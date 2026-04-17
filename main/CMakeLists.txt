@@ -1,0 +1,12 @@
+idf_component_register(SRCS
+                           "main.c"
+                           "bsp_i2c.c"
+                           "bsp_audio.c"
+                           "bsp_button.c"
+                       INCLUDE_DIRS "."
+                       REQUIRES
+                           lierda-iot__esp_lora_driver
+                           esp_driver_gpio
+                           esp_driver_i2c
+                           esp_driver_i2s
+                           esp_adc)
