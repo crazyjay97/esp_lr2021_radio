@@ -103,23 +103,26 @@ esp_err_t RadioPing::init()
 
 esp_err_t RadioPing::start()
 {
-    BaseType_t ok = xTaskCreate(task_trampoline, "radio_ping",
-                                APP_RADIO_TASK_STACK_BYTES, this,
-                                APP_RADIO_TASK_PRIORITY, nullptr);
+    BaseType_t ok = xTaskCreatePinnedToCore(task_trampoline, "radio_ping",
+                                            APP_RADIO_TASK_STACK_BYTES, this,
+                                            APP_RADIO_TASK_PRIORITY, nullptr,
+                                            APP_RADIO_TASK_CORE);
     if (ok != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
 
-    ok = xTaskCreate(tx_task_trampoline, "voice_tx",
-                     APP_VOICE_TX_TASK_STACK_BYTES, this,
-                     APP_VOICE_TX_TASK_PRIORITY, nullptr);
+    ok = xTaskCreatePinnedToCore(tx_task_trampoline, "voice_tx",
+                                 APP_VOICE_TX_TASK_STACK_BYTES, this,
+                                 APP_VOICE_TX_TASK_PRIORITY, nullptr,
+                                 APP_VOICE_TX_TASK_CORE);
     if (ok != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
 
-    ok = xTaskCreate(play_task_trampoline, "voice_play",
-                     APP_VOICE_PLAY_TASK_STACK_BYTES, this,
-                     APP_VOICE_PLAY_TASK_PRIORITY, nullptr);
+    ok = xTaskCreatePinnedToCore(play_task_trampoline, "voice_play",
+                                 APP_VOICE_PLAY_TASK_STACK_BYTES, this,
+                                 APP_VOICE_PLAY_TASK_PRIORITY, nullptr,
+                                 APP_VOICE_PLAY_TASK_CORE);
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 

@@ -41,8 +41,8 @@
 /* Fixed bitrate makes packet sizing and radio scheduling easier to debug. */
 #define APP_OPUS_USE_VBR                0
 
-/* Complexity 3..5 is a practical starting range for ESP32-S3 real-time voice. */
-#define APP_OPUS_COMPLEXITY             5
+/* Keep encoder CPU bounded on ESP32-S3; raise only after WDT/headroom tests. */
+#define APP_OPUS_COMPLEXITY             1
 
 /* Keep DTX off for the first bring-up so packet timing remains predictable. */
 #define APP_OPUS_USE_DTX                0
@@ -98,6 +98,9 @@
  * the old ping-only path, so keep this conservative during bring-up. */
 #define APP_RADIO_TASK_STACK_BYTES      32768U
 
+/* Keep direct RAL radio control on CPU0. */
+#define APP_RADIO_TASK_CORE             0
+
 /* Dedicated sync word for this project's FLRC test/audio packets. */
 #define APP_FLRC_SYNC_WORD_0            0x4CU
 #define APP_FLRC_SYNC_WORD_1            0x52U
@@ -115,8 +118,8 @@
 /* Number of encoded voice frames to queue before starting speaker playback. */
 #define APP_RX_JITTER_FRAMES            ((APP_RX_JITTER_BUFFER_MS + APP_AUDIO_FRAME_MS - 1U) / APP_AUDIO_FRAME_MS)
 
-/* Maximum number of missing frames to conceal with Opus PLC before resyncing. */
-#define APP_RX_MAX_PLC_FRAMES           3U
+/* Conceal one missing aggregated FLRC packet before resyncing. */
+#define APP_RX_MAX_PLC_FRAMES           APP_FLRC_OPUS_FRAMES_PER_PACKET
 
 /* Stop playback if no voice packet arrives within this interval. */
 #define APP_RX_AUDIO_TIMEOUT_MS         200U
@@ -134,9 +137,15 @@
 #define APP_VOICE_PLAY_TASK_PRIORITY    5
 #define APP_VOICE_PLAY_TASK_STACK_BYTES 32768U
 
+/* Run Opus decode/playback away from direct radio control. */
+#define APP_VOICE_PLAY_TASK_CORE        1
+
 /* Opus encode plus I2S read run here so RAC polling is not blocked by audio. */
 #define APP_VOICE_TX_TASK_PRIORITY      5
 #define APP_VOICE_TX_TASK_STACK_BYTES   32768U
+
+/* Keep Opus encode away from the radio/control task on CPU0. */
+#define APP_VOICE_TX_TASK_CORE          1
 
 /* ----- Local diagnostic tones ------------------------------------------------ */
 
