@@ -131,25 +131,33 @@ void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
     ESP_LOGI(TAG, "PTT %s -> FLRC voice %s", pressed ? "down" : "up",
              pressed ? "TX" : "RX");
 
-    if (pressed && mode_ == Mode::rx_pending) {
-        set_playback_pa(false);
-        playback_active_ = false;
-        have_expected_play_seq_ = false;
-        codec_.reset_encoder();
+    if (pressed) {
+        bool new_burst = !tx_burst_active_;
+        tx_burst_active_ = true;
         tx_flush_pending_ = false;
-        if (voice_queue_ != nullptr) {
-            xQueueReset(voice_queue_);
+
+        if (new_burst) {
+            set_playback_pa(false);
+            playback_active_ = false;
+            have_expected_play_seq_ = false;
+            codec_.reset_encoder();
+            if (voice_queue_ != nullptr) {
+                xQueueReset(voice_queue_);
+            }
+            if (tx_queue_ != nullptr) {
+                xQueueReset(tx_queue_);
+            }
         }
-        if (tx_queue_ != nullptr) {
-            xQueueReset(tx_queue_);
+
+        if (mode_ == Mode::rx_pending) {
+            smtc_modem_hal_protect_api_call();
+            (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+            (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+            smtc_modem_hal_unprotect_api_call();
+            mode_ = Mode::idle;
         }
-        smtc_modem_hal_protect_api_call();
-        (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
-        (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
-        smtc_modem_hal_unprotect_api_call();
-        mode_ = Mode::idle;
-    } else if (!pressed) {
-        tx_flush_pending_ = true;
+    } else {
+        tx_flush_pending_ = tx_burst_active_;
         if (mode_ == Mode::idle) {
             schedule_tx();
         }
@@ -231,10 +239,15 @@ void RadioPing::poll_once()
         }
     }
 
-    if ((ptt_active_ || tx_flush_pending_) && mode_ == Mode::idle) {
-        schedule_tx();
-    } else if (!ptt_active_ && mode_ == Mode::idle) {
-        schedule_rx();
+    if (mode_ == Mode::idle) {
+        if (tx_burst_active_) {
+            schedule_tx();
+            if (!tx_burst_active_ && !ptt_active_ && mode_ == Mode::idle) {
+                schedule_rx();
+            }
+        } else if (!ptt_active_) {
+            schedule_rx();
+        }
     }
     taskYIELD();
 }
@@ -303,10 +316,13 @@ void RadioPing::schedule_tx()
 
     UBaseType_t queued = uxQueueMessagesWaiting(tx_queue_);
     if (queued == 0) {
-        tx_flush_pending_ = false;
+        if (!ptt_active_) {
+            tx_flush_pending_ = false;
+            tx_burst_active_ = false;
+        }
         return;
     }
-    if (ptt_active_ && !tx_flush_pending_ && queued < APP_FLRC_OPUS_FRAMES_PER_PACKET) {
+    if (ptt_active_ && queued < APP_FLRC_OPUS_FRAMES_PER_PACKET) {
         return;
     }
 
@@ -314,6 +330,7 @@ void RadioPing::schedule_tx()
     if (!build_voice_packet(&tx_size)) {
         if (!ptt_active_ && uxQueueMessagesWaiting(tx_queue_) == 0) {
             tx_flush_pending_ = false;
+            tx_burst_active_ = false;
         }
         return;
     }
