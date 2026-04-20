@@ -6,6 +6,7 @@
 #include "app_config.h"
 #include "bsp.h"
 #include "LiotLr2021.h"
+#include "opus_codec.hpp"
 
 class RadioPing {
 public:
@@ -29,24 +30,34 @@ private:
     void schedule_rx();
     void schedule_tx();
     void configure_common(smtc_rac_context_t *ctx, bool is_tx, uint16_t tx_size);
-    void build_ping_packet();
+    bool build_voice_packet(uint16_t *tx_size);
     void handle_rx_packet();
+    void handle_voice_packet(uint16_t len, int16_t rssi);
     void log_rx(uint16_t seq, uint16_t len, int16_t rssi);
+    bool read_mono_frame(int16_t *mono, size_t samples);
+    void play_mono_frame(const int16_t *mono, size_t samples);
+    void update_playback_timeout();
 
     static RadioPing *instance_;
 
     uint8_t radio_id_ = RAC_INVALID_RADIO_ID;
+    OpusCodec codec_;
     Mode mode_ = Mode::idle;
     bool ptt_active_ = false;
     volatile bool done_ = false;
     volatile rp_status_t done_status_ = RP_STATUS_TASK_INIT;
 
-    uint8_t tx_buf_[32] = {};
+    uint8_t tx_buf_[APP_FLRC_MAX_PAYLOAD_BYTES] = {};
     uint8_t rx_buf_[APP_FLRC_MAX_PAYLOAD_BYTES] = {};
+    int16_t tx_pcm_[APP_AUDIO_FRAME_SAMPLES] = {};
+    int16_t rx_pcm_[APP_AUDIO_FRAME_SAMPLES] = {};
 
     uint16_t tx_seq_ = 0;
     uint16_t expected_rx_seq_ = 0;
     bool have_expected_rx_seq_ = false;
     uint32_t rx_packets_ = 0;
     uint32_t rx_lost_ = 0;
+    uint32_t rx_crc_errors_ = 0;
+    uint32_t last_rx_audio_ms_ = 0;
+    bool playback_active_ = false;
 };

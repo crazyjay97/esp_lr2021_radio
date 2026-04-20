@@ -1,5 +1,6 @@
 ## IDF Component Manager Manifest File
 dependencies:
+  78/esp-opus: "^1.0.5"
   lierda-iot/esp_lora_driver:
     registry_url: https://components.espressif.com
   idf: "^5.0"

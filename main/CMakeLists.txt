@@ -1,6 +1,7 @@
 idf_component_register(SRCS
                            "app_main.cpp"
                            "audio_diagnostics.cpp"
+                           "opus_codec.cpp"
                            "radio_ping.cpp"
                            "bsp_i2c.c"
                            "bsp_audio.c"

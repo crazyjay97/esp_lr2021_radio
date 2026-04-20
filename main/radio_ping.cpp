@@ -18,7 +18,8 @@ constexpr uint8_t kSyncWord[4] = {
 };
 constexpr uint8_t kMagic[4] = { 'L', 'R', 'P', '1' };
 constexpr uint8_t kPacketTypePing = 1;
-constexpr uint16_t kPingPacketSize = 12;
+constexpr uint8_t kPacketTypeVoice = 2;
+constexpr uint16_t kHeaderSize = 14;
 
 const char *status_to_string(rp_status_t status)
 {
@@ -50,6 +51,14 @@ uint16_t get_u16_le(const uint8_t *p)
 {
     return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
 }
+
+uint32_t get_u32_le(const uint8_t *p)
+{
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
 } // namespace
 
 RadioPing *RadioPing::instance_ = nullptr;
@@ -59,6 +68,11 @@ esp_err_t RadioPing::init()
     instance_ = this;
 
     smtc_rac_init();
+    esp_err_t err = codec_.init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
     radio_id_ = smtc_rac_open_radio(RAC_LOW_PRIORITY);
     if (radio_id_ == RAC_INVALID_RADIO_ID) {
         ESP_LOGE(TAG, "smtc_rac_open_radio failed");
@@ -89,6 +103,8 @@ void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
              pressed ? "TX" : "RX");
 
     if (pressed && mode_ == Mode::rx_pending) {
+        bsp_audio_pa_enable(false);
+        playback_active_ = false;
         smtc_rac_abort_radio_submit(radio_id_);
     } else if (!pressed && mode_ == Mode::idle) {
         schedule_rx();
@@ -104,6 +120,7 @@ void RadioPing::task()
 {
     while (true) {
         poll_once();
+        update_playback_timeout();
         vTaskDelay(pdMS_TO_TICKS(APP_RADIO_TASK_POLL_MS));
     }
 }
@@ -141,6 +158,11 @@ void RadioPing::on_done(rp_status_t status)
     if (completed_mode == Mode::rx_pending) {
         if (status == RP_STATUS_RX_PACKET) {
             handle_rx_packet();
+        } else if (status == RP_STATUS_RX_CRC_ERROR) {
+            rx_crc_errors_++;
+            if ((rx_crc_errors_ % 10) == 1) {
+                ESP_LOGW(TAG, "RX CRC errors=%lu", static_cast<unsigned long>(rx_crc_errors_));
+            }
         } else if (status != RP_STATUS_RX_TIMEOUT && status != RP_STATUS_TASK_ABORTED) {
             ESP_LOGW(TAG, "RX done: %s", status_to_string(status));
         }
@@ -176,12 +198,16 @@ void RadioPing::schedule_tx()
 {
     if (radio_id_ == RAC_INVALID_RADIO_ID || mode_ != Mode::idle) return;
 
-    build_ping_packet();
+    uint16_t tx_size = 0;
+    if (!build_voice_packet(&tx_size)) {
+        return;
+    }
+
     smtc_rac_context_t *ctx = smtc_rac_get_context(radio_id_);
     std::memset(ctx, 0, sizeof(*ctx));
-    configure_common(ctx, true, kPingPacketSize);
+    configure_common(ctx, true, tx_size);
     ctx->smtc_rac_data_buffer_setup.tx_payload_buffer = tx_buf_;
-    ctx->smtc_rac_data_buffer_setup.size_of_tx_payload_buffer = kPingPacketSize;
+    ctx->smtc_rac_data_buffer_setup.size_of_tx_payload_buffer = tx_size;
 
     smtc_rac_return_code_t rc = smtc_rac_submit_radio_transaction(radio_id_);
     if (rc == SMTC_RAC_SUCCESS) {
@@ -220,13 +246,35 @@ void RadioPing::configure_common(smtc_rac_context_t *ctx, bool is_tx, uint16_t t
     ctx->scheduler_config.callback_post_radio_transaction = &RadioPing::post_callback;
 }
 
-void RadioPing::build_ping_packet()
+bool RadioPing::build_voice_packet(uint16_t *tx_size)
 {
+    if (!read_mono_frame(tx_pcm_, APP_AUDIO_FRAME_SAMPLES)) {
+        return false;
+    }
+
     std::memcpy(tx_buf_, kMagic, sizeof(kMagic));
-    tx_buf_[4] = kPacketTypePing;
+    tx_buf_[4] = kPacketTypeVoice;
     tx_buf_[5] = 1;
     put_u16_le(&tx_buf_[6], tx_seq_++);
     put_u32_le(&tx_buf_[8], smtc_modem_hal_get_time_in_ms());
+    tx_buf_[12] = 0;
+    tx_buf_[13] = 0;
+
+    int encoded = codec_.encode(tx_pcm_, APP_AUDIO_FRAME_SAMPLES,
+                                &tx_buf_[kHeaderSize],
+                                APP_FLRC_MAX_PAYLOAD_BYTES - kHeaderSize);
+    if (encoded <= 0) {
+        ESP_LOGW(TAG, "Opus encode failed: %d", encoded);
+        return false;
+    }
+    if (encoded > 255) {
+        ESP_LOGW(TAG, "Opus packet too large: %d", encoded);
+        return false;
+    }
+
+    tx_buf_[12] = static_cast<uint8_t>(encoded);
+    *tx_size = static_cast<uint16_t>(kHeaderSize + encoded);
+    return true;
 }
 
 void RadioPing::handle_rx_packet()
@@ -235,14 +283,47 @@ void RadioPing::handle_rx_packet()
     uint16_t len = ctx->smtc_rac_data_result.rx_size;
     int16_t rssi = ctx->smtc_rac_data_result.rssi_result;
 
-    if (len < kPingPacketSize || std::memcmp(rx_buf_, kMagic, sizeof(kMagic)) != 0 ||
-        rx_buf_[4] != kPacketTypePing) {
+    if (len < kHeaderSize || std::memcmp(rx_buf_, kMagic, sizeof(kMagic)) != 0) {
         ESP_LOGW(TAG, "RX unknown packet len=%u rssi=%d", len, rssi);
         return;
     }
 
+    if (rx_buf_[4] == kPacketTypeVoice) {
+        handle_voice_packet(len, rssi);
+    } else if (rx_buf_[4] == kPacketTypePing) {
+        uint16_t seq = get_u16_le(&rx_buf_[6]);
+        log_rx(seq, len, rssi);
+    } else {
+        ESP_LOGW(TAG, "RX unsupported packet type=%u len=%u rssi=%d", rx_buf_[4], len, rssi);
+    }
+}
+
+void RadioPing::handle_voice_packet(uint16_t len, int16_t rssi)
+{
+    uint8_t opus_len = rx_buf_[12];
+    if (opus_len == 0 || kHeaderSize + opus_len > len) {
+        ESP_LOGW(TAG, "RX bad voice packet len=%u opus_len=%u", len, opus_len);
+        return;
+    }
+
     uint16_t seq = get_u16_le(&rx_buf_[6]);
+    uint32_t tx_ms = get_u32_le(&rx_buf_[8]);
+    int decoded = codec_.decode(&rx_buf_[kHeaderSize], opus_len,
+                                rx_pcm_, APP_AUDIO_FRAME_SAMPLES);
+    if (decoded <= 0) {
+        ESP_LOGW(TAG, "Opus decode failed: %d", decoded);
+        return;
+    }
+
     log_rx(seq, len, rssi);
+    play_mono_frame(rx_pcm_, static_cast<size_t>(decoded));
+    last_rx_audio_ms_ = smtc_modem_hal_get_time_in_ms();
+    playback_active_ = true;
+    uint32_t age = last_rx_audio_ms_ - tx_ms;
+    if ((seq % 50) == 0) {
+        ESP_LOGI(TAG, "voice seq=%u opus=%u pcm=%d age=%lu ms",
+                 seq, opus_len, decoded, static_cast<unsigned long>(age));
+    }
 }
 
 void RadioPing::log_rx(uint16_t seq, uint16_t len, int16_t rssi)
@@ -270,4 +351,61 @@ void RadioPing::log_rx(uint16_t seq, uint16_t len, int16_t rssi)
              static_cast<unsigned long>(denom),
              static_cast<unsigned long>(loss_x100 / 100),
              static_cast<unsigned long>(loss_x100 % 100));
+}
+
+bool RadioPing::read_mono_frame(int16_t *mono, size_t samples)
+{
+    int16_t stereo[APP_AUDIO_FRAME_SAMPLES * 2];
+    size_t got_total = 0;
+    const size_t target = samples * 2 * sizeof(int16_t);
+
+    while (got_total < target) {
+        size_t got = 0;
+        esp_err_t err = bsp_audio_read(reinterpret_cast<uint8_t *>(stereo) + got_total,
+                                       target - got_total, &got);
+        if (err != ESP_OK || got == 0) {
+            ESP_LOGW(TAG, "audio read failed: %s got=%u",
+                     esp_err_to_name(err), static_cast<unsigned>(got));
+            return false;
+        }
+        got_total += got;
+    }
+
+    for (size_t i = 0; i < samples; i++) {
+        int16_t left = stereo[2 * i];
+        int16_t right = stereo[2 * i + 1];
+        mono[i] = (left / 2) + (right / 2);
+    }
+    return true;
+}
+
+void RadioPing::play_mono_frame(const int16_t *mono, size_t samples)
+{
+    int16_t stereo[APP_AUDIO_FRAME_SAMPLES * 2];
+    if (samples > APP_AUDIO_FRAME_SAMPLES) {
+        samples = APP_AUDIO_FRAME_SAMPLES;
+    }
+
+    for (size_t i = 0; i < samples; i++) {
+        stereo[2 * i] = mono[i];
+        stereo[2 * i + 1] = mono[i];
+    }
+
+    bsp_audio_pa_enable(true);
+    size_t written = 0;
+    esp_err_t err = bsp_audio_write(stereo, samples * 2 * sizeof(int16_t), &written);
+    if (err != ESP_OK || written == 0) {
+        ESP_LOGW(TAG, "audio write failed: %s written=%u",
+                 esp_err_to_name(err), static_cast<unsigned>(written));
+    }
+}
+
+void RadioPing::update_playback_timeout()
+{
+    if (!playback_active_) return;
+    uint32_t now = smtc_modem_hal_get_time_in_ms();
+    if (now - last_rx_audio_ms_ > APP_RX_AUDIO_TIMEOUT_MS) {
+        bsp_audio_pa_enable(false);
+        playback_active_ = false;
+    }
 }
