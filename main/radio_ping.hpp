@@ -56,9 +56,10 @@ private:
         uint8_t payload[APP_OPUS_MAX_PACKET_BYTES];
     };
 
-    struct TxPacket {
+    struct TxFrame {
+        uint16_t seq;
         uint16_t len;
-        uint8_t payload[APP_FLRC_MAX_PAYLOAD_BYTES];
+        uint8_t payload[APP_OPUS_MAX_PACKET_BYTES];
     };
 
     static RadioPing *instance_;
@@ -69,6 +70,7 @@ private:
     QueueHandle_t tx_queue_ = nullptr;
     Mode mode_ = Mode::idle;
     volatile bool ptt_active_ = false;
+    bool tx_flush_pending_ = false;
     volatile bool done_ = false;
     volatile rp_status_t done_status_ = RP_STATUS_TASK_INIT;
 

@@ -83,7 +83,7 @@ esp_err_t RadioPing::init()
         ESP_LOGE(TAG, "voice queue alloc failed");
         return ESP_ERR_NO_MEM;
     }
-    tx_queue_ = xQueueCreate(APP_VOICE_TX_QUEUE_LEN, sizeof(TxPacket));
+    tx_queue_ = xQueueCreate(APP_VOICE_TX_QUEUE_LEN, sizeof(TxFrame));
     if (tx_queue_ == nullptr) {
         ESP_LOGE(TAG, "tx queue alloc failed");
         return ESP_ERR_NO_MEM;
@@ -137,6 +137,7 @@ void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
         playback_active_ = false;
         have_expected_play_seq_ = false;
         codec_.reset_encoder();
+        tx_flush_pending_ = false;
         if (voice_queue_ != nullptr) {
             xQueueReset(voice_queue_);
         }
@@ -145,11 +146,9 @@ void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
         }
         smtc_rac_abort_radio_submit(radio_id_);
     } else if (!pressed) {
-        if (tx_queue_ != nullptr) {
-            xQueueReset(tx_queue_);
-        }
+        tx_flush_pending_ = true;
         if (mode_ == Mode::idle) {
-            schedule_rx();
+            schedule_tx();
         }
     }
 }
@@ -226,7 +225,7 @@ void RadioPing::poll_once()
         on_done(done_status_);
     }
 
-    if (ptt_active_ && mode_ == Mode::idle) {
+    if ((ptt_active_ || tx_flush_pending_) && mode_ == Mode::idle) {
         schedule_tx();
     } else if (!ptt_active_ && mode_ == Mode::idle) {
         schedule_rx();
@@ -288,9 +287,22 @@ void RadioPing::schedule_rx()
 void RadioPing::schedule_tx()
 {
     if (radio_id_ == RAC_INVALID_RADIO_ID || mode_ != Mode::idle) return;
+    if (tx_queue_ == nullptr) return;
+
+    UBaseType_t queued = uxQueueMessagesWaiting(tx_queue_);
+    if (queued == 0) {
+        tx_flush_pending_ = false;
+        return;
+    }
+    if (ptt_active_ && !tx_flush_pending_ && queued < APP_FLRC_OPUS_FRAMES_PER_PACKET) {
+        return;
+    }
 
     uint16_t tx_size = 0;
     if (!build_voice_packet(&tx_size)) {
+        if (!ptt_active_ && uxQueueMessagesWaiting(tx_queue_) == 0) {
+            tx_flush_pending_ = false;
+        }
         return;
     }
 
@@ -303,6 +315,9 @@ void RadioPing::schedule_tx()
     smtc_rac_return_code_t rc = smtc_rac_submit_radio_transaction(radio_id_);
     if (rc == SMTC_RAC_SUCCESS) {
         mode_ = Mode::tx_pending;
+        if (!ptt_active_ && uxQueueMessagesWaiting(tx_queue_) == 0) {
+            tx_flush_pending_ = false;
+        }
     } else {
         ESP_LOGW(TAG, "schedule TX failed: %d", rc);
     }
@@ -339,13 +354,44 @@ void RadioPing::configure_common(smtc_rac_context_t *ctx, bool is_tx, uint16_t t
 
 bool RadioPing::build_voice_packet(uint16_t *tx_size)
 {
-    TxPacket packet;
-    if (tx_queue_ == nullptr || xQueueReceive(tx_queue_, &packet, 0) != pdTRUE) {
+    TxFrame frame;
+    if (tx_queue_ == nullptr || xQueueReceive(tx_queue_, &frame, 0) != pdTRUE) {
         return false;
     }
 
-    std::memcpy(tx_buf_, packet.payload, packet.len);
-    *tx_size = packet.len;
+    std::memcpy(tx_buf_, kMagic, sizeof(kMagic));
+    tx_buf_[4] = kPacketTypeVoice;
+    tx_buf_[5] = 2;
+    put_u16_le(&tx_buf_[6], frame.seq);
+    put_u32_le(&tx_buf_[8], smtc_modem_hal_get_time_in_ms());
+    tx_buf_[12] = 0;
+    tx_buf_[13] = 0;
+
+    uint16_t offset = kHeaderSize;
+    uint8_t frame_count = 0;
+    while (frame_count < APP_FLRC_OPUS_FRAMES_PER_PACKET) {
+        if (frame.len == 0 || frame.len > APP_OPUS_MAX_PACKET_BYTES ||
+            offset + 1U + frame.len > APP_FLRC_MAX_PAYLOAD_BYTES) {
+            break;
+        }
+
+        tx_buf_[offset++] = static_cast<uint8_t>(frame.len);
+        std::memcpy(&tx_buf_[offset], frame.payload, frame.len);
+        offset = static_cast<uint16_t>(offset + frame.len);
+        frame_count++;
+
+        if (frame_count >= APP_FLRC_OPUS_FRAMES_PER_PACKET ||
+            xQueueReceive(tx_queue_, &frame, 0) != pdTRUE) {
+            break;
+        }
+    }
+
+    if (frame_count == 0) {
+        return false;
+    }
+
+    tx_buf_[12] = frame_count;
+    *tx_size = offset;
     return true;
 }
 
@@ -358,22 +404,15 @@ void RadioPing::capture_voice_packet()
         return;
     }
 
-    TxPacket packet = {
+    TxFrame frame = {
+        .seq = tx_seq_++,
         .len = 0,
         .payload = {},
     };
 
-    std::memcpy(packet.payload, kMagic, sizeof(kMagic));
-    packet.payload[4] = kPacketTypeVoice;
-    packet.payload[5] = 1;
-    put_u16_le(&packet.payload[6], tx_seq_++);
-    put_u32_le(&packet.payload[8], smtc_modem_hal_get_time_in_ms());
-    packet.payload[12] = 0;
-    packet.payload[13] = 0;
-
     int encoded = codec_.encode(tx_pcm_, APP_AUDIO_FRAME_SAMPLES,
-                                &packet.payload[kHeaderSize],
-                                APP_FLRC_MAX_PAYLOAD_BYTES - kHeaderSize);
+                                frame.payload,
+                                APP_OPUS_MAX_PACKET_BYTES);
     if (encoded <= 0) {
         ESP_LOGW(TAG, "Opus encode failed: %d", encoded);
         return;
@@ -383,16 +422,15 @@ void RadioPing::capture_voice_packet()
         return;
     }
 
-    packet.payload[12] = static_cast<uint8_t>(encoded);
-    packet.len = static_cast<uint16_t>(kHeaderSize + encoded);
+    frame.len = static_cast<uint16_t>(encoded);
 
-    if (xQueueSend(tx_queue_, &packet, 0) != pdTRUE) {
-        TxPacket dropped;
+    if (xQueueSend(tx_queue_, &frame, 0) != pdTRUE) {
+        TxFrame dropped;
         (void)xQueueReceive(tx_queue_, &dropped, 0);
         tx_queue_drops_++;
-        if (xQueueSend(tx_queue_, &packet, 0) == pdTRUE) {
-            ESP_LOGW(TAG, "voice TX queue full, dropped oldest drops=%lu",
-                     static_cast<unsigned long>(tx_queue_drops_));
+        if (xQueueSend(tx_queue_, &frame, 0) == pdTRUE) {
+            ESP_LOGW(TAG, "voice TX queue full, dropped oldest seq=%u drops=%lu",
+                     dropped.seq, static_cast<unsigned long>(tx_queue_drops_));
         } else {
             ESP_LOGW(TAG, "voice TX queue full drops=%lu",
                      static_cast<unsigned long>(tx_queue_drops_));
@@ -423,33 +461,49 @@ void RadioPing::handle_rx_packet()
 
 void RadioPing::queue_voice_packet(uint16_t len, int16_t rssi)
 {
-    uint8_t opus_len = rx_buf_[12];
-    if (opus_len == 0 || opus_len > APP_OPUS_MAX_PACKET_BYTES || kHeaderSize + opus_len > len) {
-        ESP_LOGW(TAG, "RX bad voice packet len=%u opus_len=%u", len, opus_len);
+    uint8_t frame_count = rx_buf_[12];
+    if (frame_count == 0 || frame_count > APP_FLRC_OPUS_FRAMES_PER_PACKET) {
+        ESP_LOGW(TAG, "RX bad voice packet len=%u frames=%u", len, frame_count);
         return;
     }
 
     uint16_t seq = get_u16_le(&rx_buf_[6]);
-    log_rx(seq, len, rssi);
+    uint16_t offset = kHeaderSize;
+    for (uint8_t i = 0; i < frame_count; i++) {
+        if (offset >= len) {
+            ESP_LOGW(TAG, "RX truncated voice packet len=%u frames=%u", len, frame_count);
+            return;
+        }
 
-    VoicePacket packet = {
-        .seq = seq,
-        .len = opus_len,
-        .rssi = rssi,
-        .payload = {},
-    };
-    std::memcpy(packet.payload, &rx_buf_[kHeaderSize], opus_len);
+        uint8_t opus_len = rx_buf_[offset++];
+        if (opus_len == 0 || opus_len > APP_OPUS_MAX_PACKET_BYTES || offset + opus_len > len) {
+            ESP_LOGW(TAG, "RX bad voice frame len=%u opus_len=%u", len, opus_len);
+            return;
+        }
 
-    if (xQueueSend(voice_queue_, &packet, 0) != pdTRUE) {
-        VoicePacket dropped;
-        (void)xQueueReceive(voice_queue_, &dropped, 0);
-        rx_queue_drops_++;
-        if (xQueueSend(voice_queue_, &packet, 0) == pdTRUE) {
-            ESP_LOGW(TAG, "voice queue full, dropped oldest seq=%u drops=%lu",
-                     dropped.seq, static_cast<unsigned long>(rx_queue_drops_));
-        } else {
-            ESP_LOGW(TAG, "voice queue full drops=%lu seq=%u",
-                     static_cast<unsigned long>(rx_queue_drops_), seq);
+        uint16_t frame_seq = static_cast<uint16_t>(seq + i);
+        log_rx(frame_seq, len, rssi);
+
+        VoicePacket packet = {
+            .seq = frame_seq,
+            .len = opus_len,
+            .rssi = rssi,
+            .payload = {},
+        };
+        std::memcpy(packet.payload, &rx_buf_[offset], opus_len);
+        offset = static_cast<uint16_t>(offset + opus_len);
+
+        if (xQueueSend(voice_queue_, &packet, 0) != pdTRUE) {
+            VoicePacket dropped;
+            (void)xQueueReceive(voice_queue_, &dropped, 0);
+            rx_queue_drops_++;
+            if (xQueueSend(voice_queue_, &packet, 0) == pdTRUE) {
+                ESP_LOGW(TAG, "voice queue full, dropped oldest seq=%u drops=%lu",
+                         dropped.seq, static_cast<unsigned long>(rx_queue_drops_));
+            } else {
+                ESP_LOGW(TAG, "voice queue full drops=%lu seq=%u",
+                         static_cast<unsigned long>(rx_queue_drops_), frame_seq);
+            }
         }
     }
 }
