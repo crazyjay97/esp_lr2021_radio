@@ -18,8 +18,8 @@
 /* PCM sample format passed to the Opus encoder and produced by the decoder. */
 #define APP_AUDIO_BITS_PER_SAMPLE       16U
 
-/* 20 ms is a good first target for PTT latency, CPU load, and packet rate. */
-#define APP_AUDIO_FRAME_MS              20U
+/* 10 ms reduces per-frame encode blocking and makes packet loss less audible. */
+#define APP_AUDIO_FRAME_MS              10U
 
 /* Number of mono PCM samples in one Opus frame at APP_AUDIO_SAMPLE_RATE_HZ. */
 #define APP_AUDIO_FRAME_SAMPLES         ((APP_AUDIO_SAMPLE_RATE_HZ * APP_AUDIO_FRAME_MS) / 1000U)
@@ -32,17 +32,17 @@
 
 /* ----- Opus voice codec ------------------------------------------------------ */
 
-/* Use OPUS_APPLICATION_VOIP when the Opus component is added. */
-#define APP_OPUS_APPLICATION            OPUS_APPLICATION_VOIP
+/* Low-delay mode avoids the heavier SILK VOIP path that was hitting WDT. */
+#define APP_OPUS_APPLICATION            OPUS_APPLICATION_RESTRICTED_LOWDELAY
 
-/* Start conservative; raise to 24000 for better quality if range is still OK. */
-#define APP_OPUS_BITRATE_BPS            16000
+/* 16 kHz speech has enough FLRC budget; 24 kbps improves low-delay quality. */
+#define APP_OPUS_BITRATE_BPS            24000
 
 /* Fixed bitrate makes packet sizing and radio scheduling easier to debug. */
 #define APP_OPUS_USE_VBR                0
 
 /* Keep encoder CPU bounded on ESP32-S3; raise only after WDT/headroom tests. */
-#define APP_OPUS_COMPLEXITY             1
+#define APP_OPUS_COMPLEXITY             0
 
 /* Keep DTX off for the first bring-up so packet timing remains predictable. */
 #define APP_OPUS_USE_DTX                0
@@ -73,9 +73,8 @@
 /* Keep payloads small so each packet carries one low-latency voice frame. */
 #define APP_FLRC_MAX_PAYLOAD_BYTES      255U
 
-/* Pack several 20 ms Opus frames per FLRC packet to reduce RAC TX overhead.
- * At 16 kbps CBR each Opus frame is about 40 bytes, so 5 frames fits in the
- * 255-byte FLRC payload with per-frame length bytes and the app header. */
+/* Pack several 10 ms Opus frames per FLRC packet to reduce TX overhead while
+ * keeping each radio packet to about 50 ms of audio. */
 #define APP_FLRC_OPUS_FRAMES_PER_PACKET 5U
 
 /* RX timeout used by the packet receiver before it re-arms listening. */
