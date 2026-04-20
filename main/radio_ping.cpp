@@ -115,8 +115,12 @@ void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
              pressed ? "TX" : "RX");
 
     if (pressed && mode_ == Mode::rx_pending) {
-        bsp_audio_pa_enable(false);
+        set_playback_pa(false);
         playback_active_ = false;
+        have_expected_play_seq_ = false;
+        if (voice_queue_ != nullptr) {
+            xQueueReset(voice_queue_);
+        }
         smtc_rac_abort_radio_submit(radio_id_);
     } else if (!pressed && mode_ == Mode::idle) {
         schedule_rx();
@@ -150,6 +154,9 @@ void RadioPing::play_task()
         if (xQueueReceive(voice_queue_, &packet, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+
+        wait_for_jitter_buffer();
+        conceal_missing_frames(packet.seq);
 
         int decoded = codec_.decode(packet.payload, packet.len, rx_pcm_, APP_AUDIO_FRAME_SAMPLES);
         if (decoded <= 0) {
@@ -356,9 +363,16 @@ void RadioPing::queue_voice_packet(uint16_t len, int16_t rssi)
     std::memcpy(packet.payload, &rx_buf_[kHeaderSize], opus_len);
 
     if (xQueueSend(voice_queue_, &packet, 0) != pdTRUE) {
+        VoicePacket dropped;
+        (void)xQueueReceive(voice_queue_, &dropped, 0);
         rx_queue_drops_++;
-        ESP_LOGW(TAG, "voice queue full drops=%lu seq=%u",
-                 static_cast<unsigned long>(rx_queue_drops_), seq);
+        if (xQueueSend(voice_queue_, &packet, 0) == pdTRUE) {
+            ESP_LOGW(TAG, "voice queue full, dropped oldest seq=%u drops=%lu",
+                     dropped.seq, static_cast<unsigned long>(rx_queue_drops_));
+        } else {
+            ESP_LOGW(TAG, "voice queue full drops=%lu seq=%u",
+                     static_cast<unsigned long>(rx_queue_drops_), seq);
+        }
     }
 }
 
@@ -380,6 +394,46 @@ void RadioPing::log_rx(uint16_t seq, uint16_t len, int16_t rssi)
     }
 
     rx_packets_++;
+}
+
+void RadioPing::wait_for_jitter_buffer()
+{
+    if (playback_active_ || voice_queue_ == nullptr || APP_RX_JITTER_FRAMES <= 1U) {
+        return;
+    }
+
+    const UBaseType_t target_waiting = static_cast<UBaseType_t>(APP_RX_JITTER_FRAMES - 1U);
+    const uint32_t start_ms = smtc_modem_hal_get_time_in_ms();
+    while (uxQueueMessagesWaiting(voice_queue_) < target_waiting) {
+        if (smtc_modem_hal_get_time_in_ms() - start_ms >= APP_RX_JITTER_BUFFER_MS) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+void RadioPing::conceal_missing_frames(uint16_t seq)
+{
+    if (!have_expected_play_seq_) {
+        expected_play_seq_ = seq;
+        have_expected_play_seq_ = true;
+    }
+
+    uint16_t gap = static_cast<uint16_t>(seq - expected_play_seq_);
+    if (gap > 0 && gap <= APP_RX_MAX_PLC_FRAMES) {
+        for (uint16_t i = 0; i < gap; i++) {
+            int decoded = codec_.decode_lost(rx_pcm_, APP_AUDIO_FRAME_SAMPLES);
+            if (decoded <= 0) {
+                ESP_LOGW(TAG, "Opus PLC failed: %d", decoded);
+                break;
+            }
+            play_mono_frame(rx_pcm_, static_cast<size_t>(decoded));
+            last_rx_audio_ms_ = smtc_modem_hal_get_time_in_ms();
+            playback_active_ = true;
+        }
+    }
+
+    expected_play_seq_ = static_cast<uint16_t>(seq + 1);
 }
 
 bool RadioPing::read_mono_frame(int16_t *mono, size_t samples)
@@ -420,7 +474,7 @@ void RadioPing::play_mono_frame(const int16_t *mono, size_t samples)
         stereo[2 * i + 1] = mono[i];
     }
 
-    bsp_audio_pa_enable(true);
+    set_playback_pa(true);
     size_t written = 0;
     esp_err_t err = bsp_audio_write(stereo, samples * 2 * sizeof(int16_t), &written);
     if (err != ESP_OK || written == 0) {
@@ -429,12 +483,26 @@ void RadioPing::play_mono_frame(const int16_t *mono, size_t samples)
     }
 }
 
+void RadioPing::set_playback_pa(bool on)
+{
+    if (playback_pa_on_ == on) {
+        return;
+    }
+    esp_err_t err = bsp_audio_pa_enable(on);
+    if (err == ESP_OK) {
+        playback_pa_on_ = on;
+    } else {
+        ESP_LOGW(TAG, "PA %s failed: %s", on ? "enable" : "disable", esp_err_to_name(err));
+    }
+}
+
 void RadioPing::update_playback_timeout()
 {
     if (!playback_active_) return;
     uint32_t now = smtc_modem_hal_get_time_in_ms();
     if (now - last_rx_audio_ms_ > APP_RX_AUDIO_TIMEOUT_MS) {
-        bsp_audio_pa_enable(false);
+        set_playback_pa(false);
         playback_active_ = false;
+        have_expected_play_seq_ = false;
     }
 }

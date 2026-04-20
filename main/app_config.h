@@ -82,8 +82,9 @@
 /* Log one voice frame every N packets to avoid flooding the serial console. */
 #define APP_VOICE_LOG_EVERY_N           25U
 
-/* Poll period for the RAC engine task. Keep this long enough for IDLE tasks. */
-#define APP_RADIO_TASK_POLL_MS          20U
+/* Poll period for the RAC engine task. Keep well below one audio frame so TX
+ * done/RX done is handled without stretching the 20 ms voice cadence. */
+#define APP_RADIO_TASK_POLL_MS          2U
 
 /* FreeRTOS priority for the radio engine task. */
 #define APP_RADIO_TASK_PRIORITY         4
@@ -105,6 +106,12 @@
 
 /* Receiver-side jitter buffer target before starting speaker playback. */
 #define APP_RX_JITTER_BUFFER_MS         60U
+
+/* Number of encoded voice frames to queue before starting speaker playback. */
+#define APP_RX_JITTER_FRAMES            ((APP_RX_JITTER_BUFFER_MS + APP_AUDIO_FRAME_MS - 1U) / APP_AUDIO_FRAME_MS)
+
+/* Maximum number of missing frames to conceal with Opus PLC before resyncing. */
+#define APP_RX_MAX_PLC_FRAMES           3U
 
 /* Stop playback if no voice packet arrives within this interval. */
 #define APP_RX_AUDIO_TIMEOUT_MS         200U

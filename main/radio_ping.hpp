@@ -39,8 +39,11 @@ private:
     void handle_rx_packet();
     void queue_voice_packet(uint16_t len, int16_t rssi);
     void log_rx(uint16_t seq, uint16_t len, int16_t rssi);
+    void wait_for_jitter_buffer();
+    void conceal_missing_frames(uint16_t seq);
     bool read_mono_frame(int16_t *mono, size_t samples);
     void play_mono_frame(const int16_t *mono, size_t samples);
+    void set_playback_pa(bool on);
     void update_playback_timeout();
 
     struct VoicePacket {
@@ -73,5 +76,8 @@ private:
     uint32_t rx_crc_errors_ = 0;
     uint32_t rx_queue_drops_ = 0;
     uint32_t last_rx_audio_ms_ = 0;
+    uint16_t expected_play_seq_ = 0;
+    bool have_expected_play_seq_ = false;
+    bool playback_pa_on_ = false;
     bool playback_active_ = false;
 };
