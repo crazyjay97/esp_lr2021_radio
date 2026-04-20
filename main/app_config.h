@@ -79,6 +79,15 @@
 /* Interval between PTT-held FLRC ping packets before real audio is connected. */
 #define APP_FLRC_PING_INTERVAL_MS       50U
 
+/* Poll period for the RAC engine task. Keep this long enough for IDLE tasks. */
+#define APP_RADIO_TASK_POLL_MS          20U
+
+/* FreeRTOS priority for the radio engine task. */
+#define APP_RADIO_TASK_PRIORITY         4
+
+/* Stack for the C++ radio task and RAC callbacks. */
+#define APP_RADIO_TASK_STACK_BYTES      4096U
+
 /* Dedicated sync word for this project's FLRC test/audio packets. */
 #define APP_FLRC_SYNC_WORD_0            0x4CU
 #define APP_FLRC_SYNC_WORD_1            0x52U

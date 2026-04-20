@@ -72,6 +72,14 @@ esp_err_t RadioPing::init()
     return ESP_OK;
 }
 
+esp_err_t RadioPing::start()
+{
+    BaseType_t ok = xTaskCreate(task_trampoline, "radio_ping",
+                                APP_RADIO_TASK_STACK_BYTES, this,
+                                APP_RADIO_TASK_PRIORITY, nullptr);
+    return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
 void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
 {
     if (id != APP_PTT_BUTTON) return;
@@ -87,9 +95,23 @@ void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
     }
 }
 
-void RadioPing::poll()
+void RadioPing::task_trampoline(void *arg)
+{
+    static_cast<RadioPing *>(arg)->task();
+}
+
+void RadioPing::task()
+{
+    while (true) {
+        poll_once();
+        vTaskDelay(pdMS_TO_TICKS(APP_RADIO_TASK_POLL_MS));
+    }
+}
+
+void RadioPing::poll_once()
 {
     smtc_rac_run_engine();
+    taskYIELD();
 
     if (done_) {
         done_ = false;
@@ -101,6 +123,7 @@ void RadioPing::poll()
     } else if (!ptt_active_ && mode_ == Mode::idle) {
         schedule_rx();
     }
+    taskYIELD();
 }
 
 void RadioPing::post_callback(rp_status_t status)

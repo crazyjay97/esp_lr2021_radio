@@ -52,6 +52,9 @@ extern "C" void app_main(void)
     if ((e = g_radio.init()) != ESP_OK) {
         ESP_LOGE(TAG, "radio init: %s", esp_err_to_name(e));
     }
+    if ((e = g_radio.start()) != ESP_OK) {
+        ESP_LOGE(TAG, "radio task start: %s", esp_err_to_name(e));
+    }
     if ((e = bsp_button_init(on_button, nullptr)) != ESP_OK) {
         ESP_LOGE(TAG, "btn init: %s", esp_err_to_name(e));
     }
@@ -62,9 +65,4 @@ extern "C" void app_main(void)
              APP_AUDIO_SAMPLE_RATE_HZ, APP_AUDIO_FRAME_MS, APP_OPUS_BITRATE_BPS,
              APP_FLRC_FREQUENCY_HZ, APP_FLRC_BITRATE_BPS);
     ESP_LOGI(TAG, "K5/PTT: hold to send FLRC ping. K3: local record/play diagnostic. K4=vol-, K6=vol+");
-
-    while (true) {
-        g_radio.poll();
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
 }

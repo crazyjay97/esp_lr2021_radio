@@ -10,8 +10,8 @@
 class RadioPing {
 public:
     esp_err_t init();
+    esp_err_t start();
     void handle_button(bsp_btn_id_t id, bool pressed);
-    void poll();
 
 private:
     enum class Mode {
@@ -20,8 +20,11 @@ private:
         tx_pending,
     };
 
+    static void task_trampoline(void *arg);
     static void post_callback(rp_status_t status);
 
+    void task();
+    void poll_once();
     void on_done(rp_status_t status);
     void schedule_rx();
     void schedule_tx();
