@@ -109,6 +109,13 @@
 /* Stop playback if no voice packet arrives within this interval. */
 #define APP_RX_AUDIO_TIMEOUT_MS         200U
 
+/* Number of encoded voice packets buffered between radio RX and playback. */
+#define APP_VOICE_RX_QUEUE_LEN          12U
+
+/* Opus decode plus I2S write run here so radio RX can re-arm quickly. */
+#define APP_VOICE_PLAY_TASK_PRIORITY    5
+#define APP_VOICE_PLAY_TASK_STACK_BYTES 32768U
+
 /* ----- Local diagnostic tones ------------------------------------------------ */
 
 #define APP_BEEP_FREQ_HZ                1800

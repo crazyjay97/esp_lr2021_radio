@@ -4,6 +4,7 @@
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "app_config.h"
@@ -57,13 +58,6 @@ uint16_t get_u16_le(const uint8_t *p)
     return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
 }
 
-uint32_t get_u32_le(const uint8_t *p)
-{
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
 } // namespace
 
 RadioPing *RadioPing::instance_ = nullptr;
@@ -76,6 +70,12 @@ esp_err_t RadioPing::init()
     esp_err_t err = codec_.init();
     if (err != ESP_OK) {
         return err;
+    }
+
+    voice_queue_ = xQueueCreate(APP_VOICE_RX_QUEUE_LEN, sizeof(VoicePacket));
+    if (voice_queue_ == nullptr) {
+        ESP_LOGE(TAG, "voice queue alloc failed");
+        return ESP_ERR_NO_MEM;
     }
 
     radio_id_ = smtc_rac_open_radio(RAC_LOW_PRIORITY);
@@ -96,6 +96,13 @@ esp_err_t RadioPing::start()
     BaseType_t ok = xTaskCreate(task_trampoline, "radio_ping",
                                 APP_RADIO_TASK_STACK_BYTES, this,
                                 APP_RADIO_TASK_PRIORITY, nullptr);
+    if (ok != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ok = xTaskCreate(play_task_trampoline, "voice_play",
+                     APP_VOICE_PLAY_TASK_STACK_BYTES, this,
+                     APP_VOICE_PLAY_TASK_PRIORITY, nullptr);
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
@@ -121,12 +128,38 @@ void RadioPing::task_trampoline(void *arg)
     static_cast<RadioPing *>(arg)->task();
 }
 
+void RadioPing::play_task_trampoline(void *arg)
+{
+    static_cast<RadioPing *>(arg)->play_task();
+}
+
 void RadioPing::task()
 {
     while (true) {
         poll_once();
         update_playback_timeout();
         vTaskDelay(pdMS_TO_TICKS(APP_RADIO_TASK_POLL_MS));
+    }
+}
+
+void RadioPing::play_task()
+{
+    VoicePacket packet;
+
+    while (true) {
+        if (xQueueReceive(voice_queue_, &packet, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        int decoded = codec_.decode(packet.payload, packet.len, rx_pcm_, APP_AUDIO_FRAME_SAMPLES);
+        if (decoded <= 0) {
+            ESP_LOGW(TAG, "Opus decode failed: %d", decoded);
+            continue;
+        }
+
+        play_mono_frame(rx_pcm_, static_cast<size_t>(decoded));
+        last_rx_audio_ms_ = smtc_modem_hal_get_time_in_ms();
+        playback_active_ = true;
     }
 }
 
@@ -172,9 +205,7 @@ void RadioPing::on_done(rp_status_t status)
             ESP_LOGW(TAG, "RX done: %s", status_to_string(status));
         }
     } else if (completed_mode == Mode::tx_pending) {
-        if (status == RP_STATUS_TX_DONE) {
-            ESP_LOGI(TAG, "FLRC TX ping seq=%u", static_cast<unsigned>(tx_seq_ - 1));
-        } else {
+        if (status != RP_STATUS_TX_DONE) {
             ESP_LOGW(TAG, "TX done: %s", status_to_string(status));
         }
         if (APP_FLRC_VOICE_TX_GAP_MS > 0) {
@@ -281,11 +312,6 @@ bool RadioPing::build_voice_packet(uint16_t *tx_size)
 
     tx_buf_[12] = static_cast<uint8_t>(encoded);
     *tx_size = static_cast<uint16_t>(kHeaderSize + encoded);
-    if ((tx_seq_ % APP_VOICE_LOG_EVERY_N) == 0) {
-        ESP_LOGI(TAG, "voice TX seq=%u opus=%d total=%u",
-                 static_cast<unsigned>(tx_seq_ - 1), encoded,
-                 static_cast<unsigned>(*tx_size));
-    }
     return true;
 }
 
@@ -301,7 +327,7 @@ void RadioPing::handle_rx_packet()
     }
 
     if (rx_buf_[4] == kPacketTypeVoice) {
-        handle_voice_packet(len, rssi);
+        queue_voice_packet(len, rssi);
     } else if (rx_buf_[4] == kPacketTypePing) {
         uint16_t seq = get_u16_le(&rx_buf_[6]);
         log_rx(seq, len, rssi);
@@ -310,31 +336,29 @@ void RadioPing::handle_rx_packet()
     }
 }
 
-void RadioPing::handle_voice_packet(uint16_t len, int16_t rssi)
+void RadioPing::queue_voice_packet(uint16_t len, int16_t rssi)
 {
     uint8_t opus_len = rx_buf_[12];
-    if (opus_len == 0 || kHeaderSize + opus_len > len) {
+    if (opus_len == 0 || opus_len > APP_OPUS_MAX_PACKET_BYTES || kHeaderSize + opus_len > len) {
         ESP_LOGW(TAG, "RX bad voice packet len=%u opus_len=%u", len, opus_len);
         return;
     }
 
     uint16_t seq = get_u16_le(&rx_buf_[6]);
-    uint32_t tx_ms = get_u32_le(&rx_buf_[8]);
-    int decoded = codec_.decode(&rx_buf_[kHeaderSize], opus_len,
-                                rx_pcm_, APP_AUDIO_FRAME_SAMPLES);
-    if (decoded <= 0) {
-        ESP_LOGW(TAG, "Opus decode failed: %d", decoded);
-        return;
-    }
-
     log_rx(seq, len, rssi);
-    play_mono_frame(rx_pcm_, static_cast<size_t>(decoded));
-    last_rx_audio_ms_ = smtc_modem_hal_get_time_in_ms();
-    playback_active_ = true;
-    uint32_t age = last_rx_audio_ms_ - tx_ms;
-    if ((seq % APP_VOICE_LOG_EVERY_N) == 0) {
-        ESP_LOGI(TAG, "voice seq=%u opus=%u pcm=%d age=%lu ms",
-                 seq, opus_len, decoded, static_cast<unsigned long>(age));
+
+    VoicePacket packet = {
+        .seq = seq,
+        .len = opus_len,
+        .rssi = rssi,
+        .payload = {},
+    };
+    std::memcpy(packet.payload, &rx_buf_[kHeaderSize], opus_len);
+
+    if (xQueueSend(voice_queue_, &packet, 0) != pdTRUE) {
+        rx_queue_drops_++;
+        ESP_LOGW(TAG, "voice queue full drops=%lu seq=%u",
+                 static_cast<unsigned long>(rx_queue_drops_), seq);
     }
 }
 
@@ -347,6 +371,8 @@ void RadioPing::log_rx(uint16_t seq, uint16_t len, int16_t rssi)
         uint16_t gap = static_cast<uint16_t>(seq - expected_rx_seq_);
         if (gap < 0x8000) {
             rx_lost_ += gap;
+            ESP_LOGW(TAG, "FLRC loss gap=%u expected=%u got=%u total_lost=%lu rssi=%d dBm",
+                     gap, expected_rx_seq_, seq, static_cast<unsigned long>(rx_lost_), rssi);
         }
         expected_rx_seq_ = static_cast<uint16_t>(seq + 1);
     } else {
@@ -354,15 +380,6 @@ void RadioPing::log_rx(uint16_t seq, uint16_t len, int16_t rssi)
     }
 
     rx_packets_++;
-    uint32_t denom = rx_packets_ + rx_lost_;
-    uint32_t loss_x100 = denom ? (rx_lost_ * 10000UL) / denom : 0;
-
-    ESP_LOGI(TAG, "FLRC RX seq=%u rssi=%d dBm len=%u lost=%lu/%lu loss=%lu.%02lu%%",
-             seq, rssi, len,
-             static_cast<unsigned long>(rx_lost_),
-             static_cast<unsigned long>(denom),
-             static_cast<unsigned long>(loss_x100 / 100),
-             static_cast<unsigned long>(loss_x100 % 100));
 }
 
 bool RadioPing::read_mono_frame(int16_t *mono, size_t samples)
@@ -409,9 +426,6 @@ void RadioPing::play_mono_frame(const int16_t *mono, size_t samples)
     if (err != ESP_OK || written == 0) {
         ESP_LOGW(TAG, "audio write failed: %s written=%u",
                  esp_err_to_name(err), static_cast<unsigned>(written));
-    } else if ((rx_packets_ % APP_VOICE_LOG_EVERY_N) == 0) {
-        ESP_LOGI(TAG, "audio play samples=%u written=%u",
-                 static_cast<unsigned>(samples), static_cast<unsigned>(written));
     }
 }
 

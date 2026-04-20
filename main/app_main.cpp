@@ -35,6 +35,7 @@ void on_button(bsp_btn_id_t id, bool pressed, void *user)
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "Lierda L-LRMAM36-FANN4-DK01 booting");
+    esp_log_level_set("RALF_LR20XX", ESP_LOG_WARN);
 
     ESP_ERROR_CHECK(bsp_i2c_init());
     bsp_i2c_scan();
