@@ -119,9 +119,16 @@
 /* Number of encoded voice packets buffered between radio RX and playback. */
 #define APP_VOICE_RX_QUEUE_LEN          12U
 
+/* Number of encoded voice packets buffered between microphone and radio TX. */
+#define APP_VOICE_TX_QUEUE_LEN          4U
+
 /* Opus decode plus I2S write run here so radio RX can re-arm quickly. */
 #define APP_VOICE_PLAY_TASK_PRIORITY    5
 #define APP_VOICE_PLAY_TASK_STACK_BYTES 32768U
+
+/* Opus encode plus I2S read run here so RAC polling is not blocked by audio. */
+#define APP_VOICE_TX_TASK_PRIORITY      5
+#define APP_VOICE_TX_TASK_STACK_BYTES   32768U
 
 /* ----- Local diagnostic tones ------------------------------------------------ */
 

@@ -25,10 +25,12 @@ private:
     };
 
     static void task_trampoline(void *arg);
+    static void tx_task_trampoline(void *arg);
     static void play_task_trampoline(void *arg);
     static void post_callback(rp_status_t status);
 
     void task();
+    void tx_task();
     void play_task();
     void poll_once();
     void on_done(rp_status_t status);
@@ -36,6 +38,7 @@ private:
     void schedule_tx();
     void configure_common(smtc_rac_context_t *ctx, bool is_tx, uint16_t tx_size);
     bool build_voice_packet(uint16_t *tx_size);
+    void capture_voice_packet();
     void handle_rx_packet();
     void queue_voice_packet(uint16_t len, int16_t rssi);
     void log_rx(uint16_t seq, uint16_t len, int16_t rssi);
@@ -53,13 +56,19 @@ private:
         uint8_t payload[APP_OPUS_MAX_PACKET_BYTES];
     };
 
+    struct TxPacket {
+        uint16_t len;
+        uint8_t payload[APP_FLRC_MAX_PAYLOAD_BYTES];
+    };
+
     static RadioPing *instance_;
 
     uint8_t radio_id_ = RAC_INVALID_RADIO_ID;
     OpusCodec codec_;
     QueueHandle_t voice_queue_ = nullptr;
+    QueueHandle_t tx_queue_ = nullptr;
     Mode mode_ = Mode::idle;
-    bool ptt_active_ = false;
+    volatile bool ptt_active_ = false;
     volatile bool done_ = false;
     volatile rp_status_t done_status_ = RP_STATUS_TASK_INIT;
 
@@ -75,6 +84,7 @@ private:
     uint32_t rx_lost_ = 0;
     uint32_t rx_crc_errors_ = 0;
     uint32_t rx_queue_drops_ = 0;
+    uint32_t tx_queue_drops_ = 0;
     uint32_t last_rx_audio_ms_ = 0;
     uint16_t expected_play_seq_ = 0;
     bool have_expected_play_seq_ = false;

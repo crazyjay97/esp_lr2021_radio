@@ -83,6 +83,11 @@ esp_err_t RadioPing::init()
         ESP_LOGE(TAG, "voice queue alloc failed");
         return ESP_ERR_NO_MEM;
     }
+    tx_queue_ = xQueueCreate(APP_VOICE_TX_QUEUE_LEN, sizeof(TxPacket));
+    if (tx_queue_ == nullptr) {
+        ESP_LOGE(TAG, "tx queue alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
 
     radio_id_ = smtc_rac_open_radio(RAC_LOW_PRIORITY);
     if (radio_id_ == RAC_INVALID_RADIO_ID) {
@@ -106,6 +111,13 @@ esp_err_t RadioPing::start()
         return ESP_ERR_NO_MEM;
     }
 
+    ok = xTaskCreate(tx_task_trampoline, "voice_tx",
+                     APP_VOICE_TX_TASK_STACK_BYTES, this,
+                     APP_VOICE_TX_TASK_PRIORITY, nullptr);
+    if (ok != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
     ok = xTaskCreate(play_task_trampoline, "voice_play",
                      APP_VOICE_PLAY_TASK_STACK_BYTES, this,
                      APP_VOICE_PLAY_TASK_PRIORITY, nullptr);
@@ -124,18 +136,32 @@ void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
         set_playback_pa(false);
         playback_active_ = false;
         have_expected_play_seq_ = false;
+        codec_.reset_encoder();
         if (voice_queue_ != nullptr) {
             xQueueReset(voice_queue_);
         }
+        if (tx_queue_ != nullptr) {
+            xQueueReset(tx_queue_);
+        }
         smtc_rac_abort_radio_submit(radio_id_);
-    } else if (!pressed && mode_ == Mode::idle) {
-        schedule_rx();
+    } else if (!pressed) {
+        if (tx_queue_ != nullptr) {
+            xQueueReset(tx_queue_);
+        }
+        if (mode_ == Mode::idle) {
+            schedule_rx();
+        }
     }
 }
 
 void RadioPing::task_trampoline(void *arg)
 {
     static_cast<RadioPing *>(arg)->task();
+}
+
+void RadioPing::tx_task_trampoline(void *arg)
+{
+    static_cast<RadioPing *>(arg)->tx_task();
 }
 
 void RadioPing::play_task_trampoline(void *arg)
@@ -152,6 +178,17 @@ void RadioPing::task()
     }
 }
 
+void RadioPing::tx_task()
+{
+    while (true) {
+        if (!ptt_active_) {
+            vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
+            continue;
+        }
+        capture_voice_packet();
+    }
+}
+
 void RadioPing::play_task()
 {
     VoicePacket packet;
@@ -161,6 +198,9 @@ void RadioPing::play_task()
             continue;
         }
 
+        if (!playback_active_) {
+            codec_.reset_decoder();
+        }
         wait_for_jitter_buffer();
         conceal_missing_frames(packet.seq);
 
@@ -299,33 +339,65 @@ void RadioPing::configure_common(smtc_rac_context_t *ctx, bool is_tx, uint16_t t
 
 bool RadioPing::build_voice_packet(uint16_t *tx_size)
 {
-    if (!read_mono_frame(tx_pcm_, APP_AUDIO_FRAME_SAMPLES)) {
+    TxPacket packet;
+    if (tx_queue_ == nullptr || xQueueReceive(tx_queue_, &packet, 0) != pdTRUE) {
         return false;
     }
 
-    std::memcpy(tx_buf_, kMagic, sizeof(kMagic));
-    tx_buf_[4] = kPacketTypeVoice;
-    tx_buf_[5] = 1;
-    put_u16_le(&tx_buf_[6], tx_seq_++);
-    put_u32_le(&tx_buf_[8], smtc_modem_hal_get_time_in_ms());
-    tx_buf_[12] = 0;
-    tx_buf_[13] = 0;
+    std::memcpy(tx_buf_, packet.payload, packet.len);
+    *tx_size = packet.len;
+    return true;
+}
+
+void RadioPing::capture_voice_packet()
+{
+    if (tx_queue_ == nullptr || !read_mono_frame(tx_pcm_, APP_AUDIO_FRAME_SAMPLES)) {
+        return;
+    }
+    if (!ptt_active_) {
+        return;
+    }
+
+    TxPacket packet = {
+        .len = 0,
+        .payload = {},
+    };
+
+    std::memcpy(packet.payload, kMagic, sizeof(kMagic));
+    packet.payload[4] = kPacketTypeVoice;
+    packet.payload[5] = 1;
+    put_u16_le(&packet.payload[6], tx_seq_++);
+    put_u32_le(&packet.payload[8], smtc_modem_hal_get_time_in_ms());
+    packet.payload[12] = 0;
+    packet.payload[13] = 0;
 
     int encoded = codec_.encode(tx_pcm_, APP_AUDIO_FRAME_SAMPLES,
-                                &tx_buf_[kHeaderSize],
+                                &packet.payload[kHeaderSize],
                                 APP_FLRC_MAX_PAYLOAD_BYTES - kHeaderSize);
     if (encoded <= 0) {
         ESP_LOGW(TAG, "Opus encode failed: %d", encoded);
-        return false;
+        return;
     }
     if (encoded > 255) {
         ESP_LOGW(TAG, "Opus packet too large: %d", encoded);
-        return false;
+        return;
     }
 
-    tx_buf_[12] = static_cast<uint8_t>(encoded);
-    *tx_size = static_cast<uint16_t>(kHeaderSize + encoded);
-    return true;
+    packet.payload[12] = static_cast<uint8_t>(encoded);
+    packet.len = static_cast<uint16_t>(kHeaderSize + encoded);
+
+    if (xQueueSend(tx_queue_, &packet, 0) != pdTRUE) {
+        TxPacket dropped;
+        (void)xQueueReceive(tx_queue_, &dropped, 0);
+        tx_queue_drops_++;
+        if (xQueueSend(tx_queue_, &packet, 0) == pdTRUE) {
+            ESP_LOGW(TAG, "voice TX queue full, dropped oldest drops=%lu",
+                     static_cast<unsigned long>(tx_queue_drops_));
+        } else {
+            ESP_LOGW(TAG, "voice TX queue full drops=%lu",
+                     static_cast<unsigned long>(tx_queue_drops_));
+        }
+    }
 }
 
 void RadioPing::handle_rx_packet()

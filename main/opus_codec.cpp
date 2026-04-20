@@ -66,3 +66,17 @@ int OpusCodec::decode_lost(int16_t *pcm, int frame_samples)
     if (!ready()) return OPUS_INVALID_STATE;
     return opus_decode(decoder_, nullptr, 0, pcm, frame_samples, 0);
 }
+
+void OpusCodec::reset_encoder()
+{
+    if (encoder_ != nullptr) {
+        opus_encoder_ctl(encoder_, OPUS_RESET_STATE);
+    }
+}
+
+void OpusCodec::reset_decoder()
+{
+    if (decoder_ != nullptr) {
+        opus_decoder_ctl(decoder_, OPUS_RESET_STATE);
+    }
+}
