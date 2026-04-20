@@ -44,7 +44,7 @@ typedef enum {
     BSP_BTN_BOOT = 0,   /* GPIO0 strap button (K2)     */
     BSP_BTN_USER1,      /* K3 -> ~1.11 V on KEY_ADC    */
     BSP_BTN_VOL_DN,     /* K4 -> ~2.41 V               */
-    BSP_BTN_MUTE,       /* K5 -> ~1.65 V               */
+    BSP_BTN_PTT,        /* K5 -> ~1.65 V               */
     BSP_BTN_VOL_UP,     /* K6 -> ~0.82 V               */
     BSP_BTN_COUNT,
 } bsp_btn_id_t;

@@ -1,5 +1,7 @@
 idf_component_register(SRCS
-                           "main.c"
+                           "app_main.cpp"
+                           "audio_diagnostics.cpp"
+                           "radio_ping.cpp"
                            "bsp_i2c.c"
                            "bsp_audio.c"
                            "bsp_button.c"

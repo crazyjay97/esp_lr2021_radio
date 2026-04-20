@@ -65,7 +65,7 @@
  * K2 -> GPIO0 / BOOT (strap button)
  * K3..K6 share a resistor-divider ADC ladder on GPIO5:
  *     K4 (27 k)  -> ~2.41 V  "VOL-"
- *     K5 (10 k)  -> ~1.65 V  "MUTE"
+ *     K5 (10 k)  -> ~1.65 V  "PTT"
  *     K6 (3.3 k) -> ~0.82 V  "VOL+"
  *     K3 (5.1 k) -> ~1.11 V  "USER1"
  * Read via ADC1 channel on GPIO5.
