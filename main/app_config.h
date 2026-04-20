@@ -88,8 +88,9 @@
 /* FreeRTOS priority for the radio engine task. */
 #define APP_RADIO_TASK_PRIORITY         4
 
-/* Stack for the C++ radio task and RAC callbacks. */
-#define APP_RADIO_TASK_STACK_BYTES      4096U
+/* Stack for RAC callbacks plus Opus encode/decode. Opus needs much more than
+ * the old ping-only path, so keep this conservative during bring-up. */
+#define APP_RADIO_TASK_STACK_BYTES      32768U
 
 /* Dedicated sync word for this project's FLRC test/audio packets. */
 #define APP_FLRC_SYNC_WORD_0            0x4CU

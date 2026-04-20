@@ -64,5 +64,5 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "voice config: Opus %u Hz, %u ms, %d bps CBR; FLRC %lu Hz, %lu bps",
              APP_AUDIO_SAMPLE_RATE_HZ, APP_AUDIO_FRAME_MS, APP_OPUS_BITRATE_BPS,
              APP_FLRC_FREQUENCY_HZ, APP_FLRC_BITRATE_BPS);
-    ESP_LOGI(TAG, "K5/PTT: hold to send FLRC ping. K3: local record/play diagnostic. K4=vol-, K6=vol+");
+    ESP_LOGI(TAG, "K5/PTT: hold to send Opus voice over FLRC. K3: local record/play diagnostic. K4=vol-, K6=vol+");
 }
