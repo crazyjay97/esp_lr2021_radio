@@ -53,7 +53,7 @@
 /* ----- FLRC radio link ------------------------------------------------------- */
 
 /* Center frequency. Confirm the exact channel is legal for the deployment area. */
-#define APP_FLRC_FREQUENCY_HZ           900000000UL
+#define APP_FLRC_FREQUENCY_HZ           868000000UL
 
 /* LR2021 FLRC high-rate mode requested for this project. */
 #define APP_FLRC_BITRATE_BPS            2600000UL
@@ -61,8 +61,8 @@
 /* Double-sided FLRC bandwidth paired with 2.6 Mbps in the LR2021 driver. */
 #define APP_FLRC_BANDWIDTH_HZ           2666000UL
 
-/* Initial TX power for bench tests; adjust for range, heat, and regulations. */
-#define APP_FLRC_TX_POWER_DBM           10
+/* Initial TX power for 868 MHz bench tests; adjust for range, heat, and regulations. */
+#define APP_FLRC_TX_POWER_DBM           14
 
 /* Use FEC during early tests; switch to RAL_FLRC_CR_1_1 only after range tests. */
 #define APP_FLRC_CODING_RATE            RAL_FLRC_CR_1_2
