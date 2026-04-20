@@ -73,8 +73,10 @@
 /* Keep payloads small so each packet carries one low-latency voice frame. */
 #define APP_FLRC_MAX_PAYLOAD_BYTES      255U
 
-/* Pack several 20 ms Opus frames per FLRC packet to reduce RAC TX overhead. */
-#define APP_FLRC_OPUS_FRAMES_PER_PACKET 3U
+/* Pack several 20 ms Opus frames per FLRC packet to reduce RAC TX overhead.
+ * At 16 kbps CBR each Opus frame is about 40 bytes, so 5 frames fits in the
+ * 255-byte FLRC payload with per-frame length bytes and the app header. */
+#define APP_FLRC_OPUS_FRAMES_PER_PACKET 5U
 
 /* RX timeout used by the packet receiver before it re-arms listening. */
 #define APP_FLRC_RX_TIMEOUT_MS          100U
@@ -123,7 +125,10 @@
 #define APP_VOICE_RX_QUEUE_LEN          12U
 
 /* Number of encoded voice frames buffered between microphone and radio TX. */
-#define APP_VOICE_TX_QUEUE_LEN          12U
+#define APP_VOICE_TX_QUEUE_LEN          25U
+
+/* Only print one TX queue overflow warning every N dropped voice frames. */
+#define APP_TX_DROP_LOG_EVERY_N         25U
 
 /* Opus decode plus I2S write run here so radio RX can re-arm quickly. */
 #define APP_VOICE_PLAY_TASK_PRIORITY    5

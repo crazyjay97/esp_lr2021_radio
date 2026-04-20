@@ -429,11 +429,15 @@ void RadioPing::capture_voice_packet()
         (void)xQueueReceive(tx_queue_, &dropped, 0);
         tx_queue_drops_++;
         if (xQueueSend(tx_queue_, &frame, 0) == pdTRUE) {
-            ESP_LOGW(TAG, "voice TX queue full, dropped oldest seq=%u drops=%lu",
-                     dropped.seq, static_cast<unsigned long>(tx_queue_drops_));
+            if ((tx_queue_drops_ % APP_TX_DROP_LOG_EVERY_N) == 1) {
+                ESP_LOGW(TAG, "voice TX queue full, dropped oldest seq=%u drops=%lu",
+                         dropped.seq, static_cast<unsigned long>(tx_queue_drops_));
+            }
         } else {
-            ESP_LOGW(TAG, "voice TX queue full drops=%lu",
-                     static_cast<unsigned long>(tx_queue_drops_));
+            if ((tx_queue_drops_ % APP_TX_DROP_LOG_EVERY_N) == 1) {
+                ESP_LOGW(TAG, "voice TX queue full drops=%lu",
+                         static_cast<unsigned long>(tx_queue_drops_));
+            }
         }
     }
 }
