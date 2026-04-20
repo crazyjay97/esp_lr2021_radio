@@ -27,18 +27,6 @@ int32_t abs16(int16_t v)
     return v < 0 ? -static_cast<int32_t>(v) : v;
 }
 
-const char *status_to_string(rp_status_t status)
-{
-    switch (status) {
-    case RP_STATUS_RX_CRC_ERROR: return "RX_CRC_ERROR";
-    case RP_STATUS_TX_DONE: return "TX_DONE";
-    case RP_STATUS_RX_PACKET: return "RX_PACKET";
-    case RP_STATUS_RX_TIMEOUT: return "RX_TIMEOUT";
-    case RP_STATUS_TASK_ABORTED: return "TASK_ABORTED";
-    default: return "OTHER";
-    }
-}
-
 void put_u16_le(uint8_t *p, uint16_t v)
 {
     p[0] = static_cast<uint8_t>(v);
@@ -72,7 +60,6 @@ esp_err_t RadioPing::init()
 {
     instance_ = this;
 
-    smtc_rac_init();
     esp_err_t err = codec_.init();
     if (err != ESP_OK) {
         return err;
@@ -89,15 +76,27 @@ esp_err_t RadioPing::init()
         return ESP_ERR_NO_MEM;
     }
 
-    radio_id_ = smtc_rac_open_radio(RAC_LOW_PRIORITY);
-    if (radio_id_ == RAC_INVALID_RADIO_ID) {
-        ESP_LOGE(TAG, "smtc_rac_open_radio failed");
+    smtc_modem_hal_protect_api_call();
+    ral_status_t status = ral_reset(&radio_.ral);
+    if (status == RAL_STATUS_OK) status = ral_init(&radio_.ral);
+    if (status == RAL_STATUS_OK) {
+        status = ral_set_rx_tx_fallback_mode(&radio_.ral, RAL_FALLBACK_STDBY_XOSC);
+    }
+    if (status == RAL_STATUS_OK) status = ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+    if (status == RAL_STATUS_OK && !configure_flrc()) status = RAL_STATUS_ERROR;
+    if (status == RAL_STATUS_OK) {
+        status = ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+    }
+    smtc_modem_hal_irq_config_radio_irq(&RadioPing::irq_callback, this);
+    smtc_modem_hal_unprotect_api_call();
+
+    if (status != RAL_STATUS_OK) {
+        ESP_LOGE(TAG, "direct RAL init failed: %d", status);
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "LR2021 RAC initialized: radio_id=%u FLRC rf=%lu Hz br=%lu bps bw=%lu Hz",
-             radio_id_, APP_FLRC_FREQUENCY_HZ, APP_FLRC_BITRATE_BPS,
-             APP_FLRC_BANDWIDTH_HZ);
+    ESP_LOGI(TAG, "LR2021 direct RAL initialized: FLRC rf=%lu Hz br=%lu bps bw=%lu Hz",
+             APP_FLRC_FREQUENCY_HZ, APP_FLRC_BITRATE_BPS, APP_FLRC_BANDWIDTH_HZ);
     schedule_rx();
     return ESP_OK;
 }
@@ -144,7 +143,11 @@ void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
         if (tx_queue_ != nullptr) {
             xQueueReset(tx_queue_);
         }
-        smtc_rac_abort_radio_submit(radio_id_);
+        smtc_modem_hal_protect_api_call();
+        (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+        (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+        smtc_modem_hal_unprotect_api_call();
+        mode_ = Mode::idle;
     } else if (!pressed) {
         tx_flush_pending_ = true;
         if (mode_ == Mode::idle) {
@@ -217,12 +220,15 @@ void RadioPing::play_task()
 
 void RadioPing::poll_once()
 {
-    smtc_rac_run_engine();
-    taskYIELD();
-
-    if (done_) {
-        done_ = false;
-        on_done(done_status_);
+    if (irq_pending_) {
+        irq_pending_ = false;
+        ral_irq_t irq = RAL_IRQ_NONE;
+        smtc_modem_hal_protect_api_call();
+        ral_status_t status = ral_get_and_clear_irq_status(&radio_.ral, &irq);
+        smtc_modem_hal_unprotect_api_call();
+        if (status == RAL_STATUS_OK && irq != RAL_IRQ_NONE) {
+            handle_irq(irq);
+        }
     }
 
     if ((ptt_active_ || tx_flush_pending_) && mode_ == Mode::idle) {
@@ -233,60 +239,66 @@ void RadioPing::poll_once()
     taskYIELD();
 }
 
-void RadioPing::post_callback(rp_status_t status)
+void RadioPing::irq_callback(void *context)
 {
-    if (instance_ == nullptr) return;
-    instance_->done_status_ = status;
-    instance_->done_ = true;
+    auto *self = static_cast<RadioPing *>(context);
+    if (self != nullptr) {
+        self->irq_pending_ = true;
+    }
 }
 
-void RadioPing::on_done(rp_status_t status)
+void RadioPing::handle_irq(ral_irq_t irq)
 {
     Mode completed_mode = mode_;
     mode_ = Mode::idle;
 
     if (completed_mode == Mode::rx_pending) {
-        if (status == RP_STATUS_RX_PACKET) {
+        if ((irq & RAL_IRQ_RX_DONE) != 0) {
             handle_rx_packet();
-        } else if (status == RP_STATUS_RX_CRC_ERROR) {
+        } else if ((irq & RAL_IRQ_RX_CRC_ERROR) != 0) {
             rx_crc_errors_++;
             if ((rx_crc_errors_ % 10) == 1) {
                 ESP_LOGW(TAG, "RX CRC errors=%lu", static_cast<unsigned long>(rx_crc_errors_));
             }
-        } else if (status != RP_STATUS_RX_TIMEOUT && status != RP_STATUS_TASK_ABORTED) {
-            ESP_LOGW(TAG, "RX done: %s", status_to_string(status));
+        } else if ((irq & RAL_IRQ_RX_HDR_ERROR) != 0) {
+            ESP_LOGW(TAG, "RX header error");
+        } else if ((irq & RAL_IRQ_RX_TIMEOUT) == 0) {
+            ESP_LOGW(TAG, "RX irq=0x%08lx", static_cast<unsigned long>(irq));
         }
     } else if (completed_mode == Mode::tx_pending) {
-        if (status != RP_STATUS_TX_DONE) {
-            ESP_LOGW(TAG, "TX done: %s", status_to_string(status));
+        if ((irq & RAL_IRQ_TX_DONE) == 0) {
+            ESP_LOGW(TAG, "TX irq=0x%08lx", static_cast<unsigned long>(irq));
         }
         if (APP_FLRC_VOICE_TX_GAP_MS > 0) {
-            vTaskDelay(pdMS_TO_TICKS(APP_FLRC_VOICE_TX_GAP_MS));
+            vTaskDelay(ms_to_ticks_min_1(APP_FLRC_VOICE_TX_GAP_MS));
         }
     }
 }
 
 void RadioPing::schedule_rx()
 {
-    if (radio_id_ == RAC_INVALID_RADIO_ID || mode_ != Mode::idle) return;
+    if (mode_ != Mode::idle) return;
 
-    smtc_rac_context_t *ctx = smtc_rac_get_context(radio_id_);
-    std::memset(ctx, 0, sizeof(*ctx));
-    configure_common(ctx, false, 0);
-    ctx->smtc_rac_data_buffer_setup.rx_payload_buffer = rx_buf_;
-    ctx->smtc_rac_data_buffer_setup.size_of_rx_payload_buffer = sizeof(rx_buf_);
+    smtc_modem_hal_protect_api_call();
+    smtc_modem_hal_start_radio_tcxo();
+    smtc_modem_hal_set_ant_switch(false);
+    ral_status_t status = ral_set_dio_irq_params(&radio_.ral,
+                                                 RAL_IRQ_RX_DONE | RAL_IRQ_RX_TIMEOUT |
+                                                 RAL_IRQ_RX_HDR_ERROR | RAL_IRQ_RX_CRC_ERROR);
+    if (status == RAL_STATUS_OK) status = ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+    if (status == RAL_STATUS_OK) status = ral_set_rx(&radio_.ral, APP_FLRC_RX_TIMEOUT_MS);
+    smtc_modem_hal_unprotect_api_call();
 
-    smtc_rac_return_code_t rc = smtc_rac_submit_radio_transaction(radio_id_);
-    if (rc == SMTC_RAC_SUCCESS) {
+    if (status == RAL_STATUS_OK) {
         mode_ = Mode::rx_pending;
     } else {
-        ESP_LOGW(TAG, "schedule RX failed: %d", rc);
+        ESP_LOGW(TAG, "schedule RX failed: %d", status);
     }
 }
 
 void RadioPing::schedule_tx()
 {
-    if (radio_id_ == RAC_INVALID_RADIO_ID || mode_ != Mode::idle) return;
+    if (mode_ != Mode::idle) return;
     if (tx_queue_ == nullptr) return;
 
     UBaseType_t queued = uxQueueMessagesWaiting(tx_queue_);
@@ -306,50 +318,45 @@ void RadioPing::schedule_tx()
         return;
     }
 
-    smtc_rac_context_t *ctx = smtc_rac_get_context(radio_id_);
-    std::memset(ctx, 0, sizeof(*ctx));
-    configure_common(ctx, true, tx_size);
-    ctx->smtc_rac_data_buffer_setup.tx_payload_buffer = tx_buf_;
-    ctx->smtc_rac_data_buffer_setup.size_of_tx_payload_buffer = tx_size;
+    smtc_modem_hal_protect_api_call();
+    smtc_modem_hal_start_radio_tcxo();
+    smtc_modem_hal_set_ant_switch(true);
+    ral_status_t status = ral_set_dio_irq_params(&radio_.ral, RAL_IRQ_TX_DONE);
+    if (status == RAL_STATUS_OK) status = ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+    if (status == RAL_STATUS_OK) status = ral_set_pkt_payload(&radio_.ral, tx_buf_, tx_size);
+    if (status == RAL_STATUS_OK) status = ral_set_tx(&radio_.ral);
+    smtc_modem_hal_unprotect_api_call();
 
-    smtc_rac_return_code_t rc = smtc_rac_submit_radio_transaction(radio_id_);
-    if (rc == SMTC_RAC_SUCCESS) {
+    if (status == RAL_STATUS_OK) {
         mode_ = Mode::tx_pending;
         if (!ptt_active_ && uxQueueMessagesWaiting(tx_queue_) == 0) {
             tx_flush_pending_ = false;
         }
     } else {
-        ESP_LOGW(TAG, "schedule TX failed: %d", rc);
+        ESP_LOGW(TAG, "schedule TX failed: %d", status);
     }
 }
 
-void RadioPing::configure_common(smtc_rac_context_t *ctx, bool is_tx, uint16_t tx_size)
+bool RadioPing::configure_flrc()
 {
-    ctx->modulation_type = SMTC_RAC_MODULATION_FLRC;
-    ctx->radio_params.flrc.is_tx = is_tx;
-    ctx->radio_params.flrc.tx_size = tx_size;
-    ctx->radio_params.flrc.max_rx_size = APP_FLRC_MAX_PAYLOAD_BYTES;
-    ctx->radio_params.flrc.frequency_in_hz = APP_FLRC_FREQUENCY_HZ;
-    ctx->radio_params.flrc.tx_power_in_dbm = APP_FLRC_TX_POWER_DBM;
-    ctx->radio_params.flrc.br_in_bps = APP_FLRC_BITRATE_BPS;
-    ctx->radio_params.flrc.bw_dsb_in_hz = APP_FLRC_BANDWIDTH_HZ;
-    ctx->radio_params.flrc.cr = APP_FLRC_CODING_RATE;
-    ctx->radio_params.flrc.pulse_shape = APP_FLRC_PULSE_SHAPE;
-    ctx->radio_params.flrc.preamble_len_in_bits = 32;
-    ctx->radio_params.flrc.sync_word_len = RAL_FLRC_SYNCWORD_LENGTH_4_BYTES;
-    ctx->radio_params.flrc.tx_syncword = RAL_FLRC_TX_SYNCWORD_1;
-    ctx->radio_params.flrc.match_sync_word = RAL_FLRC_RX_MATCH_SYNCWORD_1;
-    ctx->radio_params.flrc.pld_is_fix = false;
-    ctx->radio_params.flrc.crc_type = RAL_FLRC_CRC_2_BYTES;
-    ctx->radio_params.flrc.sync_word = kSyncWord;
-    ctx->radio_params.flrc.crc_seed = 0xFFFFFFFFUL;
-    ctx->radio_params.flrc.crc_polynomial = 0x04C11DB7UL;
-    ctx->radio_params.flrc.rx_timeout_ms = APP_FLRC_RX_TIMEOUT_MS;
-
-    ctx->scheduler_config.start_time_ms = smtc_modem_hal_get_time_in_ms();
-    ctx->scheduler_config.scheduling = SMTC_RAC_ASAP_TRANSACTION;
-    ctx->scheduler_config.callback_pre_radio_transaction = nullptr;
-    ctx->scheduler_config.callback_post_radio_transaction = &RadioPing::post_callback;
+    ralf_params_flrc_t params = {};
+    params.rf_freq_in_hz = APP_FLRC_FREQUENCY_HZ;
+    params.output_pwr_in_dbm = APP_FLRC_TX_POWER_DBM;
+    params.mod_params.br_in_bps = APP_FLRC_BITRATE_BPS;
+    params.mod_params.bw_dsb_in_hz = APP_FLRC_BANDWIDTH_HZ;
+    params.mod_params.cr = APP_FLRC_CODING_RATE;
+    params.mod_params.pulse_shape = APP_FLRC_PULSE_SHAPE;
+    params.pkt_params.preamble_len_in_bits = 32;
+    params.pkt_params.sync_word_len = RAL_FLRC_SYNCWORD_LENGTH_4_BYTES;
+    params.pkt_params.tx_syncword = RAL_FLRC_TX_SYNCWORD_1;
+    params.pkt_params.match_sync_word = RAL_FLRC_RX_MATCH_SYNCWORD_1;
+    params.pkt_params.pld_is_fix = false;
+    params.pkt_params.pld_len_in_bytes = APP_FLRC_MAX_PAYLOAD_BYTES;
+    params.pkt_params.crc_type = RAL_FLRC_CRC_2_BYTES;
+    params.sync_word = kSyncWord;
+    params.crc_seed = 0xFFFFFFFFUL;
+    params.crc_polynomial = 0x04C11DB7UL;
+    return ralf_setup_flrc(&radio_, &params) == RAL_STATUS_OK;
 }
 
 bool RadioPing::build_voice_packet(uint16_t *tx_size)
@@ -444,9 +451,22 @@ void RadioPing::capture_voice_packet()
 
 void RadioPing::handle_rx_packet()
 {
-    smtc_rac_context_t *ctx = smtc_rac_get_context(radio_id_);
-    uint16_t len = ctx->smtc_rac_data_result.rx_size;
-    int16_t rssi = ctx->smtc_rac_data_result.rssi_result;
+    uint16_t len = 0;
+    ral_flrc_rx_pkt_status_t pkt_status = {};
+
+    smtc_modem_hal_protect_api_call();
+    ral_status_t status = ral_get_pkt_payload(&radio_.ral, sizeof(rx_buf_), rx_buf_, &len);
+    if (status == RAL_STATUS_OK) {
+        status = ral_get_flrc_rx_pkt_status(&radio_.ral, &pkt_status);
+    }
+    smtc_modem_hal_unprotect_api_call();
+
+    if (status != RAL_STATUS_OK) {
+        ESP_LOGW(TAG, "RX read failed: %d", status);
+        return;
+    }
+
+    int16_t rssi = pkt_status.rssi_sync_in_dbm;
 
     if (len < kHeaderSize || std::memcmp(rx_buf_, kMagic, sizeof(kMagic)) != 0) {
         ESP_LOGW(TAG, "RX unknown packet len=%u rssi=%d", len, rssi);

@@ -27,16 +27,16 @@ private:
     static void task_trampoline(void *arg);
     static void tx_task_trampoline(void *arg);
     static void play_task_trampoline(void *arg);
-    static void post_callback(rp_status_t status);
+    static void irq_callback(void *context);
 
     void task();
     void tx_task();
     void play_task();
     void poll_once();
-    void on_done(rp_status_t status);
+    void handle_irq(ral_irq_t irq);
     void schedule_rx();
     void schedule_tx();
-    void configure_common(smtc_rac_context_t *ctx, bool is_tx, uint16_t tx_size);
+    bool configure_flrc();
     bool build_voice_packet(uint16_t *tx_size);
     void capture_voice_packet();
     void handle_rx_packet();
@@ -64,15 +64,14 @@ private:
 
     static RadioPing *instance_;
 
-    uint8_t radio_id_ = RAC_INVALID_RADIO_ID;
+    ralf_t radio_ = RALF_LR20XX_INSTANTIATE(nullptr);
     OpusCodec codec_;
     QueueHandle_t voice_queue_ = nullptr;
     QueueHandle_t tx_queue_ = nullptr;
     Mode mode_ = Mode::idle;
     volatile bool ptt_active_ = false;
     bool tx_flush_pending_ = false;
-    volatile bool done_ = false;
-    volatile rp_status_t done_status_ = RP_STATUS_TASK_INIT;
+    volatile bool irq_pending_ = false;
 
     uint8_t tx_buf_[APP_FLRC_MAX_PAYLOAD_BYTES] = {};
     uint8_t rx_buf_[APP_FLRC_MAX_PAYLOAD_BYTES] = {};
