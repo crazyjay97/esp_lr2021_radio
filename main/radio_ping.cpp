@@ -58,6 +58,12 @@ uint16_t get_u16_le(const uint8_t *p)
     return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
 }
 
+TickType_t ms_to_ticks_min_1(uint32_t ms)
+{
+    TickType_t ticks = pdMS_TO_TICKS(ms);
+    return ticks == 0 ? 1 : ticks;
+}
+
 } // namespace
 
 RadioPing *RadioPing::instance_ = nullptr;
@@ -142,7 +148,7 @@ void RadioPing::task()
     while (true) {
         poll_once();
         update_playback_timeout();
-        vTaskDelay(pdMS_TO_TICKS(APP_RADIO_TASK_POLL_MS));
+        vTaskDelay(ms_to_ticks_min_1(APP_RADIO_TASK_POLL_MS));
     }
 }
 
@@ -408,7 +414,7 @@ void RadioPing::wait_for_jitter_buffer()
         if (smtc_modem_hal_get_time_in_ms() - start_ms >= APP_RX_JITTER_BUFFER_MS) {
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(ms_to_ticks_min_1(1));
     }
 }
 
