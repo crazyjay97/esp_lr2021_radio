@@ -21,6 +21,11 @@ constexpr uint8_t kPacketTypePing = 1;
 constexpr uint8_t kPacketTypeVoice = 2;
 constexpr uint16_t kHeaderSize = 14;
 
+int32_t abs16(int16_t v)
+{
+    return v < 0 ? -static_cast<int32_t>(v) : v;
+}
+
 const char *status_to_string(rp_status_t status)
 {
     switch (status) {
@@ -99,7 +104,7 @@ void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
     if (id != APP_PTT_BUTTON) return;
 
     ptt_active_ = pressed;
-    ESP_LOGI(TAG, "PTT %s -> FLRC ping %s", pressed ? "down" : "up",
+    ESP_LOGI(TAG, "PTT %s -> FLRC voice %s", pressed ? "down" : "up",
              pressed ? "TX" : "RX");
 
     if (pressed && mode_ == Mode::rx_pending) {
@@ -172,7 +177,9 @@ void RadioPing::on_done(rp_status_t status)
         } else {
             ESP_LOGW(TAG, "TX done: %s", status_to_string(status));
         }
-        vTaskDelay(pdMS_TO_TICKS(APP_FLRC_PING_INTERVAL_MS));
+        if (APP_FLRC_VOICE_TX_GAP_MS > 0) {
+            vTaskDelay(pdMS_TO_TICKS(APP_FLRC_VOICE_TX_GAP_MS));
+        }
     }
 }
 
@@ -274,6 +281,11 @@ bool RadioPing::build_voice_packet(uint16_t *tx_size)
 
     tx_buf_[12] = static_cast<uint8_t>(encoded);
     *tx_size = static_cast<uint16_t>(kHeaderSize + encoded);
+    if ((tx_seq_ % APP_VOICE_LOG_EVERY_N) == 0) {
+        ESP_LOGI(TAG, "voice TX seq=%u opus=%d total=%u",
+                 static_cast<unsigned>(tx_seq_ - 1), encoded,
+                 static_cast<unsigned>(*tx_size));
+    }
     return true;
 }
 
@@ -320,7 +332,7 @@ void RadioPing::handle_voice_packet(uint16_t len, int16_t rssi)
     last_rx_audio_ms_ = smtc_modem_hal_get_time_in_ms();
     playback_active_ = true;
     uint32_t age = last_rx_audio_ms_ - tx_ms;
-    if ((seq % 50) == 0) {
+    if ((seq % APP_VOICE_LOG_EVERY_N) == 0) {
         ESP_LOGI(TAG, "voice seq=%u opus=%u pcm=%d age=%lu ms",
                  seq, opus_len, decoded, static_cast<unsigned long>(age));
     }
@@ -374,7 +386,7 @@ bool RadioPing::read_mono_frame(int16_t *mono, size_t samples)
     for (size_t i = 0; i < samples; i++) {
         int16_t left = stereo[2 * i];
         int16_t right = stereo[2 * i + 1];
-        mono[i] = (left / 2) + (right / 2);
+        mono[i] = (abs16(left) >= abs16(right)) ? left : right;
     }
     return true;
 }
@@ -397,6 +409,9 @@ void RadioPing::play_mono_frame(const int16_t *mono, size_t samples)
     if (err != ESP_OK || written == 0) {
         ESP_LOGW(TAG, "audio write failed: %s written=%u",
                  esp_err_to_name(err), static_cast<unsigned>(written));
+    } else if ((rx_packets_ % APP_VOICE_LOG_EVERY_N) == 0) {
+        ESP_LOGI(TAG, "audio play samples=%u written=%u",
+                 static_cast<unsigned>(samples), static_cast<unsigned>(written));
     }
 }
 

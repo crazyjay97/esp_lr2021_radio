@@ -76,8 +76,11 @@
 /* RX timeout used by the packet receiver before it re-arms listening. */
 #define APP_FLRC_RX_TIMEOUT_MS          100U
 
-/* Interval between PTT-held FLRC ping packets before real audio is connected. */
-#define APP_FLRC_PING_INTERVAL_MS       50U
+/* Extra gap after each voice TX packet. Keep at 0 for continuous 20 ms audio. */
+#define APP_FLRC_VOICE_TX_GAP_MS        0U
+
+/* Log one voice frame every N packets to avoid flooding the serial console. */
+#define APP_VOICE_LOG_EVERY_N           25U
 
 /* Poll period for the RAC engine task. Keep this long enough for IDLE tasks. */
 #define APP_RADIO_TASK_POLL_MS          20U
