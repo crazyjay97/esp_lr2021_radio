@@ -41,6 +41,7 @@ constexpr size_t kRawCapacityBytes = 4U * 1024U;
 constexpr uint32_t kBurstPollBudget = 32U * 1000U;
 constexpr uint64_t kCaptureMaxUs = 250U * 1000U;
 constexpr uint64_t kFullFrameMaxUs = 12U * 1000U * 1000U;
+constexpr uint64_t kRawFrameMaxUs = 4U * 1000U * 1000U;
 constexpr uint32_t kSensorWidth = APP_CAMERA_SENSOR_WIDTH;
 constexpr uint32_t kSensorHeight = APP_CAMERA_SENSOR_HEIGHT;
 constexpr size_t kSensorRowBytes = kSensorWidth * 2U;
@@ -678,6 +679,52 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
 {
 #if APP_CAMERA_FULL_FRAME_ENABLE
     uint64_t t0 = esp_timer_get_time();
+#if APP_CAMERA_RAW_ACCUM_ENABLE
+    Spi2WirePacker packer = {
+        .swap = false,
+        .lsb_first = false,
+    };
+    size_t frame_len = 0;
+    size_t total_pairs = 0;
+    while (frame_len < frame_capacity_ &&
+           esp_timer_get_time() - t0 < kRawFrameMaxUs) {
+        size_t got = spi2_cpu_burst(raw_pair_buf_, raw_capacity_,
+                                    /*sample_falling=*/true, kBurstPollBudget);
+        if (got < 16) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        total_pairs += got;
+        frame_len += packer.push(raw_pair_buf_, got,
+                                 frame_buf_ + frame_len,
+                                 frame_capacity_ - frame_len);
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    uint64_t dt_us = esp_timer_get_time() - t0;
+    char line[192];
+    if (frame_len < frame_capacity_) {
+        std::snprintf(line, sizeof(line),
+                      "raw-frame seq=%lu timeout bytes=%u/%u pairs=%u took=%llu us",
+                      static_cast<unsigned long>(seq),
+                      static_cast<unsigned>(frame_len),
+                      static_cast<unsigned>(frame_capacity_),
+                      static_cast<unsigned>(total_pairs),
+                      static_cast<unsigned long long>(dt_us));
+        write_status(line);
+        return;
+    }
+
+    std::snprintf(line, sizeof(line),
+                  "raw-frame seq=%lu bytes=%u pairs=%u took=%llu us",
+                  static_cast<unsigned long>(seq),
+                  static_cast<unsigned>(frame_len),
+                  static_cast<unsigned>(total_pairs),
+                  static_cast<unsigned long long>(dt_us));
+    write_status(line);
+    emit_frame(seq, frame_buf_, frame_len, kSensorWidth, kSensorHeight);
+    return;
+#else
     FrameAssembler msb = {
         .out = frame_buf_,
         .out_capacity = frame_capacity_,
@@ -744,6 +791,7 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
     write_status(line);
     emit_frame(seq, winner->out, winner->out_len, kSensorWidth, kSensorHeight);
     return;
+#endif
 #else
     uint64_t t0 = esp_timer_get_time();
     size_t got_total = 0;

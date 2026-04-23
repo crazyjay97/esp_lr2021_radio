@@ -301,7 +301,7 @@ def capture_worker(args: argparse.Namespace, frame_queue: "queue.Queue[Frame] | 
                     is_full_size = frame.raw_len == expected_raw_len and (
                         frame.width >= args.min_width and frame.height >= args.min_height
                     )
-                    if args.skip_partial and not is_full_size:
+                    if not args.save_partial and not is_full_size:
                         print(
                             f"skipped partial frame {frame.number}: "
                             f"{frame.width}x{frame.height}, raw={frame.raw_len}, expected={expected_raw_len}",
@@ -355,13 +355,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=15.0, help="serial read timeout in seconds")
     parser.add_argument("--keep-waiting", action="store_true", help="keep waiting after serial read timeouts")
     parser.add_argument("--max-payload", type=int, default=1024 * 1024, help="maximum packet payload bytes")
-    parser.add_argument("--skip-partial", action="store_true", help="skip tiny diagnostic/partial frames")
+    parser.add_argument("--skip-partial", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--save-partial", action="store_true", help="save tiny diagnostic/partial frames")
     parser.add_argument("--min-width", type=int, default=640, help="minimum width accepted by --skip-partial")
     parser.add_argument("--min-height", type=int, default=480, help="minimum height accepted by --skip-partial")
     parser.add_argument("--no-save", action="store_true", help="preview only, do not write image files")
     args = parser.parse_args(argv)
     if args.no_save:
         args.output = None
+    if args.skip_partial:
+        args.save_partial = False
     if args.no_save and not args.preview and args.count == 0:
         parser.error("--no-save without --preview needs a positive --count")
     if args.scale < 1:
