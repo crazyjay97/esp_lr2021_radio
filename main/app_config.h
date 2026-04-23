@@ -174,8 +174,10 @@
  * it can sustain the binary stream without drops. */
 #define APP_CAMERA_UART_BAUD            921600
 
-/* GC032A reference designs commonly use a 24 MHz master clock. */
-#define APP_GC032A_MCLK_HZ              24000000U
+/* Keep MCLK low for the current CPU GPIO sampler. The GC032A reference table
+ * was written for a faster clock, but CPU polling cannot reliably capture the
+ * resulting 2-bit stream at 24 MHz MCLK. */
+#define APP_GC032A_MCLK_HZ              6000000U
 #define APP_GC032A_I2C_ADDR             0x21U
 
 /* GC032A SPI mode emits a 640x480 YVYU/YUV422 stream with in-band sync bytes. */

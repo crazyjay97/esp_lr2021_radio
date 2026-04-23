@@ -40,7 +40,7 @@ constexpr uint16_t kGc032aExpectedId = 0x232A;
 constexpr size_t kRawCapacityBytes = 8U * 1024U;
 constexpr uint32_t kBurstPollBudget = 125U * 1000U;
 constexpr uint64_t kCaptureMaxUs = 250U * 1000U;
-constexpr uint64_t kFullFrameMaxUs = 7U * 1000U * 1000U;
+constexpr uint64_t kFullFrameMaxUs = 12U * 1000U * 1000U;
 constexpr uint32_t kSensorWidth = APP_CAMERA_SENSOR_WIDTH;
 constexpr uint32_t kSensorHeight = APP_CAMERA_SENSOR_HEIGHT;
 constexpr size_t kSensorRowBytes = kSensorWidth * 2U;
@@ -80,19 +80,14 @@ struct FrameAssembler {
         lines = 0;
     }
 
-    void finish_line(uint8_t next_byte)
+    void finish_line()
     {
         ++lines;
         if (lines >= kSensorHeight || out_len >= out_capacity) {
             done = true;
             return;
         }
-        if (next_byte == kLineStart) {
-            line_pos = 0;
-            state = FrameParseState::Payload;
-        } else {
-            state = FrameParseState::SeekLineStart;
-        }
+        state = FrameParseState::SeekLineStart;
     }
 
     void feed(uint8_t b, size_t packed_offset)
@@ -135,10 +130,14 @@ struct FrameAssembler {
 
         case FrameParseState::ExpectLineEnd:
             if (b == kLineEnd) {
-                finish_line(0);
+                finish_line();
             } else {
                 ++bad_line_end;
-                finish_line(b);
+                ++restarts;
+                reset_frame();
+                if (b == kFrameStart) {
+                    state = FrameParseState::SeekLineStart;
+                }
             }
             break;
         }
