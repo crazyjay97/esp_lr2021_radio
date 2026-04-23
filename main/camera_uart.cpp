@@ -37,8 +37,8 @@ constexpr uint16_t kGc032aExpectedId = 0x232A;
 
 // 32 KB raw window = 32K PCLK edges. This captures a short slice of the
 // GC032A's 640x480 2-bit stream for bring-up preview and sync diagnostics.
-constexpr size_t kRawCapacityBytes = 8U * 1024U;
-constexpr uint32_t kBurstPollBudget = 125U * 1000U;
+constexpr size_t kRawCapacityBytes = 4U * 1024U;
+constexpr uint32_t kBurstPollBudget = 32U * 1000U;
 constexpr uint64_t kCaptureMaxUs = 250U * 1000U;
 constexpr uint64_t kFullFrameMaxUs = 12U * 1000U * 1000U;
 constexpr uint32_t kSensorWidth = APP_CAMERA_SENSOR_WIDTH;
@@ -213,23 +213,57 @@ static size_t spi2_cpu_burst(uint8_t *raw_pairs, size_t pair_total,
 // Pack `pair_count` raw 2-bit samples into bytes. `swap` swaps D0/D1 inside the
 // pair; `lsb_first` controls whether the first PCLK sample lands in bits [1:0]
 // of the packed byte (LSB) or bits [7:6] (MSB).
+struct Spi2WirePacker {
+    bool swap = false;
+    bool lsb_first = false;
+    uint8_t out_byte = 0;
+    uint8_t phase = 0;
+
+    void reset()
+    {
+        out_byte = 0;
+        phase = 0;
+    }
+
+    uint8_t normalize_pair(uint8_t pair) const
+    {
+        pair &= 0x03U;
+        if (swap) {
+            pair = static_cast<uint8_t>(((pair & 0x01U) << 1) |
+                                        ((pair & 0x02U) >> 1));
+        }
+        return pair;
+    }
+
+    size_t push(const uint8_t *raw_pairs, size_t pair_count,
+                uint8_t *packed, size_t packed_capacity)
+    {
+        size_t out_len = 0;
+        for (size_t i = 0; i < pair_count; ++i) {
+            uint8_t pair = normalize_pair(raw_pairs[i]);
+            uint32_t shift = lsb_first ? (phase * 2U) : ((3U - phase) * 2U);
+            out_byte = static_cast<uint8_t>(out_byte | (pair << shift));
+            if (++phase >= 4U) {
+                if (out_len >= packed_capacity) {
+                    reset();
+                    return out_len;
+                }
+                packed[out_len++] = out_byte;
+                reset();
+            }
+        }
+        return out_len;
+    }
+};
+
 size_t pack_pairs(const uint8_t *raw_pairs, size_t pair_count,
                   uint8_t *packed, bool swap, bool lsb_first)
 {
-    const size_t byte_count = pair_count / 4U;
-    for (size_t b = 0; b < byte_count; ++b) {
-        uint8_t out = 0;
-        for (int i = 0; i < 4; ++i) {
-            uint8_t p = raw_pairs[b * 4 + i] & 0x03U;
-            if (swap) {
-                p = static_cast<uint8_t>(((p & 0x01U) << 1) | ((p & 0x02U) >> 1));
-            }
-            uint32_t shift = lsb_first ? (i * 2) : ((3 - i) * 2);
-            out = static_cast<uint8_t>(out | (p << shift));
-        }
-        packed[b] = out;
-    }
-    return byte_count;
+    Spi2WirePacker packer = {
+        .swap = swap,
+        .lsb_first = lsb_first,
+    };
+    return packer.push(raw_pairs, pair_count, packed, pair_count / 4U);
 }
 
 struct DecodeStats {
@@ -648,6 +682,10 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
         .out = frame_buf_,
         .out_capacity = frame_capacity_,
     };
+    Spi2WirePacker packer = {
+        .swap = false,
+        .lsb_first = false,
+    };
 
     size_t total_pairs = 0;
     size_t total_packed = 0;
@@ -660,8 +698,8 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
         }
         total_pairs += got;
 
-        size_t packed_len = pack_pairs(raw_pair_buf_, got, packed_buf_,
-                                       /*swap=*/false, /*lsb_first=*/false);
+        size_t packed_len = packer.push(raw_pair_buf_, got, packed_buf_,
+                                        raw_capacity_ / 4U);
         for (size_t i = 0; i < packed_len; ++i) {
             msb.feed(packed_buf_[i], total_packed + i);
         }
@@ -707,12 +745,20 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
     emit_frame(seq, winner->out, winner->out_len, kSensorWidth, kSensorHeight);
     return;
 #else
-    std::memset(raw_pair_buf_, 0, raw_capacity_);
     uint64_t t0 = esp_timer_get_time();
-    size_t got = 0;
-    while (got < raw_capacity_) {
-        got += spi2_cpu_burst(raw_pair_buf_ + got, raw_capacity_ - got,
-                              /*sample_falling=*/true, kBurstPollBudget);
+    size_t got_total = 0;
+    size_t packed_len = 0;
+    Spi2WirePacker packer = {
+        .swap = false,
+        .lsb_first = true,
+    };
+    while (packed_len < raw_capacity_ / 4U) {
+        size_t got = spi2_cpu_burst(raw_pair_buf_, raw_capacity_,
+                                    /*sample_falling=*/true, kBurstPollBudget);
+        got_total += got;
+        packed_len += packer.push(raw_pair_buf_, got,
+                                  packed_buf_ + packed_len,
+                                  raw_capacity_ / 4U - packed_len);
         if (esp_timer_get_time() - t0 >= kCaptureMaxUs) {
             break;
         }
@@ -724,22 +770,20 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
     std::snprintf(line, sizeof(line),
                   "spi-frame seq=%lu edge=fall pairs=%u/%u took=%llu us (%.2f MHz est.)",
                   static_cast<unsigned long>(seq),
-                  static_cast<unsigned>(got),
+                  static_cast<unsigned>(got_total),
                   static_cast<unsigned>(raw_capacity_),
                   static_cast<unsigned long long>(dt_us),
-                  dt_us > 0 ? (static_cast<double>(got) / static_cast<double>(dt_us))
+                  dt_us > 0 ? (static_cast<double>(got_total) / static_cast<double>(dt_us))
                             : 0.0);
     write_status(line);
 
-    if (got < 16) {
+    if (got_total < 16 || packed_len == 0) {
         write_status("spi-burst: too few samples — PCLK not toggling?");
         return;
     }
 
-    // Current hardware captures the cleanest sync stream on falling PCLK with
-    // D0/D1 in natural order and first sample in the low bits.
-    size_t packed_len = pack_pairs(raw_pair_buf_, got, packed_buf_,
-                                   /*swap=*/false, /*lsb_first=*/true);
+    // Current hardware captures the cleanest diagnostic sync stream on falling
+    // PCLK with D0/D1 in natural order and first sample in the low bits.
     size_t image_len = 0;
     bool in_frame = false;
     bool in_line = false;
@@ -778,7 +822,6 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
 
     if (image_len == 0) {
         write_status("spi-frame: no line payload found in burst");
-        analyze_and_dump(raw_pair_buf_, got, /*sample_falling=*/true, seq);
         return;
     }
     size_t emit_len = std::min(image_len, kPreviewBytes);
@@ -786,7 +829,6 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
     emit_len = emit_height * kPreviewRowBytes;
     if (emit_height == 0) {
         write_status("spi-frame: payload shorter than one preview row");
-        analyze_and_dump(raw_pair_buf_, got, /*sample_falling=*/true, seq);
         return;
     }
 

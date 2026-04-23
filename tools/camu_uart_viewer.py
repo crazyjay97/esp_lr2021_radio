@@ -57,6 +57,7 @@ class Frame:
     number: int
     width: int
     height: int
+    raw: bytes
     rgb: bytes
     raw_len: int
 
@@ -198,6 +199,13 @@ def save_frame(path_pattern: str, frame: Frame) -> Path:
     return path
 
 
+def save_raw_frame(path_pattern: str, frame: Frame) -> Path:
+    path = Path(path_pattern.format(frame=frame.number, time=int(time.time())))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(frame.raw)
+    return path
+
+
 def frames_from_stream(stream: BinaryIO, max_payload: int):
     current_meta: dict[str, str] | None = None
     current_raw = bytearray()
@@ -235,6 +243,7 @@ def frames_from_stream(stream: BinaryIO, max_payload: int):
                 number=number,
                 width=width,
                 height=height,
+                raw=raw,
                 rgb=rgb,
                 raw_len=len(raw),
             )
@@ -288,10 +297,30 @@ def capture_worker(args: argparse.Namespace, frame_queue: "queue.Queue[Frame] | 
                 frame_iter = frames_from_stream(ser, max_payload=args.max_payload)
                 for frame in frame_iter:
                     captured += 1
+                    expected_raw_len = frame.width * frame.height * 2
+                    is_full_size = frame.raw_len == expected_raw_len and (
+                        frame.width >= args.min_width and frame.height >= args.min_height
+                    )
+                    if args.skip_partial and not is_full_size:
+                        print(
+                            f"skipped partial frame {frame.number}: "
+                            f"{frame.width}x{frame.height}, raw={frame.raw_len}, expected={expected_raw_len}",
+                            file=sys.stderr,
+                        )
+                        continue
                     if args.output:
                         saved_path = save_frame(args.output, frame)
                         saved += 1
-                        print(f"saved {saved_path} ({frame.width}x{frame.height}, frame {frame.number})")
+                        print(
+                            f"saved {saved_path} ({frame.width}x{frame.height}, "
+                            f"raw={frame.raw_len}, frame {frame.number})"
+                        )
+                    if args.raw_output:
+                        raw_path = save_raw_frame(args.raw_output, frame)
+                        print(
+                            f"saved raw {raw_path} ({frame.width}x{frame.height}, "
+                            f"raw={frame.raw_len}, frame {frame.number})"
+                        )
                     if frame_queue is not None:
                         try:
                             frame_queue.put_nowait(frame)
@@ -315,12 +344,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="captures/camu_{frame:06d}.png",
         help="output path pattern; supports {frame} and {time}; use .ppm to avoid Pillow",
     )
+    parser.add_argument(
+        "--raw-output",
+        default=None,
+        help="optional raw YUV/RGB output path pattern; complete 640x480 YVYU is 614400 bytes",
+    )
     parser.add_argument("-n", "--count", type=int, default=1, help="number of frames to save without --preview; 0 means forever")
     parser.add_argument("--preview", action="store_true", help="open a live preview window")
     parser.add_argument("--scale", type=int, default=3, help="integer preview scale, default: 3")
     parser.add_argument("--timeout", type=float, default=15.0, help="serial read timeout in seconds")
     parser.add_argument("--keep-waiting", action="store_true", help="keep waiting after serial read timeouts")
     parser.add_argument("--max-payload", type=int, default=1024 * 1024, help="maximum packet payload bytes")
+    parser.add_argument("--skip-partial", action="store_true", help="skip tiny diagnostic/partial frames")
+    parser.add_argument("--min-width", type=int, default=640, help="minimum width accepted by --skip-partial")
+    parser.add_argument("--min-height", type=int, default=480, help="minimum height accepted by --skip-partial")
     parser.add_argument("--no-save", action="store_true", help="preview only, do not write image files")
     args = parser.parse_args(argv)
     if args.no_save:
@@ -331,6 +368,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--scale must be >= 1")
     if args.count < 0:
         parser.error("--count must be >= 0")
+    if args.min_width < 1 or args.min_height < 1:
+        parser.error("--min-width and --min-height must be >= 1")
     return args
 
 

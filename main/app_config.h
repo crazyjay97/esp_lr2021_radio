@@ -62,7 +62,7 @@
 #define APP_FLRC_BANDWIDTH_HZ           2666000UL
 
 /* Initial TX power for 868 MHz bench tests; adjust for range, heat, and regulations. */
-#define APP_FLRC_TX_POWER_DBM           14
+#define APP_FLRC_TX_POWER_DBM           20
 
 /* Use FEC during early tests; switch to RAL_FLRC_CR_1_1 only after range tests. */
 #define APP_FLRC_CODING_RATE            RAL_FLRC_CR_1_2
@@ -174,10 +174,8 @@
  * it can sustain the binary stream without drops. */
 #define APP_CAMERA_UART_BAUD            921600
 
-/* Keep MCLK low for the current CPU GPIO sampler. The GC032A reference table
- * was written for a faster clock, but CPU polling cannot reliably capture the
- * resulting 2-bit stream at 24 MHz MCLK. */
-#define APP_GC032A_MCLK_HZ              6000000U
+/* GC032A reference designs commonly use a 24 MHz master clock. */
+#define APP_GC032A_MCLK_HZ              24000000U
 #define APP_GC032A_I2C_ADDR             0x21U
 
 /* GC032A SPI mode emits a 640x480 YVYU/YUV422 stream with in-band sync bytes. */
@@ -185,7 +183,7 @@
 #define APP_CAMERA_SENSOR_HEIGHT        480U
 #define APP_CAMERA_PREVIEW_WIDTH        64U
 #define APP_CAMERA_PREVIEW_HEIGHT       48U
-#define APP_CAMERA_FULL_FRAME_ENABLE    1
+#define APP_CAMERA_FULL_FRAME_ENABLE    0
 #define APP_CAMERA_PREVIEW_FPS          1U
 #define APP_CAMERA_CAPTURE_SAMPLE_BYTES (60U * 1024U)
 #define APP_CAMERA_UART_CHUNK_BYTES     512U
