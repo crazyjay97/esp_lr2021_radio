@@ -163,3 +163,30 @@
 #define APP_STARTUP_CHIME_TONE_MS       90
 #define APP_STARTUP_CHIME_GAP_MS        35
 #define APP_STARTUP_CHIME_AMP           3500
+
+/* ----- Camera UART bring-up ------------------------------------------------- */
+
+/* Enable the camera-adapter bring-up task. It powers the adapter, probes the
+ * shared I2C bus for a sensor, and streams framed image data on UART2. */
+#define APP_CAMERA_UART_ENABLE          1
+
+/* CP2105 secondary UART rate. Raise this only after the PC preview tool proves
+ * it can sustain the binary stream without drops. */
+#define APP_CAMERA_UART_BAUD            921600
+
+/* GC032A reference designs commonly use a 24 MHz master clock. */
+#define APP_GC032A_MCLK_HZ              24000000U
+#define APP_GC032A_I2C_ADDR             0x21U
+
+/* GC032A SPI mode emits a 640x480 YVYU/YUV422 stream with in-band sync bytes. */
+#define APP_CAMERA_SENSOR_WIDTH         640U
+#define APP_CAMERA_SENSOR_HEIGHT        480U
+#define APP_CAMERA_PREVIEW_WIDTH        64U
+#define APP_CAMERA_PREVIEW_HEIGHT       48U
+#define APP_CAMERA_FULL_FRAME_ENABLE    1
+#define APP_CAMERA_PREVIEW_FPS          1U
+#define APP_CAMERA_CAPTURE_SAMPLE_BYTES (60U * 1024U)
+#define APP_CAMERA_UART_CHUNK_BYTES     512U
+#define APP_CAMERA_TASK_PRIORITY        3
+#define APP_CAMERA_TASK_STACK_BYTES     12288U
+#define APP_CAMERA_TASK_CORE            1
