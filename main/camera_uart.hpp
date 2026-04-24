@@ -25,6 +25,7 @@ private:
     esp_err_t alloc_sample_buffer();
     void probe_i2c();
 
+    void dvp_dma_probe_loop();
     void capture_and_send_frame(uint32_t seq);
     void analyze_and_dump(const uint8_t *raw_pairs, size_t pair_count,
                           bool sample_falling, uint32_t seq);

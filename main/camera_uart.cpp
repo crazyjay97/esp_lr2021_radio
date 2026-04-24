@@ -5,17 +5,24 @@
 #include <algorithm>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
 #include "driver/uart.h"
+#include "esp_cam_ctlr.h"
+#include "esp_cam_ctlr_dvp.h"
 #include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
+#include "hal/cam_ll.h"
 #include "soc/gpio_reg.h"
+#include "soc/gpio_pins.h"
+#include "soc/gpio_sig_map.h"
 
 #include "app_config.h"
 #include "bsp.h"
@@ -31,6 +38,11 @@ constexpr uint8_t kFrameStart = 0xAB;
 constexpr uint8_t kLineStart  = 0x80;
 constexpr uint8_t kLineEnd    = 0x9D;
 constexpr uint8_t kFrameEnd   = 0xB6;
+constexpr uint32_t kBt656SyncPrefix = 0xFF000000UL;
+constexpr uint32_t kFrameStartSync = kBt656SyncPrefix | kFrameStart;
+constexpr uint32_t kLineStartSync  = kBt656SyncPrefix | kLineStart;
+constexpr uint32_t kLineEndSync    = kBt656SyncPrefix | kLineEnd;
+constexpr uint32_t kFrameEndSync   = kBt656SyncPrefix | kFrameEnd;
 constexpr uint8_t kGc032aIdHighReg = 0xF0;
 constexpr uint8_t kGc032aIdLowReg  = 0xF1;
 constexpr uint16_t kGc032aExpectedId = 0x232A;
@@ -41,7 +53,12 @@ constexpr size_t kRawCapacityBytes = 4U * 1024U;
 constexpr uint32_t kBurstPollBudget = 32U * 1000U;
 constexpr uint64_t kCaptureMaxUs = 250U * 1000U;
 constexpr uint64_t kFullFrameMaxUs = 12U * 1000U * 1000U;
-constexpr uint64_t kRawFrameMaxUs = 4U * 1000U * 1000U;
+constexpr uint64_t kRawFrameMaxUs = 4500U * 1000U;
+constexpr uint32_t kRawFrameYieldEveryBursts = 16U;
+constexpr TickType_t kCameraYieldTicks = 1;
+constexpr size_t kDvpProbeRawBytes = 4U * 1024U;
+constexpr size_t kDvpProbePackedBytes = kDvpProbeRawBytes / 4U;
+constexpr uint32_t kDvpProbeWindowsPerLog = 64U;
 constexpr uint32_t kSensorWidth = APP_CAMERA_SENSOR_WIDTH;
 constexpr uint32_t kSensorHeight = APP_CAMERA_SENSOR_HEIGHT;
 constexpr size_t kSensorRowBytes = kSensorWidth * 2U;
@@ -67,9 +84,16 @@ struct FrameAssembler {
     size_t out_capacity = 0;
     size_t out_len = 0;
     size_t line_pos = 0;
+    size_t sync_wait_bytes = 0;
+    uint32_t sync_window = 0;
     uint32_t lines = 0;
+    uint32_t frame_syncs = 0;
+    uint32_t line_start_syncs = 0;
+    uint32_t line_end_syncs = 0;
+    uint32_t frame_end_syncs = 0;
     uint32_t restarts = 0;
     uint32_t bad_line_end = 0;
+    uint32_t last_bad_line_end = 0;
     int32_t first_frame_start = -1;
     bool done = false;
 
@@ -78,13 +102,14 @@ struct FrameAssembler {
         state = FrameParseState::SeekFrameStart;
         out_len = 0;
         line_pos = 0;
+        sync_wait_bytes = 0;
         lines = 0;
     }
 
     void finish_line()
     {
         ++lines;
-        if (lines >= kSensorHeight || out_len >= out_capacity) {
+        if (lines >= kSensorHeight || (out_capacity > 0 && out_len >= out_capacity)) {
             done = true;
             return;
         }
@@ -94,12 +119,17 @@ struct FrameAssembler {
     void feed(uint8_t b, size_t packed_offset)
     {
         if (done) return;
+        sync_window = (sync_window << 8U) | b;
+        if (sync_window == kFrameStartSync) ++frame_syncs;
+        if (sync_window == kLineStartSync) ++line_start_syncs;
+        if (sync_window == kLineEndSync) ++line_end_syncs;
+        if (sync_window == kFrameEndSync) ++frame_end_syncs;
 
         switch (state) {
         case FrameParseState::SeekFrameStart:
-            if (b == kFrameStart) {
+            if (sync_window == kFrameStartSync) {
                 if (first_frame_start < 0) {
-                    first_frame_start = static_cast<int32_t>(packed_offset);
+                    first_frame_start = static_cast<int32_t>(packed_offset) - 3;
                 }
                 out_len = 0;
                 line_pos = 0;
@@ -109,34 +139,42 @@ struct FrameAssembler {
             break;
 
         case FrameParseState::SeekLineStart:
-            if (b == kLineStart) {
+            if (sync_window == kLineStartSync) {
                 line_pos = 0;
                 state = FrameParseState::Payload;
-            } else if (b == kFrameStart && out_len == 0) {
+            } else if (sync_window == kFrameStartSync && out_len == 0) {
                 ++restarts;
                 out_len = 0;
                 line_pos = 0;
                 lines = 0;
+            } else if (sync_window == kFrameEndSync && lines > 0) {
+                done = true;
             }
             break;
 
         case FrameParseState::Payload:
             if (out_len < out_capacity) {
-                out[out_len++] = b;
+                if (out) {
+                    out[out_len] = b;
+                }
+                ++out_len;
             }
             if (++line_pos >= kSensorRowBytes) {
+                sync_wait_bytes = 0;
                 state = FrameParseState::ExpectLineEnd;
             }
             break;
 
         case FrameParseState::ExpectLineEnd:
-            if (b == kLineEnd) {
+            ++sync_wait_bytes;
+            if (sync_window == kLineEndSync) {
                 finish_line();
-            } else {
+            } else if (sync_wait_bytes >= 4U) {
                 ++bad_line_end;
+                last_bad_line_end = sync_window;
                 ++restarts;
                 reset_frame();
-                if (b == kFrameStart) {
+                if (sync_window == kFrameStartSync) {
                     state = FrameParseState::SeekLineStart;
                 }
             }
@@ -163,6 +201,18 @@ struct __attribute__((packed)) PacketHeader {
     uint32_t checksum;
 };
 
+struct DvpProbeDone {
+    uint8_t *buffer = nullptr;
+    size_t received = 0;
+};
+
+struct DvpProbeContext {
+    uint8_t *buffers[2] = {};
+    size_t buffer_len = 0;
+    uint32_t next = 0;
+    QueueHandle_t done_queue = nullptr;
+};
+
 uint32_t fnv1a(const void *data, size_t len)
 {
     const auto *p = static_cast<const uint8_t *>(data);
@@ -172,6 +222,179 @@ uint32_t fnv1a(const void *data, size_t len)
         h *= 16777619UL;
     }
     return h;
+}
+
+bool IRAM_ATTR dvp_probe_get_new_trans(esp_cam_ctlr_handle_t,
+                                       esp_cam_ctlr_trans_t *trans,
+                                       void *user_data)
+{
+    auto *ctx = static_cast<DvpProbeContext *>(user_data);
+    uint32_t idx = ctx->next++ & 0x01U;
+    trans->buffer = ctx->buffers[idx];
+    trans->buflen = ctx->buffer_len;
+    return false;
+}
+
+bool IRAM_ATTR dvp_probe_trans_finished(esp_cam_ctlr_handle_t,
+                                        esp_cam_ctlr_trans_t *trans,
+                                        void *user_data)
+{
+    auto *ctx = static_cast<DvpProbeContext *>(user_data);
+    DvpProbeDone done = {
+        .buffer = static_cast<uint8_t *>(trans->buffer),
+        .received = trans->received_size,
+    };
+    BaseType_t task_woken = pdFALSE;
+    xQueueSendFromISR(ctx->done_queue, &done, &task_woken);
+    return task_woken == pdTRUE;
+}
+
+struct SyncCounts {
+    uint32_t fs = 0;
+    uint32_t ls = 0;
+    uint32_t le = 0;
+    uint32_t fe = 0;
+};
+
+// GC032A 2-wire SPI output puts a full independent BT.656 byte stream on EACH
+// of D0 and D1 (not bits of a single stream split across lanes). So `FF 00 00
+// XX` on D1 means 8 PCLKs of D1=1 then 16 PCLKs of D1=0 then 8 bits of sync
+// byte XX on D1, regardless of what D0 is doing. Scan each lane independently.
+struct RawSyncCounts {
+    // Counts per lane. `ls` counts a match for any of the four sync markers at
+    // any MSB-first or LSB-first bit order.
+    uint32_t d0_prefix = 0, d1_prefix = 0;
+    uint32_t d0_fs = 0, d0_ls = 0, d0_le = 0, d0_fe = 0;
+    uint32_t d1_fs = 0, d1_ls = 0, d1_le = 0, d1_fe = 0;
+    int32_t  d0_first_fs = -1, d1_first_fs = -1;
+    uint32_t d0_max_one_run = 0, d0_max_zero_run = 0;
+    uint32_t d1_max_one_run = 0, d1_max_zero_run = 0;
+};
+
+static uint8_t reverse_byte(uint8_t b)
+{
+    b = static_cast<uint8_t>((b >> 4) | (b << 4));
+    b = static_cast<uint8_t>(((b & 0xCCU) >> 2) | ((b & 0x33U) << 2));
+    b = static_cast<uint8_t>(((b & 0xAAU) >> 1) | ((b & 0x55U) << 1));
+    return b;
+}
+
+// Check if the 8 bits of `lane_stream` starting at bit offset `off` match any
+// known sync byte (AB / 80 / 9D / B6) in either MSB-first or LSB-first order.
+// `update` receives which sync matched (0=fs, 1=ls, 2=le, 3=fe) or -1.
+static int classify_sync_tail(uint32_t bit_offset, const uint8_t *pairs, size_t n,
+                              bool lane_d1)
+{
+    if (bit_offset + 8 > n) return -1;
+    uint8_t v = 0;
+    // Collect 8 consecutive bits from the chosen lane, MSB-first order (i.e.,
+    // the bit sampled earliest ends up in bit 7 of v).
+    for (uint32_t k = 0; k < 8; ++k) {
+        uint8_t p = pairs[bit_offset + k];
+        uint8_t lane_bit = lane_d1 ? ((p >> 1) & 1U) : (p & 1U);
+        v = static_cast<uint8_t>((v << 1) | lane_bit);
+    }
+    uint8_t v_rev = reverse_byte(v);
+    auto hit = [&](uint8_t expected) { return v == expected || v_rev == expected; };
+    if (hit(kFrameStart)) return 0;
+    if (hit(kLineStart))  return 1;
+    if (hit(kLineEnd))    return 2;
+    if (hit(kFrameEnd))   return 3;
+    return -1;
+}
+
+// Extract a single lane (D0 if `d1`==false, D1 otherwise) from `pairs` and
+// pack into MSB-first bytes. Returns how many bytes were written.
+size_t extract_lane_bytes(const uint8_t *pairs, size_t n_pairs,
+                          bool d1, uint8_t *out, size_t out_capacity)
+{
+    size_t out_len = 0;
+    uint8_t acc = 0;
+    uint8_t bit_count = 0;
+    for (size_t i = 0; i < n_pairs && out_len < out_capacity; ++i) {
+        uint8_t b = d1 ? ((pairs[i] >> 1) & 1U) : (pairs[i] & 1U);
+        acc = static_cast<uint8_t>((acc << 1) | b);
+        if (++bit_count == 8) {
+            out[out_len++] = acc;
+            acc = 0;
+            bit_count = 0;
+        }
+    }
+    return out_len;
+}
+
+RawSyncCounts scan_raw_pairs_for_sync(const uint8_t *pairs, size_t n)
+{
+    RawSyncCounts c;
+    if (n < 32) return c;
+
+    // Track consecutive runs per lane.
+    uint32_t d0_zero = 0, d0_one = 0, d1_zero = 0, d1_one = 0;
+
+    // Sliding window for 8-ones + 16-zeros prefix on each lane, using shift
+    // registers of the last 24 bits. We compare against:
+    //   d0_prefix_match: low 24 bits of d0_window == 0xFF0000
+    //   same for d1.
+    uint32_t d0_win = 0, d1_win = 0;
+    constexpr uint32_t kPrefixMask = 0x00FFFFFFU;  // 24 bits
+    constexpr uint32_t kPrefixVal  = 0x00FF0000U;  // 8 ones then 16 zeros
+
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t p = pairs[i];
+        uint8_t b0 = p & 1U;
+        uint8_t b1 = (p >> 1) & 1U;
+
+        // Runs
+        if (b0) { if (++d0_one > c.d0_max_one_run) c.d0_max_one_run = d0_one; d0_zero = 0; }
+        else    { if (++d0_zero > c.d0_max_zero_run) c.d0_max_zero_run = d0_zero; d0_one = 0; }
+        if (b1) { if (++d1_one > c.d1_max_one_run) c.d1_max_one_run = d1_one; d1_zero = 0; }
+        else    { if (++d1_zero > c.d1_max_zero_run) c.d1_max_zero_run = d1_zero; d1_one = 0; }
+
+        // Sliding windows
+        d0_win = ((d0_win << 1) | b0) & kPrefixMask;
+        d1_win = ((d1_win << 1) | b1) & kPrefixMask;
+
+        // On a new prefix match at this bit index, the prefix's last bit
+        // landed at position i. The 8-bit sync tail starts at i+1 and spans
+        // pairs[i+1 .. i+8]. Need at least 8 more pairs to classify.
+        if (d0_win == kPrefixVal) {
+            ++c.d0_prefix;
+            int kind = classify_sync_tail(static_cast<uint32_t>(i + 1), pairs, n, /*lane_d1=*/false);
+            switch (kind) {
+            case 0: ++c.d0_fs; if (c.d0_first_fs < 0) c.d0_first_fs = static_cast<int32_t>(i - 23); break;
+            case 1: ++c.d0_ls; break;
+            case 2: ++c.d0_le; break;
+            case 3: ++c.d0_fe; break;
+            default: break;
+            }
+        }
+        if (d1_win == kPrefixVal) {
+            ++c.d1_prefix;
+            int kind = classify_sync_tail(static_cast<uint32_t>(i + 1), pairs, n, /*lane_d1=*/true);
+            switch (kind) {
+            case 0: ++c.d1_fs; if (c.d1_first_fs < 0) c.d1_first_fs = static_cast<int32_t>(i - 23); break;
+            case 1: ++c.d1_ls; break;
+            case 2: ++c.d1_le; break;
+            case 3: ++c.d1_fe; break;
+            default: break;
+            }
+        }
+    }
+    return c;
+}
+
+SyncCounts count_bt656_syncs(const uint8_t *data, size_t len)
+{
+    SyncCounts counts;
+    uint32_t window = 0;
+    for (size_t i = 0; i < len; ++i) {
+        window = (window << 8U) | data[i];
+        if (window == kFrameStartSync) ++counts.fs;
+        if (window == kLineStartSync) ++counts.ls;
+        if (window == kLineEndSync) ++counts.le;
+        if (window == kFrameEndSync) ++counts.fe;
+    }
+    return counts;
 }
 
 // IRAM-resident tight loop. Reads GPIO_IN_REG every iteration, latches D0/D1
@@ -379,12 +602,16 @@ void CameraUartStreamer::task()
                   );
     write_status(banner);
 
+#if APP_CAMERA_DVP_DMA_PROBE_ENABLE
+    dvp_dma_probe_loop();
+#else
     uint32_t seq = 0;
     const TickType_t period = pdMS_TO_TICKS(1000);
     while (true) {
         capture_and_send_frame(seq++);
         vTaskDelay(period);
     }
+#endif
 }
 
 esp_err_t CameraUartStreamer::start_mclk()
@@ -675,30 +902,186 @@ void CameraUartStreamer::probe_i2c()
     write_status(line);
 }
 
+void CameraUartStreamer::dvp_dma_probe_loop()
+{
+    write_status("gc032a dvp-dma probe: LCD_CAM samples D0/D1 on PCLK; packing low 2 bits in software");
+
+    esp_cam_ctlr_dvp_pin_config_t pin_cfg = {};
+    pin_cfg.data_width = CAM_CTLR_DATA_WIDTH_8;
+    for (int i = 0; i < CAM_DVP_DATA_SIG_NUM; ++i) {
+        pin_cfg.data_io[i] = GPIO_NUM_NC;
+    }
+    pin_cfg.data_io[0] = BSP_GC032A_DATA0_GPIO;
+    pin_cfg.data_io[1] = BSP_GC032A_DATA1_GPIO;
+    pin_cfg.vsync_io = GPIO_NUM_NC;
+    pin_cfg.de_io = GPIO_NUM_NC;
+    pin_cfg.pclk_io = BSP_GC032A_SPI_CLK_GPIO;
+    pin_cfg.xclk_io = GPIO_NUM_NC;
+
+    esp_cam_ctlr_dvp_config_t dvp_cfg = {
+        .ctlr_id = 0,
+        .clk_src = CAM_CLK_SRC_DEFAULT,
+        .h_res = 256,
+        .v_res = static_cast<uint32_t>(kDvpProbeRawBytes / 256U),
+        .input_data_color_type = CAM_CTLR_COLOR_RAW8,
+        .cam_data_width = 8,
+        .bit_swap_en = false,
+        .byte_swap_en = false,
+        .bk_buffer_dis = true,
+        .pin_dont_init = false,
+        .pic_format_jpeg = false,
+        .external_xtal = true,
+        .dma_burst_size = 64,
+        .xclk_freq = 0,
+        .pin = &pin_cfg,
+    };
+
+    esp_cam_ctlr_handle_t cam = nullptr;
+    esp_err_t err = esp_cam_new_dvp_ctlr(&dvp_cfg, &cam);
+    if (err != ESP_OK) {
+        char line[128];
+        std::snprintf(line, sizeof(line), "dvp-dma probe: controller init failed: %s",
+                      esp_err_to_name(err));
+        write_status(line);
+        vTaskDelete(nullptr);
+    }
+
+    DvpProbeContext ctx = {};
+    ctx.buffer_len = kDvpProbeRawBytes;
+    ctx.done_queue = xQueueCreate(4, sizeof(DvpProbeDone));
+    uint32_t caps =
+#if CONFIG_SPIRAM
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
+#else
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
+#endif
+    ctx.buffers[0] = static_cast<uint8_t *>(
+        esp_cam_ctlr_alloc_buffer(cam, ctx.buffer_len, caps));
+    ctx.buffers[1] = static_cast<uint8_t *>(
+        esp_cam_ctlr_alloc_buffer(cam, ctx.buffer_len, caps));
+    uint8_t *probe_packed = static_cast<uint8_t *>(
+        heap_caps_malloc(kDvpProbePackedBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (!ctx.done_queue || !ctx.buffers[0] || !ctx.buffers[1] || !probe_packed) {
+        write_status("dvp-dma probe: failed to allocate DMA/probe buffers");
+        vTaskDelete(nullptr);
+    }
+
+    esp_cam_ctlr_evt_cbs_t cbs = {
+        .on_get_new_trans = dvp_probe_get_new_trans,
+        .on_trans_finished = dvp_probe_trans_finished,
+    };
+    ESP_ERROR_CHECK(esp_cam_ctlr_register_event_callbacks(cam, &cbs, &ctx));
+    ESP_ERROR_CHECK(esp_cam_ctlr_enable(cam));
+
+    auto *cam_hw = CAM_LL_GET_HW(0);
+    cam_ll_stop(cam_hw);
+    esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_V_SYNC_IDX, false);
+    esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_H_ENABLE_IDX, false);
+    esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_H_SYNC_IDX, false);
+    cam_ll_set_vh_de_mode(cam_hw, false);
+    cam_ll_enable_vsync_generate_eof(cam_hw, false);
+    cam_ll_set_recv_data_bytelen(cam_hw, static_cast<uint32_t>(kDvpProbeRawBytes - 1U));
+    cam_ll_enable_invert_pclk(cam_hw, false);
+    cam_ll_fifo_reset(cam_hw);
+
+    ESP_ERROR_CHECK(esp_cam_ctlr_start(cam));
+    cam_ll_start(cam_hw);
+
+    uint32_t windows = 0;
+    uint32_t best_fs = 0, best_ls = 0, best_le = 0, best_fe = 0;
+    char best_mode[16] = "none";
+    while (true) {
+        DvpProbeDone done;
+        if (xQueueReceive(ctx.done_queue, &done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            char line[192];
+            std::snprintf(line, sizeof(line),
+                          "dvp-dma probe: timeout size-eof ctrl=0x%08lX ctrl1=0x%08lX raw=0x%08lX st=0x%08lX",
+                          static_cast<unsigned long>(cam_hw->cam_ctrl.val),
+                          static_cast<unsigned long>(cam_hw->cam_ctrl1.val),
+                          static_cast<unsigned long>(cam_hw->lc_dma_int_raw.val),
+                          static_cast<unsigned long>(cam_hw->lc_dma_int_st.val));
+            write_status(line);
+            continue;
+        }
+
+        size_t raw_len = std::min(done.received, ctx.buffer_len);
+        const char *mode_name = "none";
+        SyncCounts mode_counts = {};
+        for (int mode = 0; mode < 4; ++mode) {
+            Spi2WirePacker packer = {
+                .swap = (mode & 0x01) != 0,
+                .lsb_first = (mode & 0x02) != 0,
+            };
+            size_t packed_len = packer.push(done.buffer, raw_len,
+                                            probe_packed, kDvpProbePackedBytes);
+            SyncCounts counts = count_bt656_syncs(probe_packed, packed_len);
+            uint32_t score = counts.fs * 16U + counts.ls * 4U + counts.le * 4U + counts.fe;
+            uint32_t best_score = mode_counts.fs * 16U + mode_counts.ls * 4U +
+                                  mode_counts.le * 4U + mode_counts.fe;
+            if (score > best_score) {
+                mode_counts = counts;
+                mode_name = mode == 0 ? "msb" :
+                            mode == 1 ? "msb-swap" :
+                            mode == 2 ? "lsb" : "lsb-swap";
+            }
+        }
+
+        best_fs += mode_counts.fs;
+        best_ls += mode_counts.ls;
+        best_le += mode_counts.le;
+        best_fe += mode_counts.fe;
+        std::snprintf(best_mode, sizeof(best_mode), "%s", mode_name);
+        if (++windows >= kDvpProbeWindowsPerLog ||
+            mode_counts.fs || mode_counts.ls || mode_counts.le || mode_counts.fe) {
+            char line[192];
+            std::snprintf(line, sizeof(line),
+                          "dvp-dma probe windows=%lu raw=%u packed=%u mode=%s fs=%lu ls=%lu le=%lu fe=%lu totals=%lu/%lu/%lu/%lu",
+                          static_cast<unsigned long>(windows),
+                          static_cast<unsigned>(raw_len),
+                          static_cast<unsigned>(kDvpProbePackedBytes),
+                          best_mode,
+                          static_cast<unsigned long>(mode_counts.fs),
+                          static_cast<unsigned long>(mode_counts.ls),
+                          static_cast<unsigned long>(mode_counts.le),
+                          static_cast<unsigned long>(mode_counts.fe),
+                          static_cast<unsigned long>(best_fs),
+                          static_cast<unsigned long>(best_ls),
+                          static_cast<unsigned long>(best_le),
+                          static_cast<unsigned long>(best_fe));
+            write_status(line);
+            windows = 0;
+        }
+    }
+}
+
 void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
 {
 #if APP_CAMERA_FULL_FRAME_ENABLE
     uint64_t t0 = esp_timer_get_time();
 #if APP_CAMERA_RAW_ACCUM_ENABLE
     Spi2WirePacker packer = {
-        .swap = false,
+        .swap = true,
         .lsb_first = false,
     };
     size_t frame_len = 0;
     size_t total_pairs = 0;
+    uint32_t bursts_since_delay = 0;
     while (frame_len < frame_capacity_ &&
            esp_timer_get_time() - t0 < kRawFrameMaxUs) {
         size_t got = spi2_cpu_burst(raw_pair_buf_, raw_capacity_,
-                                    /*sample_falling=*/true, kBurstPollBudget);
+                                    /*sample_falling=*/false, kBurstPollBudget);
         if (got < 16) {
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(kCameraYieldTicks);
             continue;
         }
         total_pairs += got;
         frame_len += packer.push(raw_pair_buf_, got,
                                  frame_buf_ + frame_len,
                                  frame_capacity_ - frame_len);
-        vTaskDelay(pdMS_TO_TICKS(1));
+        if (++bursts_since_delay >= kRawFrameYieldEveryBursts) {
+            bursts_since_delay = 0;
+            vTaskDelay(kCameraYieldTicks);
+        }
     }
 
     uint64_t dt_us = esp_timer_get_time() - t0;
@@ -738,9 +1121,9 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
     size_t total_packed = 0;
     while (!msb.done && esp_timer_get_time() - t0 < kFullFrameMaxUs) {
         size_t got = spi2_cpu_burst(raw_pair_buf_, raw_capacity_,
-                                    /*sample_falling=*/true, kBurstPollBudget);
+                                    /*sample_falling=*/false, kBurstPollBudget);
         if (got < 16) {
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(kCameraYieldTicks);
             continue;
         }
         total_pairs += got;
@@ -751,7 +1134,7 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
             msb.feed(packed_buf_[i], total_packed + i);
         }
         total_packed += packed_len;
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(kCameraYieldTicks);
     }
 
     uint64_t dt_us = esp_timer_get_time() - t0;
@@ -765,21 +1148,70 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
     char line[192];
     if (!winner) {
         std::snprintf(line, sizeof(line),
-                      "full-frame seq=%lu timeout pairs=%u packed=%u took=%llu us msb_lines=%lu msb_bad_end=%lu msb_rst=%lu",
+                      "full-frame seq=%lu timeout pairs=%u packed=%u took=%llu us lines=%lu bad_end=%lu last_bad=0x%08lX rst=%lu fs=%lu ls=%lu le=%lu fe=%lu sync=ff0000xx bitorder=msb-swap",
                       static_cast<unsigned long>(seq),
                       static_cast<unsigned>(total_pairs),
                       static_cast<unsigned>(total_packed),
                       static_cast<unsigned long long>(dt_us),
                       static_cast<unsigned long>(msb.lines),
                       static_cast<unsigned long>(msb.bad_line_end),
-                      static_cast<unsigned long>(msb.restarts));
+                      static_cast<unsigned long>(msb.last_bad_line_end),
+                      static_cast<unsigned long>(msb.restarts),
+                      static_cast<unsigned long>(msb.frame_syncs),
+                      static_cast<unsigned long>(msb.line_start_syncs),
+                      static_cast<unsigned long>(msb.line_end_syncs),
+                      static_cast<unsigned long>(msb.frame_end_syncs));
         write_status(line);
+
+        // Grab one more burst and run the 4-mode decode + hex dump so we can
+        // see whether any (swap, lsb_first) combination finds BT.656 syncs.
+        size_t probe_got = spi2_cpu_burst(raw_pair_buf_, raw_capacity_,
+                                          /*sample_falling=*/false,
+                                          kBurstPollBudget);
+        if (probe_got >= 64) {
+            analyze_and_dump(raw_pair_buf_, probe_got, /*sample_falling=*/false, seq);
+
+            // Pair-granular per-lane sync scan: each of D0/D1 carries its own
+            // BT.656 byte stream.
+            RawSyncCounts rc = scan_raw_pairs_for_sync(raw_pair_buf_, probe_got);
+            char rl[224];
+            std::snprintf(rl, sizeof(rl),
+                          "raw-scan pairs=%u D0 pfx=%lu fs=%lu ls=%lu le=%lu fe=%lu 1run=%lu 0run=%lu first=%ld | D1 pfx=%lu fs=%lu ls=%lu le=%lu fe=%lu 1run=%lu 0run=%lu first=%ld",
+                          static_cast<unsigned>(probe_got),
+                          static_cast<unsigned long>(rc.d0_prefix),
+                          static_cast<unsigned long>(rc.d0_fs),
+                          static_cast<unsigned long>(rc.d0_ls),
+                          static_cast<unsigned long>(rc.d0_le),
+                          static_cast<unsigned long>(rc.d0_fe),
+                          static_cast<unsigned long>(rc.d0_max_one_run),
+                          static_cast<unsigned long>(rc.d0_max_zero_run),
+                          static_cast<long>(rc.d0_first_fs),
+                          static_cast<unsigned long>(rc.d1_prefix),
+                          static_cast<unsigned long>(rc.d1_fs),
+                          static_cast<unsigned long>(rc.d1_ls),
+                          static_cast<unsigned long>(rc.d1_le),
+                          static_cast<unsigned long>(rc.d1_fe),
+                          static_cast<unsigned long>(rc.d1_max_one_run),
+                          static_cast<unsigned long>(rc.d1_max_zero_run),
+                          static_cast<long>(rc.d1_first_fs));
+            write_status(rl);
+
+            // Dump the first 64 bytes of each lane's bit stream so we can
+            // eyeball whether BT.656-like structure is on a single lane.
+            uint8_t lane_buf[64];
+            size_t n0 = extract_lane_bytes(raw_pair_buf_, probe_got, /*d1=*/false,
+                                           lane_buf, sizeof(lane_buf));
+            write_hex_dump("D0 lane", lane_buf, n0);
+            size_t n1 = extract_lane_bytes(raw_pair_buf_, probe_got, /*d1=*/true,
+                                           lane_buf, sizeof(lane_buf));
+            write_hex_dump("D1 lane", lane_buf, n1);
+        }
         vTaskDelay(pdMS_TO_TICKS(100));
         return;
     }
 
     std::snprintf(line, sizeof(line),
-                  "full-frame seq=%lu mode=%s first_AB=%ld lines=%lu bad_end=%lu bytes=%u pairs=%u took=%llu us",
+                  "full-frame seq=%lu mode=%s first_sync=%ld lines=%lu bad_end=%lu bytes=%u pairs=%u took=%llu us sync=ff0000xx bitorder=msb-swap",
                   static_cast<unsigned long>(seq),
                   mode,
                   static_cast<long>(winner->first_frame_start),
@@ -798,11 +1230,11 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
     size_t packed_len = 0;
     Spi2WirePacker packer = {
         .swap = false,
-        .lsb_first = true,
+        .lsb_first = false,
     };
     while (packed_len < raw_capacity_ / 4U) {
         size_t got = spi2_cpu_burst(raw_pair_buf_, raw_capacity_,
-                                    /*sample_falling=*/true, kBurstPollBudget);
+                                    /*sample_falling=*/false, kBurstPollBudget);
         got_total += got;
         packed_len += packer.push(raw_pair_buf_, got,
                                   packed_buf_ + packed_len,
@@ -810,7 +1242,7 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
         if (esp_timer_get_time() - t0 >= kCaptureMaxUs) {
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(kCameraYieldTicks);
     }
     uint64_t dt_us = esp_timer_get_time() - t0;
 

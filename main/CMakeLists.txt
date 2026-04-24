@@ -11,6 +11,7 @@ idf_component_register(SRCS
                        REQUIRES
                            lierda-iot__esp_lora_driver
                            esp_driver_gpio
+                           esp_driver_cam
                            esp_driver_i2c
                            esp_driver_i2s
                            esp_driver_ledc

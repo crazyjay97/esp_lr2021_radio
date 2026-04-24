@@ -174,7 +174,9 @@
  * it can sustain the binary stream without drops. */
 #define APP_CAMERA_UART_BAUD            921600
 
-/* GC032A reference designs commonly use a 24 MHz master clock. */
+/* GC032A reference designs commonly use a 24 MHz master clock. The default
+ * init table (gc032a_regs.hpp) sets PLL register 0xf8=0x83 for this MCLK, so
+ * don't change this without also retuning the PLL divider chain. */
 #define APP_GC032A_MCLK_HZ              24000000U
 #define APP_GC032A_I2C_ADDR             0x21U
 
@@ -184,7 +186,8 @@
 #define APP_CAMERA_PREVIEW_WIDTH        64U
 #define APP_CAMERA_PREVIEW_HEIGHT       48U
 #define APP_CAMERA_FULL_FRAME_ENABLE    1
-#define APP_CAMERA_RAW_ACCUM_ENABLE     1
+#define APP_CAMERA_RAW_ACCUM_ENABLE     0
+#define APP_CAMERA_DVP_DMA_PROBE_ENABLE 0
 #define APP_CAMERA_PREVIEW_FPS          1U
 #define APP_CAMERA_CAPTURE_SAMPLE_BYTES (60U * 1024U)
 #define APP_CAMERA_UART_CHUNK_BYTES     512U

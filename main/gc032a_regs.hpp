@@ -13,7 +13,10 @@ static constexpr Gc032aRegVal kGc032aInitRegs[] = {
 /*System*/
     {0xf3,0x83},
     {0xf5,0x0c},
-    {0xf7,0x01},
+    // 0xf7 bring-up: [6:4] serial_clk_div=1, [1] div2en=1, [0] pll_en=1. Drops
+    // PCLK well below the ESP32-S3 CPU poll rate so BT.656 sync bytes survive
+    // without aliasing; fps drops accordingly.
+    {0xf7,0x13},
 
     {0xf8,0x83},//PLL 03//48mhz-14fps
 
