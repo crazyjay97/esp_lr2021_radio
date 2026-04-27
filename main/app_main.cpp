@@ -47,6 +47,10 @@ extern "C" void app_main(void)
     if ((e = bsp_con6_detect(&con6)) != ESP_OK) {
         ESP_LOGE(TAG, "CON6 detect: %s", esp_err_to_name(e));
     }
+#if APP_CON6_FORCE_CAMERA
+    con6 = BSP_CON6_PERIPHERAL_CAMERA_GC032A;
+    ESP_LOGW(TAG, "CON6 force camera mode enabled; skipping LCD path");
+#endif
 
     if ((e = bsp_led_init()) != ESP_OK) {
         ESP_LOGE(TAG, "led init: %s", esp_err_to_name(e));

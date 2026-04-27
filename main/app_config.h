@@ -170,13 +170,15 @@
  * shared I2C bus for a sensor, and streams framed image data on UART2. */
 #define APP_CAMERA_UART_ENABLE          1
 
+/* Force CON6 into GC032A camera mode for camera bring-up and logic analyzer
+ * capture, even if the automatic I2C probe does not see the sensor. */
+#define APP_CON6_FORCE_CAMERA           1
+
 /* CP2105 secondary UART rate. Raise this only after the PC preview tool proves
  * it can sustain the binary stream without drops. */
 #define APP_CAMERA_UART_BAUD            921600
 
-/* GC032A reference designs commonly use a 24 MHz master clock. The default
- * init table (gc032a_regs.hpp) sets PLL register 0xf8=0x83 for this MCLK, so
- * don't change this without also retuning the PLL divider chain. */
+/* Drive the GC032A MCLK at 24 MHz, matching the vendor PCLK==24 profile. */
 #define APP_GC032A_MCLK_HZ              24000000U
 #define APP_GC032A_I2C_ADDR             0x21U
 

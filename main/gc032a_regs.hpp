@@ -10,13 +10,13 @@ struct Gc032aRegVal {
 // Extracted from the GC032A SPI sensor_init_data[] provided at repository root.
 static constexpr Gc032aRegVal kGc032aInitRegs[] = {
 
+
+
 /*System*/
     {0xf3,0x83},
     {0xf5,0x0c},
-    // Match the 24 MHz external MCLK path while keeping the bring-up divider
-    // enabled so the SPI/serial pixel stream stays conservative.
     {0xf7,0x13},
-    {0xf8,0x81},//PLL 01//24mhz-7fps
+    {0xf8,0x81},//PLL 01//24Mhz-7fps
 
     {0xf9,0x4e},
     {0xfa,0x10},
@@ -74,10 +74,7 @@ static constexpr Gc032aRegVal kGc032aInitRegs[] = {
     {0x5e,0x01},
 
 
-    // P3:0x64 controls sync output mode on this GalaxyCore register block:
-    // bit3=BT.656/header mode, bit2=SCK always. 0x01 leaves both disabled and
-    // produces image-like data without stable FF 00 00 sync words on ESP32-S3.
-    {0x64,0x0c},
+    {0x64,0x0c}, // BT.656/header mode + sck always
     {0x65,0xff},  //head sync code
     {0x66,0x00},
     {0x67,0x00},

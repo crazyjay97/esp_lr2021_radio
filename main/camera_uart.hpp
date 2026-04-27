@@ -2,7 +2,6 @@
 
 #include "esp_err.h"
 #include "driver/i2c_master.h"
-#include "driver/i2s_common.h"
 #include "freertos/FreeRTOS.h"
 
 class CameraUartStreamer {
@@ -37,7 +36,7 @@ private:
     void write_packet(uint8_t type, uint32_t seq, const void *payload, uint32_t len);
     void write_status(const char *msg);
     void write_hex_dump(const char *tag, const uint8_t *data, size_t len);
-
+    void  dvp_stream_loop();
     i2c_master_dev_handle_t gc032a_ = nullptr;
     uint8_t *raw_pair_buf_ = nullptr;   // 1 PCLK sample per byte, low 2 bits = {D1,D0}
     uint8_t *packed_buf_   = nullptr;   // 4 pairs packed per byte
@@ -45,6 +44,6 @@ private:
     size_t   raw_capacity_ = 0;
     size_t   frame_capacity_ = 0;
     uint8_t  gc032a_addr_  = 0;
-    i2s_chan_handle_t mclk_tx_ = nullptr;
+    bool     mclk_started_ = false;
     bool     initialized_  = false;
 };
