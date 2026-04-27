@@ -30,6 +30,7 @@
 
 #define BSP_I2C_ADDR_ES8311         0x18   /* Audio codec                     */
 #define BSP_I2C_ADDR_IO_EXPANDER    0x38   /* TCA9554A, confirmed by scan     */
+#define BSP_I2C_ADDR_GC032A         0x21   /* Camera sensor on CON6 adapter    */
 /* Touch panel I2C address depends on the controller fitted on the FPC. */
 
 /* ---------- I2S0 (ES8311 codec audio path) ------------------------------- */
@@ -53,8 +54,27 @@
 #define BSP_LCD_TE_GPIO             GPIO_NUM_6    /* tearing effect          */
 #define BSP_LCD_BL_GPIO             GPIO_NUM_7    /* backlight enable        */
 
-/* LCD reset is on the GPIO expander P7 (active low). */
-#define BSP_IO_EXP_LCD_RST_PIN      7
+/* LCD reset is on the GPIO expander P3 (active low). */
+#define BSP_IO_EXP_LCD_RST_PIN      3
+
+/* ST7789T3 4-wire SPI panel on SCH_Schematic1_LCD转接板.pdf.
+ *
+ * The adapter reuses CON6 nets differently from the original LCD naming:
+ *   LCD_TE/GPIO6  -> panel RST
+ *   LCD_LED/GPIO7 -> panel D/C
+ *   TP_RST/GPIO3  -> backlight LED control
+ */
+#define BSP_LCD_SPI_SCLK_GPIO       BSP_LCD_QSPI_CLK_GPIO
+#define BSP_LCD_SPI_MOSI_GPIO       BSP_LCD_QSPI_D0_GPIO
+#define BSP_LCD_SPI_DC_GPIO         BSP_LCD_BL_GPIO
+#define BSP_LCD_SPI_CS_GPIO         BSP_LCD_CS1_GPIO
+#define BSP_LCD_ST7789_RST_GPIO     BSP_LCD_TE_GPIO
+#define BSP_LCD_ST7789_BL_GPIO      BSP_TP_RST_GPIO
+#define BSP_LCD_TOUCH_INT_GPIO      BSP_LCD_QSPI_D1_GPIO
+#define BSP_LCD_TOUCH_RST_GPIO      BSP_LCD_CS2_GPIO
+
+#define BSP_I2C_ADDR_TOUCH_CST816   0x15
+#define BSP_I2C_ADDR_TOUCH_CST816_ALT 0x2A
 
 /* ---------- Capacitive touch panel (shares I2C0) ------------------------- */
 #define BSP_TP_INT_GPIO             GPIO_NUM_11

@@ -4,7 +4,9 @@ idf_component_register(SRCS
                            "camera_uart.cpp"
                            "opus_codec.cpp"
                            "radio_ping.cpp"
+                           "bsp_con6.c"
                            "bsp_i2c.c"
+                           "bsp_lcd.c"
                            "bsp_audio.c"
                            "bsp_button.c"
                        INCLUDE_DIRS "."
@@ -15,6 +17,9 @@ idf_component_register(SRCS
                            esp_driver_i2c
                            esp_driver_i2s
                            esp_driver_ledc
+                           esp_driver_spi
                            esp_driver_uart
+                           esp_lcd
                            esp_timer
-                           esp_adc)
+                           esp_adc
+                           lvgl)

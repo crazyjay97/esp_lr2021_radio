@@ -22,10 +22,24 @@ i2c_master_bus_handle_t bsp_i2c_bus(void);
  * read the log output to see which addresses responded. */
 esp_err_t bsp_i2c_scan(void);
 
+typedef enum {
+    BSP_CON6_PERIPHERAL_LCD_ST7789 = 0,
+    BSP_CON6_PERIPHERAL_CAMERA_GC032A,
+} bsp_con6_peripheral_t;
+
+/* Detect what is attached to CON6.  GC032A has priority when its I2C address
+ * ACKs; otherwise the connector is treated as the ST7789T3 LCD variant. */
+esp_err_t bsp_con6_detect(bsp_con6_peripheral_t *out_peripheral);
+
 /* Set a single pin on the TCA9554A expander (configures it as output if it
- * is not already). Pins used by the BSP: P0/P1/P2 = RGB LED, P6 = PA enable,
- * P7 = LCD reset. */
+ * is not already). Pins used by the BSP: P0/P1/P2 = RGB LED, P3 = LCD reset,
+ * P6 = PA enable. */
 esp_err_t bsp_ioexp_set_pin(uint8_t pin, bool level);
+
+/* ---------- LCD (ST7789T3 on CON6 4-wire SPI) --------------------------- */
+esp_err_t bsp_lcd_init(void);
+esp_err_t bsp_lcd_show_test_pattern(void);
+esp_err_t bsp_lcd_start_lvgl_demo(void);
 
 /* ---------- RGB LED ----------------------------------------------------- */
 esp_err_t bsp_led_init(void);

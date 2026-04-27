@@ -194,3 +194,19 @@
 #define APP_CAMERA_TASK_PRIORITY        3
 #define APP_CAMERA_TASK_STACK_BYTES     12288U
 #define APP_CAMERA_TASK_CORE            1
+
+/* ----- CON6 ST7789T3 LCD ---------------------------------------------------- */
+
+#define APP_LCD_H_RES                   240U
+#define APP_LCD_V_RES                   280U
+#define APP_LCD_X_GAP                   0
+#define APP_LCD_Y_GAP                   20
+#define APP_LCD_SPI_PCLK_HZ             (20U * 1000U * 1000U)
+#define APP_LCD_SPI_QUEUE_DEPTH         10U
+#define APP_LCD_TEST_PATTERN_ROWS       20U
+#define APP_LCD_LVGL_BUFFER_ROWS        40U
+#define APP_LCD_LVGL_TICK_MS            2U
+#define APP_LCD_LVGL_TASK_DELAY_MS      10U
+#define APP_LCD_LVGL_TASK_STACK_BYTES   8192U
+#define APP_LCD_LVGL_TASK_PRIORITY      2
+#define APP_LCD_LVGL_TASK_CORE          1
