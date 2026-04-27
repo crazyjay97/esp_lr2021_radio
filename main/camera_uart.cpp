@@ -1,5 +1,6 @@
 #include "camera_uart.hpp"
 
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -9,7 +10,7 @@
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
-#include "driver/ledc.h"
+#include "driver/i2s_std.h"
 #include "driver/uart.h"
 #include "esp_cam_ctlr.h"
 #include "esp_cam_ctlr_dvp.h"
@@ -31,9 +32,8 @@
 namespace {
 constexpr const char *TAG = "camera_uart";
 constexpr uart_port_t kUart = UART_NUM_2;
-constexpr ledc_mode_t kMclkSpeedMode = LEDC_LOW_SPEED_MODE;
-constexpr ledc_timer_t kMclkTimer = LEDC_TIMER_0;
-constexpr ledc_channel_t kMclkChannel = LEDC_CHANNEL_0;
+constexpr i2s_port_t kCameraMclkI2sPort = I2S_NUM_1;
+constexpr uint32_t kCameraMclkSampleRateHz = APP_GC032A_MCLK_HZ / 256U;
 constexpr uint8_t kFrameStart = 0xAB;
 constexpr uint8_t kLineStart  = 0x80;
 constexpr uint8_t kLineEnd    = 0x9D;
@@ -58,7 +58,7 @@ constexpr uint32_t kRawFrameYieldEveryBursts = 16U;
 constexpr TickType_t kCameraYieldTicks = 1;
 constexpr size_t kDvpProbeRawBytes = 4U * 1024U;
 constexpr size_t kDvpProbePackedBytes = kDvpProbeRawBytes / 4U;
-constexpr uint32_t kDvpProbeWindowsPerLog = 64U;
+constexpr uint32_t kDvpProbeWindowsPerLog = 8U;
 constexpr uint32_t kSensorWidth = APP_CAMERA_SENSOR_WIDTH;
 constexpr uint32_t kSensorHeight = APP_CAMERA_SENSOR_HEIGHT;
 constexpr size_t kSensorRowBytes = kSensorWidth * 2U;
@@ -306,14 +306,19 @@ static int classify_sync_tail(uint32_t bit_offset, const uint8_t *pairs, size_t 
 // Extract a single lane (D0 if `d1`==false, D1 otherwise) from `pairs` and
 // pack into MSB-first bytes. Returns how many bytes were written.
 size_t extract_lane_bytes(const uint8_t *pairs, size_t n_pairs,
-                          bool d1, uint8_t *out, size_t out_capacity)
+                          bool d1, bool lsb_first, uint8_t *out,
+                          size_t out_capacity)
 {
     size_t out_len = 0;
     uint8_t acc = 0;
     uint8_t bit_count = 0;
     for (size_t i = 0; i < n_pairs && out_len < out_capacity; ++i) {
         uint8_t b = d1 ? ((pairs[i] >> 1) & 1U) : (pairs[i] & 1U);
-        acc = static_cast<uint8_t>((acc << 1) | b);
+        if (lsb_first) {
+            acc = static_cast<uint8_t>(acc | (b << bit_count));
+        } else {
+            acc = static_cast<uint8_t>((acc << 1) | b);
+        }
         if (++bit_count == 8) {
             out[out_len++] = acc;
             acc = 0;
@@ -481,18 +486,24 @@ struct Spi2WirePacker {
 };
 
 size_t pack_pairs(const uint8_t *raw_pairs, size_t pair_count,
-                  uint8_t *packed, bool swap, bool lsb_first)
+                  uint8_t *packed, bool swap, bool lsb_first,
+                  size_t pair_phase = 0)
 {
     Spi2WirePacker packer = {
         .swap = swap,
         .lsb_first = lsb_first,
     };
-    return packer.push(raw_pairs, pair_count, packed, pair_count / 4U);
+    if (pair_phase >= pair_count) {
+        return 0;
+    }
+    return packer.push(raw_pairs + pair_phase, pair_count - pair_phase,
+                       packed, (pair_count - pair_phase) / 4U);
 }
 
 struct DecodeStats {
     bool     swap;
     bool     lsb_first;
+    uint8_t  pair_phase;
     uint32_t fs;          // 0xAB count
     uint32_t ls;          // 0x80
     uint32_t le;          // 0x9D
@@ -502,11 +513,13 @@ struct DecodeStats {
     uint32_t score;
 };
 
-DecodeStats score_packed(const uint8_t *packed, size_t byte_count, bool swap, bool lsb)
+DecodeStats score_packed(const uint8_t *packed, size_t byte_count, bool swap,
+                         bool lsb, uint8_t pair_phase)
 {
     DecodeStats s = {};
     s.swap = swap;
     s.lsb_first = lsb;
+    s.pair_phase = pair_phase;
     s.first_fs = -1;
     uint8_t prev = 0;
     for (size_t i = 0; i < byte_count; ++i) {
@@ -616,28 +629,53 @@ void CameraUartStreamer::task()
 
 esp_err_t CameraUartStreamer::start_mclk()
 {
-    ledc_timer_config_t timer = {
-        .speed_mode = kMclkSpeedMode,
-        .duty_resolution = LEDC_TIMER_1_BIT,
-        .timer_num = kMclkTimer,
-        .freq_hz = APP_GC032A_MCLK_HZ,
-        .clk_cfg = LEDC_AUTO_CLK,
-        .deconfigure = false,
-    };
-    ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG, "mclk timer");
+    if (mclk_tx_ != nullptr) {
+        return ESP_OK;
+    }
 
-    ledc_channel_config_t ch = {
-        .gpio_num = BSP_GC032A_MCLK_GPIO,
-        .speed_mode = kMclkSpeedMode,
-        .channel = kMclkChannel,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = kMclkTimer,
-        .duty = 1,
-        .hpoint = 0,
-        .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
-        .flags = {},
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(kCameraMclkI2sPort,
+                                                            I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = 2;
+    chan_cfg.dma_frame_num = 64;
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &mclk_tx_, nullptr), TAG,
+                        "mclk chan");
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = {
+            .sample_rate_hz = kCameraMclkSampleRateHz,
+            .clk_src = I2S_CLK_SRC_PLL_240M,
+            .ext_clk_freq_hz = 0,
+            .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+            .bclk_div = 8,
+        },
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                    I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = BSP_GC032A_MCLK_GPIO,
+            .bclk = I2S_GPIO_UNUSED,
+            .ws = I2S_GPIO_UNUSED,
+            .dout = I2S_GPIO_UNUSED,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
     };
-    return ledc_channel_config(&ch);
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(mclk_tx_, &std_cfg), TAG,
+                        "mclk std");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(mclk_tx_), TAG, "mclk enable");
+
+    i2s_chan_info_t info = {};
+    if (i2s_channel_get_info(mclk_tx_, &info) == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "camera mclk: I2S%" PRIu32 " PLL240 target=%" PRIu32
+                 "Hz sample=%" PRIu32 "Hz gpio=%d",
+                 static_cast<uint32_t>(info.id), APP_GC032A_MCLK_HZ,
+                 kCameraMclkSampleRateHz, BSP_GC032A_MCLK_GPIO);
+    }
+    return ESP_OK;
 }
 
 esp_err_t CameraUartStreamer::power_on_camera()
@@ -832,10 +870,32 @@ esp_err_t CameraUartStreamer::init_gc032a_sensor()
 
 void CameraUartStreamer::dump_gc032a_spi_regs()
 {
+    static constexpr uint8_t sys_regs[] = {
+        0xf3, 0xf5, 0xf7, 0xf8, 0xf9, 0xfa, 0xfc,
+    };
     static constexpr uint8_t regs[] = {
         0x51, 0x52, 0x53, 0x54, 0x55, 0x59, 0x5a, 0x5b, 0x5c,
         0x5d, 0x5e, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67,
     };
+
+    if (gc032a_write_reg(0xfe, 0x00) == ESP_OK) {
+        char sys_line[128];
+        int w = std::snprintf(sys_line, sizeof(sys_line), "gc032a sys regs:");
+        for (uint8_t reg : sys_regs) {
+            uint8_t val = 0;
+            if (gc032a_read_reg(reg, &val) == ESP_OK) {
+                w += std::snprintf(sys_line + w, sizeof(sys_line) - w,
+                                   " %02X=%02X", reg, val);
+            } else {
+                w += std::snprintf(sys_line + w, sizeof(sys_line) - w,
+                                   " %02X=??", reg);
+            }
+            if (w >= static_cast<int>(sizeof(sys_line)) - 8) {
+                break;
+            }
+        }
+        write_status(sys_line);
+    }
 
     if (gc032a_write_reg(0xfe, 0x03) != ESP_OK) {
         write_status("gc032a: failed to select spi reg page for dump");
@@ -904,7 +964,7 @@ void CameraUartStreamer::probe_i2c()
 
 void CameraUartStreamer::dvp_dma_probe_loop()
 {
-    write_status("gc032a dvp-dma probe: LCD_CAM samples D0/D1 on PCLK; packing low 2 bits in software");
+    write_status("gc032a dvp-dma probe: LCD_CAM samples D0/D1 on alternating PCLK edges; packing low 2 bits in software");
 
     esp_cam_ctlr_dvp_pin_config_t pin_cfg = {};
     pin_cfg.data_width = CAM_CTLR_DATA_WIDTH_8;
@@ -975,20 +1035,27 @@ void CameraUartStreamer::dvp_dma_probe_loop()
 
     auto *cam_hw = CAM_LL_GET_HW(0);
     cam_ll_stop(cam_hw);
-    esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_V_SYNC_IDX, false);
+    esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ZERO_INPUT, CAM_V_SYNC_IDX, false);
     esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_H_ENABLE_IDX, false);
     esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_H_SYNC_IDX, false);
     cam_ll_set_vh_de_mode(cam_hw, false);
     cam_ll_enable_vsync_generate_eof(cam_hw, false);
     cam_ll_set_recv_data_bytelen(cam_hw, static_cast<uint32_t>(kDvpProbeRawBytes - 1U));
-    cam_ll_enable_invert_pclk(cam_hw, false);
+    bool sample_falling = false;
+    cam_ll_enable_invert_pclk(cam_hw, sample_falling);
     cam_ll_fifo_reset(cam_hw);
 
     ESP_ERROR_CHECK(esp_cam_ctlr_start(cam));
     cam_ll_start(cam_hw);
+    esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_V_SYNC_IDX, false);
 
     uint32_t windows = 0;
     uint32_t best_fs = 0, best_ls = 0, best_le = 0, best_fe = 0;
+    uint32_t low2_totals[4] = {};
+    uint32_t d0_ones_total = 0;
+    uint32_t d1_ones_total = 0;
+    uint32_t high_bits_total = 0;
+    size_t raw_bytes_total = 0;
     char best_mode[16] = "none";
     while (true) {
         DvpProbeDone done;
@@ -1001,28 +1068,57 @@ void CameraUartStreamer::dvp_dma_probe_loop()
                           static_cast<unsigned long>(cam_hw->lc_dma_int_raw.val),
                           static_cast<unsigned long>(cam_hw->lc_dma_int_st.val));
             write_status(line);
+            cam_ll_stop(cam_hw);
+            cam_ll_fifo_reset(cam_hw);
+            esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ZERO_INPUT, CAM_V_SYNC_IDX, false);
+            cam_ll_enable_invert_pclk(cam_hw, sample_falling);
+            cam_ll_start(cam_hw);
+            esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_V_SYNC_IDX, false);
+            vTaskDelay(kCameraYieldTicks);
             continue;
         }
 
         size_t raw_len = std::min(done.received, ctx.buffer_len);
+        for (size_t i = 0; i < raw_len; ++i) {
+            uint8_t raw = done.buffer[i];
+            ++low2_totals[raw & 0x03U];
+            if (raw & 0x01U) {
+                ++d0_ones_total;
+            }
+            if (raw & 0x02U) {
+                ++d1_ones_total;
+            }
+            if ((raw & 0xFCU) != 0) {
+                ++high_bits_total;
+            }
+        }
+        raw_bytes_total += raw_len;
+
         const char *mode_name = "none";
+        uint8_t mode_phase = 0;
+        bool mode_swap = false;
+        bool mode_lsb = false;
         SyncCounts mode_counts = {};
-        for (int mode = 0; mode < 4; ++mode) {
-            Spi2WirePacker packer = {
-                .swap = (mode & 0x01) != 0,
-                .lsb_first = (mode & 0x02) != 0,
-            };
-            size_t packed_len = packer.push(done.buffer, raw_len,
-                                            probe_packed, kDvpProbePackedBytes);
-            SyncCounts counts = count_bt656_syncs(probe_packed, packed_len);
-            uint32_t score = counts.fs * 16U + counts.ls * 4U + counts.le * 4U + counts.fe;
-            uint32_t best_score = mode_counts.fs * 16U + mode_counts.ls * 4U +
-                                  mode_counts.le * 4U + mode_counts.fe;
-            if (score > best_score) {
-                mode_counts = counts;
-                mode_name = mode == 0 ? "msb" :
-                            mode == 1 ? "msb-swap" :
-                            mode == 2 ? "lsb" : "lsb-swap";
+        for (uint8_t phase = 0; phase < 4; ++phase) {
+            for (int mode = 0; mode < 4; ++mode) {
+                bool swap = (mode & 0x01) != 0;
+                bool lsb = (mode & 0x02) != 0;
+                size_t packed_len = pack_pairs(done.buffer, raw_len, probe_packed,
+                                               swap, lsb, phase);
+                SyncCounts counts = count_bt656_syncs(probe_packed, packed_len);
+                uint32_t score = counts.fs * 16U + counts.ls * 4U +
+                                 counts.le * 4U + counts.fe;
+                uint32_t best_score = mode_counts.fs * 16U + mode_counts.ls * 4U +
+                                      mode_counts.le * 4U + mode_counts.fe;
+                if (score > best_score) {
+                    mode_counts = counts;
+                    mode_phase = phase;
+                    mode_swap = swap;
+                    mode_lsb = lsb;
+                    mode_name = mode == 0 ? "msb" :
+                                mode == 1 ? "msb-swap" :
+                                mode == 2 ? "lsb" : "lsb-swap";
+                }
             }
         }
 
@@ -1033,13 +1129,15 @@ void CameraUartStreamer::dvp_dma_probe_loop()
         std::snprintf(best_mode, sizeof(best_mode), "%s", mode_name);
         if (++windows >= kDvpProbeWindowsPerLog ||
             mode_counts.fs || mode_counts.ls || mode_counts.le || mode_counts.fe) {
-            char line[192];
+            char line[256];
             std::snprintf(line, sizeof(line),
-                          "dvp-dma probe windows=%lu raw=%u packed=%u mode=%s fs=%lu ls=%lu le=%lu fe=%lu totals=%lu/%lu/%lu/%lu",
+                          "dvp-dma probe edge=%s windows=%lu raw=%u packed=%u mode=%s phase=%u fs=%lu ls=%lu le=%lu fe=%lu totals=%lu/%lu/%lu/%lu low2=%lu/%lu/%lu/%lu d0=%lu/%u d1=%lu/%u high=%lu/%u",
+                          sample_falling ? "fall" : "rise",
                           static_cast<unsigned long>(windows),
                           static_cast<unsigned>(raw_len),
                           static_cast<unsigned>(kDvpProbePackedBytes),
                           best_mode,
+                          static_cast<unsigned>(mode_phase),
                           static_cast<unsigned long>(mode_counts.fs),
                           static_cast<unsigned long>(mode_counts.ls),
                           static_cast<unsigned long>(mode_counts.le),
@@ -1047,10 +1145,38 @@ void CameraUartStreamer::dvp_dma_probe_loop()
                           static_cast<unsigned long>(best_fs),
                           static_cast<unsigned long>(best_ls),
                           static_cast<unsigned long>(best_le),
-                          static_cast<unsigned long>(best_fe));
+                          static_cast<unsigned long>(best_fe),
+                          static_cast<unsigned long>(low2_totals[0]),
+                          static_cast<unsigned long>(low2_totals[1]),
+                          static_cast<unsigned long>(low2_totals[2]),
+                          static_cast<unsigned long>(low2_totals[3]),
+                          static_cast<unsigned long>(d0_ones_total),
+                          static_cast<unsigned>(raw_bytes_total),
+                          static_cast<unsigned long>(d1_ones_total),
+                          static_cast<unsigned>(raw_bytes_total),
+                          static_cast<unsigned long>(high_bits_total),
+                          static_cast<unsigned>(raw_bytes_total));
             write_status(line);
+            write_hex_dump("dvp raw", done.buffer, std::min<size_t>(raw_len, 64U));
+            size_t packed_len = pack_pairs(done.buffer, raw_len, probe_packed,
+                                           mode_swap, mode_lsb, mode_phase);
+            write_hex_dump("dvp packed best", probe_packed,
+                           std::min<size_t>(packed_len, 64U));
             windows = 0;
+            low2_totals[0] = low2_totals[1] = low2_totals[2] = low2_totals[3] = 0;
+            d0_ones_total = 0;
+            d1_ones_total = 0;
+            high_bits_total = 0;
+            raw_bytes_total = 0;
+            sample_falling = !sample_falling;
+            cam_ll_stop(cam_hw);
+            cam_ll_fifo_reset(cam_hw);
+            esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ZERO_INPUT, CAM_V_SYNC_IDX, false);
+            cam_ll_enable_invert_pclk(cam_hw, sample_falling);
+            cam_ll_start(cam_hw);
+            esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_V_SYNC_IDX, false);
         }
+        vTaskDelay(kCameraYieldTicks);
     }
 }
 
@@ -1163,49 +1289,8 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
                       static_cast<unsigned long>(msb.frame_end_syncs));
         write_status(line);
 
-        // Grab one more burst and run the 4-mode decode + hex dump so we can
-        // see whether any (swap, lsb_first) combination finds BT.656 syncs.
-        size_t probe_got = spi2_cpu_burst(raw_pair_buf_, raw_capacity_,
-                                          /*sample_falling=*/false,
-                                          kBurstPollBudget);
-        if (probe_got >= 64) {
-            analyze_and_dump(raw_pair_buf_, probe_got, /*sample_falling=*/false, seq);
-
-            // Pair-granular per-lane sync scan: each of D0/D1 carries its own
-            // BT.656 byte stream.
-            RawSyncCounts rc = scan_raw_pairs_for_sync(raw_pair_buf_, probe_got);
-            char rl[224];
-            std::snprintf(rl, sizeof(rl),
-                          "raw-scan pairs=%u D0 pfx=%lu fs=%lu ls=%lu le=%lu fe=%lu 1run=%lu 0run=%lu first=%ld | D1 pfx=%lu fs=%lu ls=%lu le=%lu fe=%lu 1run=%lu 0run=%lu first=%ld",
-                          static_cast<unsigned>(probe_got),
-                          static_cast<unsigned long>(rc.d0_prefix),
-                          static_cast<unsigned long>(rc.d0_fs),
-                          static_cast<unsigned long>(rc.d0_ls),
-                          static_cast<unsigned long>(rc.d0_le),
-                          static_cast<unsigned long>(rc.d0_fe),
-                          static_cast<unsigned long>(rc.d0_max_one_run),
-                          static_cast<unsigned long>(rc.d0_max_zero_run),
-                          static_cast<long>(rc.d0_first_fs),
-                          static_cast<unsigned long>(rc.d1_prefix),
-                          static_cast<unsigned long>(rc.d1_fs),
-                          static_cast<unsigned long>(rc.d1_ls),
-                          static_cast<unsigned long>(rc.d1_le),
-                          static_cast<unsigned long>(rc.d1_fe),
-                          static_cast<unsigned long>(rc.d1_max_one_run),
-                          static_cast<unsigned long>(rc.d1_max_zero_run),
-                          static_cast<long>(rc.d1_first_fs));
-            write_status(rl);
-
-            // Dump the first 64 bytes of each lane's bit stream so we can
-            // eyeball whether BT.656-like structure is on a single lane.
-            uint8_t lane_buf[64];
-            size_t n0 = extract_lane_bytes(raw_pair_buf_, probe_got, /*d1=*/false,
-                                           lane_buf, sizeof(lane_buf));
-            write_hex_dump("D0 lane", lane_buf, n0);
-            size_t n1 = extract_lane_bytes(raw_pair_buf_, probe_got, /*d1=*/true,
-                                           lane_buf, sizeof(lane_buf));
-            write_hex_dump("D1 lane", lane_buf, n1);
-        }
+        dump_probe_burst(/*sample_falling=*/false, seq);
+        dump_probe_burst(/*sample_falling=*/true, seq);
         vTaskDelay(pdMS_TO_TICKS(100));
         return;
     }
@@ -1326,6 +1411,66 @@ void CameraUartStreamer::capture_and_send_frame(uint32_t seq)
 #endif
 }
 
+void CameraUartStreamer::dump_probe_burst(bool sample_falling, uint32_t seq)
+{
+    size_t probe_got = spi2_cpu_burst(raw_pair_buf_, raw_capacity_,
+                                      sample_falling, kBurstPollBudget);
+    if (probe_got < 64) {
+        char line[96];
+        std::snprintf(line, sizeof(line),
+                      "spi-probe edge=%s seq=%lu: too few samples (%u)",
+                      sample_falling ? "fall" : "rise",
+                      static_cast<unsigned long>(seq),
+                      static_cast<unsigned>(probe_got));
+        write_status(line);
+        return;
+    }
+
+    analyze_and_dump(raw_pair_buf_, probe_got, sample_falling, seq);
+
+    RawSyncCounts rc = scan_raw_pairs_for_sync(raw_pair_buf_, probe_got);
+    char rl[224];
+    std::snprintf(rl, sizeof(rl),
+                  "raw-scan edge=%s pairs=%u D0 pfx=%lu fs=%lu ls=%lu le=%lu fe=%lu 1run=%lu 0run=%lu first=%ld | D1 pfx=%lu fs=%lu ls=%lu le=%lu fe=%lu 1run=%lu 0run=%lu first=%ld",
+                  sample_falling ? "fall" : "rise",
+                  static_cast<unsigned>(probe_got),
+                  static_cast<unsigned long>(rc.d0_prefix),
+                  static_cast<unsigned long>(rc.d0_fs),
+                  static_cast<unsigned long>(rc.d0_ls),
+                  static_cast<unsigned long>(rc.d0_le),
+                  static_cast<unsigned long>(rc.d0_fe),
+                  static_cast<unsigned long>(rc.d0_max_one_run),
+                  static_cast<unsigned long>(rc.d0_max_zero_run),
+                  static_cast<long>(rc.d0_first_fs),
+                  static_cast<unsigned long>(rc.d1_prefix),
+                  static_cast<unsigned long>(rc.d1_fs),
+                  static_cast<unsigned long>(rc.d1_ls),
+                  static_cast<unsigned long>(rc.d1_le),
+                  static_cast<unsigned long>(rc.d1_fe),
+                  static_cast<unsigned long>(rc.d1_max_one_run),
+                  static_cast<unsigned long>(rc.d1_max_zero_run),
+                  static_cast<long>(rc.d1_first_fs));
+    write_status(rl);
+
+    uint8_t lane_buf[64];
+    size_t n0 = extract_lane_bytes(raw_pair_buf_, probe_got, /*d1=*/false,
+                                   /*lsb_first=*/false, lane_buf, sizeof(lane_buf));
+    write_hex_dump(sample_falling ? "D0 lane fall msb" : "D0 lane rise msb",
+                   lane_buf, n0);
+    n0 = extract_lane_bytes(raw_pair_buf_, probe_got, /*d1=*/false,
+                            /*lsb_first=*/true, lane_buf, sizeof(lane_buf));
+    write_hex_dump(sample_falling ? "D0 lane fall lsb" : "D0 lane rise lsb",
+                   lane_buf, n0);
+    size_t n1 = extract_lane_bytes(raw_pair_buf_, probe_got, /*d1=*/true,
+                                   /*lsb_first=*/false, lane_buf, sizeof(lane_buf));
+    write_hex_dump(sample_falling ? "D1 lane fall msb" : "D1 lane rise msb",
+                   lane_buf, n1);
+    n1 = extract_lane_bytes(raw_pair_buf_, probe_got, /*d1=*/true,
+                            /*lsb_first=*/true, lane_buf, sizeof(lane_buf));
+    write_hex_dump(sample_falling ? "D1 lane fall lsb" : "D1 lane rise lsb",
+                   lane_buf, n1);
+}
+
 void CameraUartStreamer::emit_frame(uint32_t seq, const uint8_t *data, size_t len,
                                     uint32_t width, uint32_t height)
 {
@@ -1352,41 +1497,48 @@ void CameraUartStreamer::analyze_and_dump(const uint8_t *raw_pairs, size_t pair_
     DecodeStats best = {};
     best.first_fs = -1;
     bool best_swap = false, best_lsb = false;
-    for (int mode = 0; mode < 4; ++mode) {
-        bool swap = (mode & 0x01) != 0;
-        bool lsb  = (mode & 0x02) != 0;
-        size_t bc = pack_pairs(raw_pairs, pair_count, packed_buf_, swap, lsb);
-        DecodeStats s = score_packed(packed_buf_, bc, swap, lsb);
+    uint8_t best_phase = 0;
+    for (uint8_t phase = 0; phase < 4; ++phase) {
+        for (int mode = 0; mode < 4; ++mode) {
+            bool swap = (mode & 0x01) != 0;
+            bool lsb  = (mode & 0x02) != 0;
+            size_t bc = pack_pairs(raw_pairs, pair_count, packed_buf_, swap, lsb, phase);
+            DecodeStats s = score_packed(packed_buf_, bc, swap, lsb, phase);
 
-        char line[192];
-        std::snprintf(line, sizeof(line),
-                      "spi-burst decode edge=%s swap=%u lsb=%u: AB=%lu 80=%lu 9D=%lu B6=%lu AB->80=%lu first_AB=%ld score=%lu",
-                      sample_falling ? "fall" : "rise",
-                      swap ? 1U : 0U, lsb ? 1U : 0U,
-                      static_cast<unsigned long>(s.fs),
-                      static_cast<unsigned long>(s.ls),
-                      static_cast<unsigned long>(s.le),
-                      static_cast<unsigned long>(s.fe),
-                      static_cast<unsigned long>(s.fs_then_ls),
-                      static_cast<long>(s.first_fs),
-                      static_cast<unsigned long>(s.score));
-        write_status(line);
+            char line[208];
+            std::snprintf(line, sizeof(line),
+                          "spi-burst decode edge=%s phase=%u swap=%u lsb=%u: AB=%lu 80=%lu 9D=%lu B6=%lu AB->80=%lu first_AB=%ld score=%lu",
+                          sample_falling ? "fall" : "rise",
+                          static_cast<unsigned>(phase),
+                          swap ? 1U : 0U, lsb ? 1U : 0U,
+                          static_cast<unsigned long>(s.fs),
+                          static_cast<unsigned long>(s.ls),
+                          static_cast<unsigned long>(s.le),
+                          static_cast<unsigned long>(s.fe),
+                          static_cast<unsigned long>(s.fs_then_ls),
+                          static_cast<long>(s.first_fs),
+                          static_cast<unsigned long>(s.score));
+            write_status(line);
 
-        if (s.score > best.score) {
-            best = s;
-            best_swap = swap;
-            best_lsb  = lsb;
+            if (s.score > best.score) {
+                best = s;
+                best_swap = swap;
+                best_lsb  = lsb;
+                best_phase = phase;
+            }
         }
     }
 
     // Dump the best decode so the host side can verify the byte stream by eye.
-    size_t bc = pack_pairs(raw_pairs, pair_count, packed_buf_, best_swap, best_lsb);
+    size_t bc = pack_pairs(raw_pairs, pair_count, packed_buf_, best_swap, best_lsb,
+                           best_phase);
 
     // Dump 64 bytes from the start of the packed stream
     {
         char tag[64];
-        std::snprintf(tag, sizeof(tag), "best edge=%s swap=%u lsb=%u head",
+        std::snprintf(tag, sizeof(tag), "best edge=%s ph=%u swap=%u lsb=%u head",
                       sample_falling ? "fall" : "rise",
+                      static_cast<unsigned>(best_phase),
                       best_swap ? 1U : 0U, best_lsb ? 1U : 0U);
         write_hex_dump(tag, packed_buf_, std::min<size_t>(bc, 64U));
     }
@@ -1396,8 +1548,9 @@ void CameraUartStreamer::analyze_and_dump(const uint8_t *raw_pairs, size_t pair_
         size_t start = static_cast<size_t>(best.first_fs);
         size_t avail = bc - start;
         char tag[64];
-        std::snprintf(tag, sizeof(tag), "best edge=%s @first_AB=%zu",
-                      sample_falling ? "fall" : "rise", start);
+        std::snprintf(tag, sizeof(tag), "best edge=%s ph=%u @first_AB=%zu",
+                      sample_falling ? "fall" : "rise",
+                      static_cast<unsigned>(best_phase), start);
         write_hex_dump(tag, packed_buf_ + start, std::min<size_t>(avail, 96U));
     }
 

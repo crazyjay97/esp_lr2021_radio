@@ -2,6 +2,7 @@
 
 #include "esp_err.h"
 #include "driver/i2c_master.h"
+#include "driver/i2s_common.h"
 #include "freertos/FreeRTOS.h"
 
 class CameraUartStreamer {
@@ -24,6 +25,7 @@ private:
     void dump_gc032a_spi_regs();
     esp_err_t alloc_sample_buffer();
     void probe_i2c();
+    void dump_probe_burst(bool sample_falling, uint32_t seq);
 
     void dvp_dma_probe_loop();
     void capture_and_send_frame(uint32_t seq);
@@ -43,5 +45,6 @@ private:
     size_t   raw_capacity_ = 0;
     size_t   frame_capacity_ = 0;
     uint8_t  gc032a_addr_  = 0;
+    i2s_chan_handle_t mclk_tx_ = nullptr;
     bool     initialized_  = false;
 };

@@ -23,7 +23,7 @@ static u8 GC032A_power_io[2] = {-1, -1};
 #define GC032A_RDCMD 0x43
 
 #define CONFIG_INPUT_FPS	15
-#define PCLK 48
+#define PCLK 24
 
 struct reginfo {
     u8 reg;
@@ -35,7 +35,7 @@ static const struct reginfo sensor_init_data[] = {
 	/*System*/
 	{0xf3,0x83},
 	{0xf5,0x0c},
-	{0xf7,0x01},
+	{0xf7,0x13},
 
 #if(PCLK == 24)
 	{0xf8,0x81},//PLL 01//24Mhz-7fps
@@ -92,7 +92,7 @@ static const struct reginfo sensor_init_data[] = {
 	{0x54,0x20},
 	{0x55,0x00},//20
 	{0x59,0x10},
-	{0x5a,0x00},
+	{0x5a,0x01},
 
 //640*480
 	{0x5b,0x80},
@@ -101,7 +101,7 @@ static const struct reginfo sensor_init_data[] = {
 	{0x5e,0x01},
 
 
-	{0x64,0x01}, //[1]sck always 06 04
+	{0x64,0x0c}, // BT.656/header mode + sck always
 	{0x65,0xff},  //head sync code
 	{0x66,0x00},
 	{0x67,0x00},
@@ -624,4 +624,3 @@ REGISTER_CAMERA(GC032A) = {
     }
 };
 #endif
-
