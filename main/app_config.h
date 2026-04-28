@@ -174,9 +174,18 @@
  * capture, even if the automatic I2C probe does not see the sensor. */
 #define APP_CON6_FORCE_CAMERA           1
 
-/* CP2105 secondary UART rate. Raise this only after the PC preview tool proves
- * it can sustain the binary stream without drops. */
-#define APP_CAMERA_UART_BAUD            921600
+/* Raw LCD_CAM sample stream on UART2, emitted as ASCII hex. */
+#define APP_CAMERA_UART_BAUD            2000000
+
+/* Emit one raw frame-equivalent capture and then stop LCD_CAM/camera output.
+ * This keeps the raw sampler simple: no frame/header parsing is performed.
+ * YUV422 byte stream uses 2 bytes/pixel; GC032A 2-bit SPI needs 4 PCLK
+ * samples per byte, so one 640x480 frame is about 2.46M LCD_CAM samples. */
+#define APP_CAMERA_RAW_ONE_SHOT_ENABLE  1
+#define APP_CAMERA_RAW_ONE_SHOT_MARGIN_SAMPLES (16U * 1024U)
+#define APP_CAMERA_RAW_ONE_SHOT_SAMPLES \
+    ((APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT * 2U * 4U) + \
+     APP_CAMERA_RAW_ONE_SHOT_MARGIN_SAMPLES)
 
 /* Drive the GC032A MCLK at 24 MHz, matching the vendor PCLK==24 profile. */
 #define APP_GC032A_MCLK_HZ              24000000U
