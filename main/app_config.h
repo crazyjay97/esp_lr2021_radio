@@ -174,15 +174,16 @@
  * capture, even if the automatic I2C probe does not see the sensor. */
 #define APP_CON6_FORCE_CAMERA           1
 
-/* Raw LCD_CAM sample stream on UART2, emitted as ASCII hex. */
+/* Packed 2-bit SPI byte stream on UART2. Host-side hex view should show
+ * GC032A default sync bytes such as FF FF FF 01/02/40/80 directly. */
 #define APP_CAMERA_UART_BAUD            2000000
 
 /* Emit one raw frame-equivalent capture and then stop LCD_CAM/camera output.
  * This keeps the raw sampler simple: no frame/header parsing is performed.
  * YUV422 byte stream uses 2 bytes/pixel; GC032A 2-bit SPI needs 4 PCLK
- * samples per byte, so one 640x480 frame is about 2.46M LCD_CAM samples. */
+ * samples per byte. */
 #define APP_CAMERA_RAW_ONE_SHOT_ENABLE  1
-#define APP_CAMERA_RAW_ONE_SHOT_MARGIN_SAMPLES (16U * 1024U)
+#define APP_CAMERA_RAW_ONE_SHOT_MARGIN_SAMPLES (1U * 1024U)
 #define APP_CAMERA_RAW_ONE_SHOT_SAMPLES \
     ((APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT * 2U * 4U) + \
      APP_CAMERA_RAW_ONE_SHOT_MARGIN_SAMPLES)
@@ -191,9 +192,9 @@
 #define APP_GC032A_MCLK_HZ              24000000U
 #define APP_GC032A_I2C_ADDR             0x21U
 
-/* GC032A SPI mode emits a 640x480 YVYU/YUV422 stream with in-band sync bytes. */
-#define APP_CAMERA_SENSOR_WIDTH         640U
-#define APP_CAMERA_SENSOR_HEIGHT        480U
+/* GC032A SPI mode emits YVYU/YUV422 with in-band sync bytes. */
+#define APP_CAMERA_SENSOR_WIDTH         320U
+#define APP_CAMERA_SENSOR_HEIGHT        240U
 #define APP_CAMERA_PREVIEW_WIDTH        64U
 #define APP_CAMERA_PREVIEW_HEIGHT       48U
 #define APP_CAMERA_FULL_FRAME_ENABLE    1

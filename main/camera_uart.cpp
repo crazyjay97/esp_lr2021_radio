@@ -1,8 +1,8 @@
 // ============================================================
 // camera_uart.cpp - LCD_CAM raw sampler for GC032A PCLK + D0/D1
 //
-// UART2 output is ASCII hex only: each LCD_CAM sample byte is emitted as
-// two lowercase hex chars. Only bits [1:0] carry D0/D1.
+// UART2 output is packed binary: every four LCD_CAM samples are packed into
+// one 2-bit SPI byte so host-side hex views can see FF 00 00 xx sync codes.
 // ============================================================
 
 #include "camera_uart.hpp"
@@ -47,9 +47,14 @@ constexpr uint8_t  kGc032aIdLowReg  = 0xF1;
 constexpr uint16_t kGc032aExpectedId = 0x232A;
 
 // One DMA window. LCD_CAM stores one PCLK sample per byte, with D0/D1 in
-// bits [1:0]. UART hex output is 2x this size.
+// bits [1:0].
 constexpr size_t kDvpRawBytes = 8U * 1024U;
-constexpr size_t kHexChunkSamples = 256U;
+constexpr size_t kPackedBytesPerWindow = kDvpRawBytes / 4U;
+constexpr uint32_t kGc032aSyncPrefix = 0xFFFFFF00UL;
+constexpr uint32_t kFrameStartSync = kGc032aSyncPrefix | 0x01U;
+constexpr uint32_t kLineStartSync = kGc032aSyncPrefix | 0x02U;
+constexpr uint32_t kLineEndSync = kGc032aSyncPrefix | 0x40U;
+constexpr uint32_t kFrameEndSync = kGc032aSyncPrefix | 0x80U;
 
 struct DvpProbeDone {
     uint8_t *buffer = nullptr;
@@ -98,6 +103,103 @@ static void restart_cam_hw(lcd_cam_dev_t *hw, bool pclk_invert)
     cam_ll_start(hw);
     esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT,
                                    CAM_V_SYNC_IDX, false);
+}
+
+struct Spi2BitPacker {
+    bool swap = false;
+    bool lsb_first = false;
+    uint8_t byte = 0;
+    uint8_t phase = 0;
+
+    void reset()
+    {
+        byte = 0;
+        phase = 0;
+    }
+
+    size_t push(const uint8_t *raw, size_t raw_len, uint8_t *out, size_t out_cap)
+    {
+        size_t out_len = 0;
+        for (size_t i = 0; i < raw_len; ++i) {
+            uint8_t pair = raw[i] & 0x03U; // D0=bit0, D1=bit1
+            if (swap) {
+                pair = static_cast<uint8_t>(((pair & 0x01U) << 1U) |
+                                            ((pair & 0x02U) >> 1U));
+            }
+            uint8_t shift = lsb_first ? static_cast<uint8_t>(phase * 2U)
+                                      : static_cast<uint8_t>((3U - phase) * 2U);
+            byte = static_cast<uint8_t>(byte | (pair << shift));
+            if (++phase == 4U) {
+                if (out_len >= out_cap) {
+                    reset();
+                    return out_len;
+                }
+                out[out_len++] = byte;
+                byte = 0;
+                phase = 0;
+            }
+        }
+        return out_len;
+    }
+};
+
+struct PackedSyncScan {
+    uint32_t prefix = 0;
+    uint32_t exact = 0;
+    uint32_t frame_start = 0;
+    uint32_t tail_hist[256] = {};
+    int first_prefix = -1;
+    int first_exact = -1;
+    int first_frame_start = -1;
+};
+
+static PackedSyncScan scan_packed_syncs(const uint8_t *data, size_t len)
+{
+    uint32_t win = 0;
+    PackedSyncScan scan = {};
+    for (size_t i = 0; i < len; ++i) {
+        win = (win << 8U) | data[i];
+        if (i < 3U) continue;
+        if ((win & 0xFFFFFF00UL) == kGc032aSyncPrefix) {
+            if (scan.first_prefix < 0) {
+                scan.first_prefix = static_cast<int>(i - 3U);
+            }
+            ++scan.tail_hist[win & 0xffU];
+            ++scan.prefix;
+        }
+        if (win == kFrameStartSync || win == kLineStartSync ||
+            win == kLineEndSync || win == kFrameEndSync) {
+            if (scan.first_exact < 0) {
+                scan.first_exact = static_cast<int>(i - 3U);
+            }
+            ++scan.exact;
+        }
+        if (win == kFrameStartSync) {
+            if (scan.first_frame_start < 0) {
+                scan.first_frame_start = static_cast<int>(i - 3U);
+            }
+            ++scan.frame_start;
+        }
+    }
+    return scan;
+}
+
+static void log_sync_tail_summary(const char *label, const PackedSyncScan &scan)
+{
+    char line[192];
+    size_t off = std::snprintf(line, sizeof(line),
+                               "%s prefix=%" PRIu32 " exact=%" PRIu32
+                               " fs=%" PRIu32 " tails:",
+                               label, scan.prefix, scan.exact, scan.frame_start);
+    uint32_t shown = 0;
+    for (uint32_t tail = 0; tail < 256U && shown < 12U; ++tail) {
+        uint32_t count = scan.tail_hist[tail];
+        if (count == 0U) continue;
+        off += std::snprintf(line + off, sizeof(line) - off,
+                             " %02x=%" PRIu32, static_cast<unsigned>(tail), count);
+        ++shown;
+    }
+    ESP_LOGI(TAG, "%s", line);
 }
 
 } // namespace
@@ -236,54 +338,142 @@ void CameraUartStreamer::dvp_stream_loop()
     cam_ll_start(hw);
     esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_V_SYNC_IDX, false);
 
-    ESP_LOGI(TAG, "raw hex stream: UART%d %u baud, each sample byte masked to 0x03",
+    ESP_LOGI(TAG, "packed binary stream: UART%d %u baud, D0=low D1=high",
              static_cast<int>(kUart), static_cast<unsigned>(APP_CAMERA_UART_BAUD));
 
-    static constexpr char hex[] = "0123456789abcdef";
-    char line[kHexChunkSamples * 2U + 1U];
+    uint8_t spi52 = 0xff;
+    if (gc032a_write_reg(0xfe, 0x03) == ESP_OK &&
+        gc032a_read_reg(0x52, &spi52) == ESP_OK) {
+        ESP_LOGI(TAG, "gc032a spi reg 52=%02x, default pack order=%s",
+                 spi52, (spi52 & 0x80U) ? "MSB-first" : "LSB-first");
+    } else {
+        ESP_LOGW(TAG, "gc032a spi reg 52 read failed, defaulting MSB-first");
+    }
+    gc032a_write_reg(0xfe, 0x00);
+
+    uint8_t packed[kPackedBytesPerWindow];
+    Spi2BitPacker packer;
     uint32_t windows = 0;
     uint32_t timeouts = 0;
     size_t samples_sent = 0;
+    bool phase_locked = false;
+    uint32_t lock_attempts = 0;
+    bool default_lsb_first = (spi52 != 0xff) && ((spi52 & 0x80U) == 0U);
 
     while (true) {
         DvpProbeDone done;
         if (xQueueReceive(ctx.done_queue, &done, pdMS_TO_TICKS(2000)) != pdTRUE) {
             ESP_LOGW(TAG, "dvp stream timeout, restarting LCD_CAM");
             restart_cam_hw(hw, pclk_invert);
+            phase_locked = false;
+            packer.reset();
             ++timeouts;
             continue;
         }
 
         size_t raw_len = std::min(done.received, ctx.buffer_len);
+        const uint8_t *raw = done.buffer;
+        if (!phase_locked) {
+            PackedSyncScan best_scan = {};
+            uint8_t best_phase = 0;
+            bool best_swap = false;
+            bool best_lsb = default_lsb_first;
+            int best_first_sync = -1;
+            struct PackMode {
+                bool swap;
+                bool lsb;
+            };
+            PackMode modes[] = {
+                {false, default_lsb_first},
+                {true,  default_lsb_first},
+                {false, !default_lsb_first},
+                {true,  !default_lsb_first},
+            };
+            for (uint8_t phase = 0; phase < 4U; ++phase) {
+                if (phase >= raw_len) break;
+                for (const auto &mode : modes) {
+                    Spi2BitPacker trial;
+                    trial.swap = mode.swap;
+                    trial.lsb_first = mode.lsb;
+                    size_t packed_len = trial.push(raw + phase, raw_len - phase,
+                                                   packed, sizeof(packed));
+                    PackedSyncScan scan = scan_packed_syncs(packed, packed_len);
+                    if (lock_attempts == 0U) {
+                        char label[64];
+                        std::snprintf(label, sizeof(label),
+                                      "syncdiag phase=%u swap=%u %s",
+                                      static_cast<unsigned>(phase),
+                                      mode.swap ? 1U : 0U,
+                                      mode.lsb ? "LSB" : "MSB");
+                        log_sync_tail_summary(label, scan);
+                    }
+                    if (scan.frame_start > best_scan.frame_start ||
+                        (scan.frame_start == best_scan.frame_start &&
+                         (scan.exact > best_scan.exact ||
+                          (scan.exact == best_scan.exact && scan.prefix > best_scan.prefix)))) {
+                        best_scan = scan;
+                        best_phase = phase;
+                        best_swap = mode.swap;
+                        best_lsb = mode.lsb;
+                        best_first_sync = (scan.first_frame_start >= 0)
+                                              ? scan.first_frame_start
+                                              : ((scan.first_exact >= 0)
+                                                     ? scan.first_exact : scan.first_prefix);
+                    }
+                }
+            }
+            if (best_scan.frame_start == 0U) {
+                if ((++lock_attempts % 16U) == 0U) {
+                    ESP_LOGW(TAG, "packed stream waiting for frame_start, attempts=%" PRIu32
+                                  " exact=%" PRIu32 " prefix=%" PRIu32,
+                             lock_attempts, best_scan.exact, best_scan.prefix);
+                }
+                vTaskDelay(1);
+                continue;
+            }
+
+            size_t raw_skip = static_cast<size_t>(best_phase) +
+                              static_cast<size_t>(best_first_sync) * 4U;
+            if (raw_skip >= raw_len) {
+                vTaskDelay(1);
+                continue;
+            }
+            phase_locked = true;
+            lock_attempts = 0;
+            packer.swap = best_swap;
+            packer.lsb_first = best_lsb;
+            packer.reset();
+            ESP_LOGI(TAG, "packed stream locked at frame_start: phase=%u swap=%u %s "
+                          "first_sync_byte=%d raw_skip=%u frame_start=%" PRIu32
+                          " exact=%" PRIu32 " prefix=%" PRIu32,
+                     static_cast<unsigned>(best_phase), best_swap ? 1U : 0U,
+                     best_lsb ? "LSB-first" : "MSB-first", best_first_sync,
+                     static_cast<unsigned>(raw_skip), best_scan.frame_start,
+                     best_scan.exact, best_scan.prefix);
+            raw += raw_skip;
+            raw_len -= raw_skip;
+        }
+
 #if APP_CAMERA_RAW_ONE_SHOT_ENABLE
         size_t remaining = APP_CAMERA_RAW_ONE_SHOT_SAMPLES - samples_sent;
         raw_len = std::min(raw_len, remaining);
 #endif
-        const uint8_t *raw = done.buffer;
-        size_t off = 0;
-        while (off < raw_len) {
-            size_t n = std::min(kHexChunkSamples, raw_len - off);
-            for (size_t i = 0; i < n; ++i) {
-                uint8_t v = raw[off + i] & 0x03U;
-                line[i * 2U] = hex[v >> 4U];
-                line[i * 2U + 1U] = hex[v & 0x0FU];
-            }
-            line[n * 2U] = '\n';
-            uart_write_bytes(kUart, line, n * 2U + 1U);
-            off += n;
-            samples_sent += n;
+        size_t packed_len = packer.push(raw, raw_len, packed, sizeof(packed));
+        if (packed_len > 0U) {
+            uart_write_bytes(kUart, packed, packed_len);
         }
+        samples_sent += raw_len;
 
         if ((++windows % 128U) == 0U) {
-            ESP_LOGI(TAG, "raw hex windows=%" PRIu32 " timeouts=%" PRIu32,
+            ESP_LOGI(TAG, "packed windows=%" PRIu32 " timeouts=%" PRIu32,
                      windows, timeouts);
         }
 
 #if APP_CAMERA_RAW_ONE_SHOT_ENABLE
         if (samples_sent >= APP_CAMERA_RAW_ONE_SHOT_SAMPLES) {
-            ESP_LOGI(TAG, "raw one-shot complete: samples=%u hex_bytes=%u",
+            ESP_LOGI(TAG, "packed one-shot complete: samples=%u packed_bytes=%u",
                      static_cast<unsigned>(samples_sent),
-                     static_cast<unsigned>(samples_sent * 2U));
+                     static_cast<unsigned>(samples_sent / 4U));
             uart_wait_tx_done(kUart, pdMS_TO_TICKS(30000));
             cam_ll_stop(hw);
             gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
@@ -459,8 +649,49 @@ esp_err_t CameraUartStreamer::init_gc032a_sensor()
     ESP_LOGI(TAG, "gc032a: sensor ready, %u regs written",
              static_cast<unsigned>(sizeof(kGc032aInitRegs) /
                                    sizeof(kGc032aInitRegs[0])));
+    dump_gc032a_init_regs();
     dump_gc032a_spi_regs();
     return ESP_OK;
+}
+
+void CameraUartStreamer::dump_gc032a_init_regs()
+{
+    uint8_t page = 0;
+    uint32_t checked = 0;
+    uint32_t mismatches = 0;
+
+    ESP_LOGI(TAG, "gc032a init regs readback begin");
+    for (const auto &rv : kGc032aInitRegs) {
+        if (rv.reg == 0xfe) {
+            page = rv.val;
+            if (gc032a_write_reg(0xfe, page) != ESP_OK) {
+                ESP_LOGW(TAG, "gc032a readback: select page %02x failed", page);
+                return;
+            }
+            ESP_LOGI(TAG, "gc032a readback: page=%02x", page);
+            continue;
+        }
+
+        uint8_t actual = 0;
+        esp_err_t err = gc032a_read_reg(rv.reg, &actual);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "gc032a readback: p%02x r%02x failed: %s",
+                     page, rv.reg, esp_err_to_name(err));
+            continue;
+        }
+
+        ++checked;
+        if (actual != rv.val) ++mismatches;
+        ESP_LOGI(TAG, "gc032a readback: p%02x r%02x=%02x expected=%02x%s",
+                 page, rv.reg, actual, rv.val,
+                 actual == rv.val ? "" : " mismatch");
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    gc032a_write_reg(0xfe, 0x00);
+    ESP_LOGI(TAG, "gc032a init regs readback done: checked=%" PRIu32
+                  " mismatches=%" PRIu32,
+             checked, mismatches);
 }
 
 void CameraUartStreamer::dump_gc032a_spi_regs()

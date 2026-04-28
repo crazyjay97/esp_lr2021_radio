@@ -20,6 +20,7 @@ private:
     esp_err_t gc032a_read_reg(uint8_t reg, uint8_t *val);
     esp_err_t gc032a_write_reg(uint8_t reg, uint8_t val);
     esp_err_t init_gc032a_sensor();
+    void dump_gc032a_init_regs();
     void dump_gc032a_spi_regs();
     void probe_i2c();
     void write_status(const char *msg);
