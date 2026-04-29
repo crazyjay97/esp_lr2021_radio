@@ -178,19 +178,46 @@
  * GC032A default sync bytes such as FF FF FF 01/02/40/80 directly. */
 #define APP_CAMERA_UART_BAUD            2000000
 
-/* Emit one raw frame-equivalent capture and then stop LCD_CAM/camera output.
- * This keeps the raw sampler simple: no frame/header parsing is performed.
- * YUV422 byte stream uses 2 bytes/pixel; GC032A 2-bit SPI needs 4 PCLK
- * samples per byte. */
+/* Capture a bounded packed raw stream into PSRAM, then stop LCD_CAM/camera
+ * output and dump the captured bytes over UART2. This avoids UART backpressure
+ * while sampling. */
 #define APP_CAMERA_RAW_ONE_SHOT_ENABLE  1
+#define APP_CAMERA_PACKED_CAPTURE_BYTES (1U * 1024U * 1024U)
+#define APP_CAMERA_OUTPUT_PPM_ENABLE    1
+#define APP_CAMERA_IMAGE_MAX_WIDTH      640U
+#define APP_CAMERA_IMAGE_MAX_HEIGHT     480U
+#define APP_CAMERA_CAPTURE_USE_SPI_SLAVE 0
+#define APP_CAMERA_SPI_SLAVE_CAPTURE_MS  1500U
 #define APP_CAMERA_RAW_ONE_SHOT_MARGIN_SAMPLES (1U * 1024U)
 #define APP_CAMERA_RAW_ONE_SHOT_SAMPLES \
     ((APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT * 2U * 4U) + \
      APP_CAMERA_RAW_ONE_SHOT_MARGIN_SAMPLES)
 
-/* Drive the GC032A MCLK at 24 MHz, matching the vendor PCLK==24 profile. */
-#define APP_GC032A_MCLK_HZ              24000000U
+/* Drive GC032A MCLK at an LEDC/APB-exact 20 MHz for stable scope timing. */
+#define APP_GC032A_MCLK_HZ              20000000U
 #define APP_GC032A_I2C_ADDR             0x21U
+
+/* Keep the main GC032A register list untouched and apply only post-init
+ * experiments here. */
+#define APP_GC032A_SPI_1SDR_ENABLE      0
+#define APP_GC032A_PCLK_DELAY_ENABLE    0
+#define APP_GC032A_PCLK_DELAY_REG       0x05U
+#define APP_GC032A_PCLK_DELAY_VAL       0x02U
+
+/* P0:0x46[2] controls the GC032A PCLK/data edge relationship on similar GalaxyCore
+ * sensors. Pair this with LCD_CAM pclk inversion so ESP samples the opposite
+ * edge after moving the sensor output edge. */
+#define APP_GC032A_PCLK_POLARITY_ENABLE 0
+#define APP_GC032A_PCLK_POLARITY_VAL    0x26U
+#define APP_CAMERA_DVP_PCLK_INVERT      0
+
+/* Temporary timing experiment: keep the main GC032A register list untouched,
+ * then increase page0 HB/VB after init to reduce frame rate/average output. */
+#define APP_GC032A_TIMING_PATCH_ENABLE  0
+#define APP_GC032A_PATCH_HB_HI          0x03U
+#define APP_GC032A_PATCH_HB_LO          0x00U
+#define APP_GC032A_PATCH_VB_HI          0x01U
+#define APP_GC032A_PATCH_VB_LO          0x00U
 
 /* GC032A SPI mode emits YVYU/YUV422 with in-band sync bytes. */
 #define APP_CAMERA_SENSOR_WIDTH         320U

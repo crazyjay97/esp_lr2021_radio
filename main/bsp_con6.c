@@ -20,7 +20,7 @@ static esp_err_t con6_start_camera_mclk_for_detect(void)
         .duty_resolution = LEDC_TIMER_1_BIT,
         .timer_num = LEDC_TIMER_0,
         .freq_hz = APP_GC032A_MCLK_HZ,
-        .clk_cfg = LEDC_AUTO_CLK,
+        .clk_cfg = LEDC_USE_APB_CLK,
         .deconfigure = false,
     };
     ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG, "detect mclk timer");

@@ -100,6 +100,7 @@
 #define BSP_GC032A_SPI_CLK_GPIO     GPIO_NUM_12
 #define BSP_GC032A_DATA0_GPIO       GPIO_NUM_6
 #define BSP_GC032A_DATA1_GPIO       GPIO_NUM_7
+#define BSP_GC032A_SPI_CS_GPIO      GPIO_NUM_4
 
 /* ---------- RGB status LED (driven by the GPIO expander) ----------------- */
 #define BSP_IO_EXP_LED_G_PIN        0
