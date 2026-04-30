@@ -1,16 +1,18 @@
 // ============================================================
-// camera_uart.cpp - LCD_CAM raw sampler for GC032A PCLK + D0/D1
+// camera_uart.cpp - GC032A packet stream capture over LCD_CAM
 //
-// UART2 output is packed binary: every four LCD_CAM samples are packed into
-// one 2-bit SPI byte so host-side hex views can see FF 00 00 xx sync codes.
+// 中文说明：
+// GC032A 当前输出 packet 数据流。1SDR 模式只采 D0，每 8 个 sample 拼 1 byte；
+// 2-bit 模式采 D0/D1，每 4 个 sample 拼 1 byte。
+// 因为 DMA 起点不一定落在 GC032A 字节边界，采样过程中会同时尝试
+// phase。只有找到 FF FF FF 01 帧头后才固定 phase 并开始保存，
+// 保存的第一个字节序列就是 FF FF FF 01，最后通过 UART2 输出。
 // ============================================================
 
 #include "camera_uart.hpp"
 
 #include <algorithm>
 #include <cinttypes>
-#include <cstdio>
-#include <cstring>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -18,7 +20,6 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
-#include "driver/spi_slave.h"
 #include "driver/uart.h"
 #include "esp_cam_ctlr.h"
 #include "esp_cam_ctlr_dvp.h"
@@ -27,11 +28,9 @@
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "hal/cam_ll.h"
-#include "hal/spi_ll.h"
 #include "soc/gpio_pins.h"
 #include "soc/gpio_sig_map.h"
 #include "soc/lcd_cam_struct.h"
-#include "soc/spi_periph.h"
 #include "app_config.h"
 #include "bsp.h"
 #include "gc032a_regs.hpp"
@@ -51,24 +50,24 @@ constexpr uint32_t         kMclkDuty50Percent  = 1U;
 constexpr uint8_t  kGc032aIdHighReg = 0xF0;
 constexpr uint8_t  kGc032aIdLowReg  = 0xF1;
 constexpr uint16_t kGc032aExpectedId = 0x232A;
-constexpr spi_host_device_t kCameraSpiHost = SPI3_HOST;
 
-// One DMA window. LCD_CAM stores one PCLK sample per byte, with D0/D1 in
-// bits [1:0].
-constexpr size_t kDvpRawBytes = 32U * 1024U;
-constexpr size_t kPackedBytesPerWindow =
-#if APP_GC032A_SPI_1SDR_ENABLE
-    kDvpRawBytes / 8U;
-#else
-    kDvpRawBytes / 4U;
-#endif
-constexpr size_t kPackedRawPhaseOffset = 0U;
-constexpr size_t kSpiSlaveDmaBytes = 32U * 1024U;
-constexpr TickType_t kSpiSlaveWindowTicks = pdMS_TO_TICKS(10);
-constexpr size_t kSyncSize = 4U;
+// LCD_CAM DMA 每个 byte 只用低位数据：1SDR 用 bit0=D0，2-bit 用 bit0=D0/bit1=D1。
+// DMA buffer 必须在 internal SRAM；一帧 packet 数据另存到 PSRAM。
+constexpr size_t kDvpRawBytes = 64U * 1024U;
+constexpr size_t kDvpBufferCount = 4U;
+constexpr bool kUse1Sdr = APP_GC032A_SPI_1SDR_ENABLE != 0;
+constexpr uint8_t kSampleBits = kUse1Sdr ? 1U : 2U;
+constexpr uint8_t kSamplesPerByte = static_cast<uint8_t>(8U / kSampleBits);
+constexpr uint8_t kPhaseCount = kSamplesPerByte;
+constexpr uint8_t kSampleMask = static_cast<uint8_t>((1U << kSampleBits) - 1U);
+constexpr uint8_t kPreferredPhase = kUse1Sdr ? 0U : 3U;
+constexpr uint32_t kSyncSearchWindowsPerPhase = 128U;
+constexpr uint32_t kIdleDelayEveryWindows = 16U;
 constexpr uint8_t kSyncFrameStart = 0x01U;
-constexpr uint8_t kSyncLineStart = 0x02U;
-constexpr uint8_t kSyncLineEnd = 0x40U;
+constexpr uint8_t kSyncFrameEnd = 0x00U;
+constexpr uint32_t kSyncPrefix = 0xffffff00UL;
+constexpr uint32_t kFrameStartWord = kSyncPrefix | kSyncFrameStart;
+constexpr uint32_t kFrameEndWord = kSyncPrefix | kSyncFrameEnd;
 
 struct DvpProbeDone {
     uint8_t *buffer = nullptr;
@@ -76,9 +75,11 @@ struct DvpProbeDone {
 };
 
 struct DvpProbeContext {
-    uint8_t *buffers[2] = {};
+    uint8_t *buffers[kDvpBufferCount] = {};
     size_t buffer_len = 0;
     uint32_t next = 0;
+    uint32_t queue_drops = 0;
+    portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
     QueueHandle_t done_queue = nullptr;
 };
 
@@ -87,7 +88,7 @@ static bool IRAM_ATTR dvp_get_new_trans(esp_cam_ctlr_handle_t,
                                         void *user_data)
 {
     auto *ctx = static_cast<DvpProbeContext *>(user_data);
-    uint32_t idx = ctx->next++ & 0x01U;
+    uint32_t idx = ctx->next++ % kDvpBufferCount;
     trans->buffer = ctx->buffers[idx];
     trans->buflen = ctx->buffer_len;
     return false;
@@ -103,12 +104,17 @@ static bool IRAM_ATTR dvp_trans_finished(esp_cam_ctlr_handle_t,
         .received = trans->received_size,
     };
     BaseType_t woken = pdFALSE;
-    xQueueSendFromISR(ctx->done_queue, &done, &woken);
+    if (xQueueSendFromISR(ctx->done_queue, &done, &woken) != pdTRUE) {
+        portENTER_CRITICAL_ISR(&ctx->lock);
+        ++ctx->queue_drops;
+        portEXIT_CRITICAL_ISR(&ctx->lock);
+    }
     return woken == pdTRUE;
 }
 
 static void restart_cam_hw(lcd_cam_dev_t *hw, bool pclk_invert)
 {
+    // LCD_CAM 偶尔收不到 DMA 完成事件时，复位 FIFO 并重新打开采样。
     cam_ll_stop(hw);
     cam_ll_fifo_reset(hw);
     esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ZERO_INPUT,
@@ -119,282 +125,46 @@ static void restart_cam_hw(lcd_cam_dev_t *hw, bool pclk_invert)
                                    CAM_V_SYNC_IDX, false);
 }
 
-static void force_spi_slave_cs_level(spi_host_device_t host, bool active)
-{
-    gpio_set_level(BSP_GC032A_SPI_CS_GPIO, active ? 0 : 1);
-    esp_rom_gpio_connect_in_signal(BSP_GC032A_SPI_CS_GPIO,
-                                   spi_periph_signal[host].spics_in, false);
-}
-
-static void force_camera_data_input_only()
-{
-    gpio_set_direction(BSP_GC032A_DATA0_GPIO, GPIO_MODE_INPUT);
-    gpio_set_direction(BSP_GC032A_DATA1_GPIO, GPIO_MODE_INPUT);
-}
-
-static void IRAM_ATTR camera_spi_slave_post_setup(spi_slave_transaction_t *)
-{
-#if !APP_GC032A_SPI_1SDR_ENABLE
-    spi_dev_t *hw = SPI_LL_GET_HW(kCameraSpiHost);
-    hw->user.doutdin = 0;
-    hw->user.fwrite_dual = 1;
-    hw->ctrl.fread_dual = 1;
-#endif
-    force_spi_slave_cs_level(kCameraSpiHost, true);
-}
-
-struct Spi2BitPacker {
-    bool swap = false;
-    bool lsb_first = false;
+struct PhaseSyncCandidate {
+    uint8_t skip_samples = 0;
     uint8_t byte = 0;
     uint8_t phase = 0;
+    uint32_t sync_word = 0;
 
-    void reset()
+    void reset(uint8_t initial_skip)
     {
+        skip_samples = initial_skip;
         byte = 0;
         phase = 0;
+        sync_word = 0;
     }
 
-    size_t push(const uint8_t *raw, size_t raw_len, uint8_t *out, size_t out_cap)
+    bool push_sample(uint8_t sample, uint8_t *out)
     {
-        size_t out_len = 0;
-        for (size_t i = 0; i < raw_len; ++i) {
-            uint8_t pair = raw[i] & 0x03U; // D0=bit0, D1=bit1
-            if (swap) {
-                pair = static_cast<uint8_t>(((pair & 0x01U) << 1U) |
-                                            ((pair & 0x02U) >> 1U));
-            }
-            uint8_t shift = lsb_first ? static_cast<uint8_t>(phase * 2U)
-                                      : static_cast<uint8_t>((3U - phase) * 2U);
-            byte = static_cast<uint8_t>(byte | (pair << shift));
-            if (++phase == 4U) {
-                if (out_len >= out_cap) {
-                    reset();
-                    return out_len;
-                }
-                out[out_len++] = byte;
-                byte = 0;
-                phase = 0;
-            }
+        if (skip_samples > 0U) {
+            --skip_samples;
+            return false;
         }
-        return out_len;
+        // GC032A 当前配置是 LSB-first：第 1 个 sample 放在 byte 的低位。
+        byte = static_cast<uint8_t>(byte | ((sample & kSampleMask) << (phase * kSampleBits)));
+        if (++phase == kSamplesPerByte) {
+            *out = byte;
+            sync_word = (sync_word << 8U) | byte;
+            byte = 0;
+            phase = 0;
+            return true;
+        }
+        return false;
     }
 };
 
-struct Spi1BitPacker {
-    bool lsb_first = true;
-    uint8_t byte = 0;
-    uint8_t phase = 0;
-
-    void reset()
-    {
-        byte = 0;
-        phase = 0;
-    }
-
-    size_t push(const uint8_t *raw, size_t raw_len, uint8_t *out, size_t out_cap)
-    {
-        size_t out_len = 0;
-        for (size_t i = 0; i < raw_len; ++i) {
-            uint8_t bit = raw[i] & 0x01U; // D0 only
-            uint8_t shift = lsb_first ? phase : static_cast<uint8_t>(7U - phase);
-            byte = static_cast<uint8_t>(byte | (bit << shift));
-            if (++phase == 8U) {
-                if (out_len >= out_cap) {
-                    reset();
-                    return out_len;
-                }
-                out[out_len++] = byte;
-                byte = 0;
-                phase = 0;
-            }
-        }
-        return out_len;
-    }
-};
-
-static bool sync_at(const uint8_t *data, size_t len, size_t pos, uint8_t tag)
+static inline uint8_t pack_lsb_samples(const uint8_t *raw)
 {
-    return pos + kSyncSize <= len &&
-           data[pos] == 0xffU &&
-           data[pos + 1U] == 0xffU &&
-           data[pos + 2U] == 0xffU &&
-           data[pos + 3U] == tag;
-}
-
-static size_t find_sync(const uint8_t *data, size_t len, size_t start, uint8_t tag)
-{
-    if (len < kSyncSize || start > len - kSyncSize) {
-        return SIZE_MAX;
+    uint8_t out = 0;
+    for (uint8_t i = 0; i < kSamplesPerByte; ++i) {
+        out = static_cast<uint8_t>(out | ((raw[i] & kSampleMask) << (i * kSampleBits)));
     }
-    for (size_t i = start; i <= len - kSyncSize; ++i) {
-        if (sync_at(data, len, i, tag)) {
-            return i;
-        }
-    }
-    return SIZE_MAX;
-}
-
-static uint8_t clamp_u8(int v)
-{
-    if (v < 0) return 0;
-    if (v > 255) return 255;
-    return static_cast<uint8_t>(v);
-}
-
-static void yuv_to_rgb(uint8_t y, uint8_t u, uint8_t v, uint8_t *rgb)
-{
-    int c = static_cast<int>(y) - 16;
-    int d = static_cast<int>(u) - 128;
-    int e = static_cast<int>(v) - 128;
-    if (c < 0) c = 0;
-
-    rgb[0] = clamp_u8((298 * c + 409 * e + 128) >> 8);
-    rgb[1] = clamp_u8((298 * c - 100 * d - 208 * e + 128) >> 8);
-    rgb[2] = clamp_u8((298 * c + 516 * d + 128) >> 8);
-}
-
-static bool parse_gc032a_frame_header(const uint8_t *data,
-                                      size_t len,
-                                      size_t frame_start,
-                                      uint16_t *width,
-                                      uint16_t *height,
-                                      size_t *payload_pos)
-{
-    size_t pos = frame_start + kSyncSize;
-    if (pos + 5U > len) {
-        return false;
-    }
-
-    uint16_t w = static_cast<uint16_t>((static_cast<uint16_t>(data[pos + 2U]) << 8U) |
-                                       data[pos + 1U]);
-    uint16_t h = static_cast<uint16_t>((static_cast<uint16_t>(data[pos + 4U]) << 8U) |
-                                       data[pos + 3U]);
-    if (w == 0U || h == 0U ||
-        w > APP_CAMERA_IMAGE_MAX_WIDTH ||
-        h > APP_CAMERA_IMAGE_MAX_HEIGHT) {
-        return false;
-    }
-
-    *width = w;
-    *height = h;
-    *payload_pos = pos + 5U;
-    return true;
-}
-
-static esp_err_t output_ppm_from_gc032a_stream(const uint8_t *data, size_t len)
-{
-    size_t frame_start = find_sync(data, len, 0, kSyncFrameStart);
-    if (frame_start == SIZE_MAX) {
-        ESP_LOGE(TAG, "PPM output: frame_start FF FF FF 01 not found");
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    uint16_t width = APP_CAMERA_SENSOR_WIDTH;
-    uint16_t height = APP_CAMERA_SENSOR_HEIGHT;
-    size_t pos = frame_start + kSyncSize;
-    if (parse_gc032a_frame_header(data, len, frame_start, &width, &height, &pos)) {
-        ESP_LOGI(TAG, "PPM output: frame header width=%u height=%u",
-                 static_cast<unsigned>(width), static_cast<unsigned>(height));
-    } else {
-        width = std::min<uint16_t>(APP_CAMERA_SENSOR_WIDTH,
-                                   APP_CAMERA_IMAGE_MAX_WIDTH);
-        height = std::min<uint16_t>(APP_CAMERA_SENSOR_HEIGHT,
-                                    APP_CAMERA_IMAGE_MAX_HEIGHT);
-        ESP_LOGW(TAG, "PPM output: invalid frame header, fallback width=%u height=%u",
-                 static_cast<unsigned>(width), static_cast<unsigned>(height));
-    }
-
-    const size_t rgb_len = static_cast<size_t>(width) * height * 3U;
-    uint8_t *rgb = static_cast<uint8_t *>(
-        heap_caps_malloc(rgb_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!rgb) {
-        rgb = static_cast<uint8_t *>(
-            heap_caps_malloc(rgb_len, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    }
-    if (!rgb) {
-        ESP_LOGE(TAG, "PPM output: RGB frame alloc failed: %u bytes",
-                 static_cast<unsigned>(rgb_len));
-        return ESP_ERR_NO_MEM;
-    }
-    std::memset(rgb, 0, rgb_len);
-
-    uint32_t lines_found = 0;
-    uint32_t lines_used = 0;
-    uint32_t malformed = 0;
-    const size_t expected_line_bytes = static_cast<size_t>(width) * 2U;
-    const size_t max_line_scan_extra = 64U;
-
-    while (pos < len) {
-        size_t line_start = find_sync(data, len, pos, kSyncLineStart);
-        if (line_start == SIZE_MAX || line_start + kSyncSize + 2U > len) {
-            break;
-        }
-        ++lines_found;
-
-        uint16_t line_no = static_cast<uint16_t>(
-            data[line_start + kSyncSize] |
-            (static_cast<uint16_t>(data[line_start + kSyncSize + 1U]) << 8U));
-        size_t payload_start = line_start + kSyncSize + 2U;
-        size_t scan_end = std::min(len, payload_start + expected_line_bytes + max_line_scan_extra);
-        size_t line_end = find_sync(data, scan_end, payload_start, kSyncLineEnd);
-        if (line_end == SIZE_MAX) {
-            ++malformed;
-            pos = payload_start;
-            continue;
-        }
-
-        size_t payload_len = line_end - payload_start;
-        size_t usable = std::min(payload_len, expected_line_bytes);
-        usable &= ~static_cast<size_t>(0x03U);
-
-        if (line_no < height && usable >= 4U) {
-            uint8_t *dst = rgb + (static_cast<size_t>(line_no) * width * 3U);
-            size_t x = 0;
-            for (size_t i = 0; i + 3U < usable && x + 1U < width; i += 4U, x += 2U) {
-                uint8_t y0 = data[payload_start + i];
-                uint8_t v = data[payload_start + i + 1U];
-                uint8_t y1 = data[payload_start + i + 2U];
-                uint8_t u = data[payload_start + i + 3U];
-                yuv_to_rgb(y0, u, v, dst + x * 3U);
-                yuv_to_rgb(y1, u, v, dst + (x + 1U) * 3U);
-            }
-            ++lines_used;
-        } else {
-            ++malformed;
-        }
-
-        pos = line_end + kSyncSize;
-    }
-
-    char header[48];
-    int header_len = std::snprintf(header, sizeof(header),
-                                   "P6\n%u %u\n255\n",
-                                   static_cast<unsigned>(width),
-                                   static_cast<unsigned>(height));
-    if (header_len <= 0 || static_cast<size_t>(header_len) >= sizeof(header)) {
-        heap_caps_free(rgb);
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    ESP_LOGI(TAG, "PPM output: frame_start_off=%u lines_found=%u lines_used=%u malformed=%u rgb_bytes=%u",
-             static_cast<unsigned>(frame_start),
-             static_cast<unsigned>(lines_found),
-             static_cast<unsigned>(lines_used),
-             static_cast<unsigned>(malformed),
-             static_cast<unsigned>(rgb_len));
-
-    uart_write_bytes(kUart, header, header_len);
-    for (size_t off = 0; off < rgb_len;) {
-        size_t chunk = std::min(static_cast<size_t>(APP_CAMERA_UART_CHUNK_BYTES),
-                                rgb_len - off);
-        uart_write_bytes(kUart, rgb + off, chunk);
-        off += chunk;
-        vTaskDelay(1);
-    }
-    uart_wait_tx_done(kUart, pdMS_TO_TICKS(30000));
-    heap_caps_free(rgb);
-    return ESP_OK;
+    return out;
 }
 
 } // namespace
@@ -451,197 +221,13 @@ void CameraUartStreamer::task()
         vTaskDelete(nullptr);
     }
 
-#if APP_CAMERA_CAPTURE_USE_SPI_SLAVE
-    spi_slave_stream_loop();
-#else
     dvp_stream_loop();
-#endif
-}
-
-void CameraUartStreamer::spi_slave_stream_loop()
-{
-    uint8_t spi52 = 0xff;
-    if (gc032a_write_reg(0xfe, 0x03) == ESP_OK &&
-        gc032a_read_reg(0x52, &spi52) == ESP_OK) {
-    ESP_LOGI(TAG, "gc032a spi reg 52=%02x, expected order=%s",
-                 spi52, (spi52 & 0x80U) ? "MSB-first" : "LSB-first");
-    } else {
-        ESP_LOGW(TAG, "gc032a spi reg 52 read failed");
-    }
-    gc032a_write_reg(0xfe, 0x00);
-
-    gpio_config_t cs_cfg = {
-        .pin_bit_mask = 1ULL << BSP_GC032A_SPI_CS_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&cs_cfg));
-    gpio_set_level(BSP_GC032A_SPI_CS_GPIO, 1);
-
-    const size_t capture_cap = APP_CAMERA_PACKED_CAPTURE_BYTES;
-    uint8_t *capture = static_cast<uint8_t *>(
-        heap_caps_malloc(capture_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!capture) {
-        ESP_LOGW(TAG, "spi slave PSRAM capture alloc failed, trying internal");
-        capture = static_cast<uint8_t *>(
-            heap_caps_malloc(capture_cap, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    }
-    if (!capture) {
-        ESP_LOGE(TAG, "spi slave capture buffer alloc failed: %u bytes",
-                 static_cast<unsigned>(capture_cap));
-        gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
-        vTaskDelete(nullptr);
-    }
-    std::memset(capture, 0, capture_cap);
-
-    uint8_t *dma_buf = static_cast<uint8_t *>(
-        heap_caps_aligned_alloc(64, kSpiSlaveDmaBytes,
-                                MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
-    if (!dma_buf) {
-        ESP_LOGE(TAG, "spi slave DMA buffer alloc failed: %u bytes",
-                 static_cast<unsigned>(kSpiSlaveDmaBytes));
-        heap_caps_free(capture);
-        gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
-        vTaskDelete(nullptr);
-    }
-
-    spi_bus_config_t bus_cfg = {};
-    bus_cfg.mosi_io_num = BSP_GC032A_DATA0_GPIO;
-#if APP_GC032A_SPI_1SDR_ENABLE
-    bus_cfg.miso_io_num = -1;
-#else
-    bus_cfg.miso_io_num = BSP_GC032A_DATA1_GPIO;
-#endif
-    bus_cfg.sclk_io_num = BSP_GC032A_SPI_CLK_GPIO;
-    bus_cfg.data2_io_num = -1;
-    bus_cfg.data3_io_num = -1;
-    bus_cfg.data4_io_num = -1;
-    bus_cfg.data5_io_num = -1;
-    bus_cfg.data6_io_num = -1;
-    bus_cfg.data7_io_num = -1;
-    bus_cfg.max_transfer_sz = static_cast<int>(kSpiSlaveDmaBytes);
-    bus_cfg.flags = SPICOMMON_BUSFLAG_SCLK | SPICOMMON_BUSFLAG_MOSI |
-#if !APP_GC032A_SPI_1SDR_ENABLE
-                    SPICOMMON_BUSFLAG_DUAL |
-#endif
-                    SPICOMMON_BUSFLAG_GPIO_PINS;
-
-    spi_slave_interface_config_t slave_cfg = {};
-    slave_cfg.spics_io_num = BSP_GC032A_SPI_CS_GPIO;
-    slave_cfg.flags = SPI_SLAVE_RXBIT_LSBFIRST;
-    slave_cfg.queue_size = 1;
-    slave_cfg.mode = 0;
-    slave_cfg.post_setup_cb = camera_spi_slave_post_setup;
-
-    esp_err_t err = spi_slave_initialize(kCameraSpiHost, &bus_cfg, &slave_cfg,
-                                         SPI_DMA_CH_AUTO);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "spi slave init failed: %s", esp_err_to_name(err));
-        heap_caps_free(dma_buf);
-        heap_caps_free(capture);
-        gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
-        vTaskDelete(nullptr);
-    }
-    ESP_ERROR_CHECK(gpio_config(&cs_cfg));
-    gpio_set_level(BSP_GC032A_SPI_CS_GPIO, 1);
-    force_camera_data_input_only();
-    ESP_LOGI(TAG, "spi slave data pins forced input-only after bus init");
-
-    force_spi_slave_cs_level(kCameraSpiHost, false);
-
-    ESP_LOGI(TAG, "spi slave %s capture: host=SPI3 PCLK=GPIO%d MOSI/IO0=GPIO%d IO1=GPIO%d CS=GPIO%d loopback %u ms bytes=%u dma_window=%u",
-#if APP_GC032A_SPI_1SDR_ENABLE
-             "1-line SDR",
-#else
-             "DIO",
-#endif
-             BSP_GC032A_SPI_CLK_GPIO, BSP_GC032A_DATA0_GPIO,
-             BSP_GC032A_DATA1_GPIO, BSP_GC032A_SPI_CS_GPIO,
-             static_cast<unsigned>(APP_CAMERA_SPI_SLAVE_CAPTURE_MS),
-             static_cast<unsigned>(capture_cap),
-             static_cast<unsigned>(kSpiSlaveDmaBytes));
-
-    size_t got = 0;
-    uint32_t windows = 0;
-    TickType_t deadline = xTaskGetTickCount() +
-                          pdMS_TO_TICKS(APP_CAMERA_SPI_SLAVE_CAPTURE_MS);
-    while (got < capture_cap && xTaskGetTickCount() < deadline) {
-        spi_slave_transaction_t trans = {};
-        trans.length = kSpiSlaveDmaBytes * 8U;
-        trans.rx_buffer = dma_buf;
-        std::memset(dma_buf, 0, kSpiSlaveDmaBytes);
-
-        err = spi_slave_queue_trans(kCameraSpiHost, &trans, pdMS_TO_TICKS(1000));
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "spi slave queue failed: %s", esp_err_to_name(err));
-            break;
-        }
-
-        force_spi_slave_cs_level(kCameraSpiHost, true);
-        vTaskDelay(kSpiSlaveWindowTicks);
-        force_spi_slave_cs_level(kCameraSpiHost, false);
-
-        spi_slave_transaction_t *ret = nullptr;
-        err = spi_slave_get_trans_result(kCameraSpiHost, &ret, pdMS_TO_TICKS(1000));
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "spi slave result failed: %s", esp_err_to_name(err));
-            break;
-        }
-
-        size_t rx_len = 0;
-        if (ret) {
-            rx_len = std::min(kSpiSlaveDmaBytes, (ret->trans_len + 7U) / 8U);
-        }
-        size_t copy_len = std::min(rx_len, capture_cap - got);
-        size_t nonzero = 0;
-        for (size_t i = 0; i < copy_len; ++i) {
-            nonzero += dma_buf[i] != 0;
-        }
-        std::memcpy(capture + got, dma_buf, copy_len);
-        got += copy_len;
-        ++windows;
-        if (windows <= 4U || (windows % 32U) == 0U) {
-            ESP_LOGI(TAG, "spi slave window=%u trans_bits=%u rx_bytes=%u nonzero=%u total=%u",
-                     static_cast<unsigned>(windows),
-                     ret ? static_cast<unsigned>(ret->trans_len) : 0U,
-                     static_cast<unsigned>(copy_len),
-                     static_cast<unsigned>(nonzero),
-                     static_cast<unsigned>(got));
-        }
-    }
-
-    gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
-    ESP_LOGI(TAG, "spi slave capture complete: windows=%u dump_bytes=%u",
-             static_cast<unsigned>(windows),
-             static_cast<unsigned>(got));
-
-#if APP_CAMERA_OUTPUT_PPM_ENABLE
-    if (got > 0U && output_ppm_from_gc032a_stream(capture, got) == ESP_OK) {
-        ESP_LOGI(TAG, "SPI slave PPM output complete");
-    } else
-#endif
-    {
-        for (size_t off = 0; off < got;) {
-            size_t chunk = std::min(static_cast<size_t>(APP_CAMERA_UART_CHUNK_BYTES),
-                                    got - off);
-            uart_write_bytes(kUart, capture + off, chunk);
-            off += chunk;
-            vTaskDelay(1);
-        }
-        uart_wait_tx_done(kUart, pdMS_TO_TICKS(30000));
-    }
-
-    spi_slave_free(kCameraSpiHost);
-    heap_caps_free(dma_buf);
-    heap_caps_free(capture);
-    ESP_LOGI(TAG, "SPI slave UART dump complete");
-    vTaskDelete(nullptr);
 }
 
 void CameraUartStreamer::dvp_stream_loop()
 {
+    // 使用 LCD_CAM 的 DVP 输入采 GC032A 的 PCLK/D0/D1。
+    // 1SDR 只接 D0；2-bit 模式接 D0/D1。LCD_CAM 按 RAW8 收，有效数据在低位。
     esp_cam_ctlr_dvp_pin_config_t pin_cfg = {};
     pin_cfg.data_width = CAM_CTLR_DATA_WIDTH_8;
     for (int i = 0; i < CAM_DVP_DATA_SIG_NUM; ++i) {
@@ -658,7 +244,7 @@ void CameraUartStreamer::dvp_stream_loop()
 
     esp_cam_ctlr_dvp_config_t dvp_cfg = {
         .ctlr_id = 0,
-        .clk_src = CAM_CLK_SRC_XTAL,
+        .clk_src = CAM_CLK_SRC_PLL240M,
         .h_res = 256,
         .v_res = static_cast<uint32_t>(kDvpRawBytes / 256U),
         .input_data_color_type = CAM_CTLR_COLOR_RAW8,
@@ -680,16 +266,44 @@ void CameraUartStreamer::dvp_stream_loop()
         vTaskDelete(nullptr);
     }
 
+    size_t capture_cap = APP_CAMERA_PACKED_CAPTURE_BYTES;
+    size_t capture_len = 0;
+    uint8_t *capture = static_cast<uint8_t *>(
+        heap_caps_malloc(capture_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!capture) {
+        ESP_LOGE(TAG, "packed capture PSRAM alloc failed: %u bytes, largest_psram=%u",
+                 static_cast<unsigned>(capture_cap),
+                 static_cast<unsigned>(
+                     heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM |
+                                                      MALLOC_CAP_8BIT)));
+        gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
+        vTaskDelete(nullptr);
+    }
+    ESP_LOGI(TAG, "packed one-frame PSRAM capture buffer=%u bytes",
+             static_cast<unsigned>(capture_cap));
+
     DvpProbeContext ctx = {};
     ctx.buffer_len = kDvpRawBytes;
-    ctx.done_queue = xQueueCreate(4, sizeof(DvpProbeDone));
+    ctx.done_queue = xQueueCreate(kDvpBufferCount, sizeof(DvpProbeDone));
+    // DMA buffer 必须在 internal SRAM，不能放 PSRAM。
     uint32_t buf_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
-    ctx.buffers[0] = static_cast<uint8_t *>(
-        esp_cam_ctlr_alloc_buffer(cam, ctx.buffer_len, buf_caps));
-    ctx.buffers[1] = static_cast<uint8_t *>(
-        esp_cam_ctlr_alloc_buffer(cam, ctx.buffer_len, buf_caps));
-    if (!ctx.done_queue || !ctx.buffers[0] || !ctx.buffers[1]) {
-        ESP_LOGE(TAG, "dvp: DMA buffer alloc failed");
+    for (size_t i = 0; i < kDvpBufferCount; ++i) {
+        ctx.buffers[i] = static_cast<uint8_t *>(
+            esp_cam_ctlr_alloc_buffer(cam, ctx.buffer_len, buf_caps));
+    }
+    bool dma_alloc_ok = ctx.done_queue != nullptr;
+    for (size_t i = 0; i < kDvpBufferCount; ++i) {
+        dma_alloc_ok = dma_alloc_ok && ctx.buffers[i] != nullptr;
+    }
+    if (!dma_alloc_ok) {
+        ESP_LOGE(TAG, "dvp: DMA buffer alloc failed, window=%u count=%u largest_dma=%u",
+                 static_cast<unsigned>(ctx.buffer_len),
+                 static_cast<unsigned>(kDvpBufferCount),
+                 static_cast<unsigned>(
+                     heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                      MALLOC_CAP_DMA |
+                                                      MALLOC_CAP_8BIT)));
+        heap_caps_free(capture);
         vTaskDelete(nullptr);
     }
 
@@ -716,8 +330,9 @@ void CameraUartStreamer::dvp_stream_loop()
     cam_ll_start(hw);
     esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_V_SYNC_IDX, false);
 
-    ESP_LOGI(TAG, "packed binary stream: UART%d %u baud, D0=low D1=high",
-             static_cast<int>(kUart), static_cast<unsigned>(APP_CAMERA_UART_BAUD));
+    ESP_LOGI(TAG, "packed binary stream: UART%d %u baud, mode=%s",
+             static_cast<int>(kUart), static_cast<unsigned>(APP_CAMERA_UART_BAUD),
+             kUse1Sdr ? "1SDR D0-only" : "2-bit D0/D1");
 
     uint8_t spi52 = 0xff;
     if (gc032a_write_reg(0xfe, 0x03) == ESP_OK &&
@@ -729,124 +344,159 @@ void CameraUartStreamer::dvp_stream_loop()
     }
     gc032a_write_reg(0xfe, 0x00);
 
-    uint8_t *capture = nullptr;
-    size_t capture_cap = 0;
-    size_t capture_len = 0;
-#if APP_CAMERA_RAW_ONE_SHOT_ENABLE
-    capture_cap = APP_CAMERA_PACKED_CAPTURE_BYTES;
-    capture = static_cast<uint8_t *>(
-        heap_caps_malloc(capture_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!capture) {
-        capture = static_cast<uint8_t *>(
-            heap_caps_malloc(capture_cap, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    PhaseSyncCandidate phases[kPhaseCount];
+    for (uint8_t i = 0; i < kPhaseCount; ++i) {
+        phases[i].reset(i);
     }
-    if (!capture) {
-        ESP_LOGE(TAG, "packed capture buffer alloc failed: %u bytes",
-                 static_cast<unsigned>(capture_cap));
-        cam_ll_stop(hw);
-        gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
-        vTaskDelete(nullptr);
-    }
-    ESP_LOGI(TAG, "packed one-shot capture buffer=%u bytes",
-             static_cast<unsigned>(capture_cap));
-#endif
-
-    uint8_t packed[kPackedBytesPerWindow];
-#if APP_GC032A_SPI_1SDR_ENABLE
-    Spi1BitPacker packer;
-    packer.lsb_first = true;
-#else
-    Spi2BitPacker packer;
-    packer.swap = false;
-    packer.lsb_first = true;
-#endif
-    packer.reset();
     uint32_t windows = 0;
     uint32_t timeouts = 0;
-    size_t samples_sent = 0;
-#if APP_GC032A_SPI_1SDR_ENABLE
-    ESP_LOGI(TAG, "1-bit map fixed: IO0/D0 -> bits 0..7, LSB-first");
-#else
-    ESP_LOGI(TAG, "2-bit map fixed: IO0/D0 -> bits 0/2/4/6, IO1/D1 -> bits 1/3/5/7, LSB-first");
-#endif
+    size_t samples_seen = 0;
+    bool frame_locked = false;
+    bool frame_done = false;
+    uint8_t locked_phase = 0;
+    uint8_t search_phase = kPreferredPhase;
+    ESP_LOGI(TAG, "%s online sync: search phase=%u/%u, lock on FF FF FF 01, LSB-first",
+             kUse1Sdr ? "1SDR" : "2-bit",
+             static_cast<unsigned>(search_phase),
+             static_cast<unsigned>(kPhaseCount));
 
-    while (true) {
+    while (!frame_done) {
         DvpProbeDone done;
         if (xQueueReceive(ctx.done_queue, &done, pdMS_TO_TICKS(2000)) != pdTRUE) {
             ESP_LOGW(TAG, "dvp stream timeout, restarting LCD_CAM");
+            if (frame_locked) {
+                ESP_LOGW(TAG, "timeout after frame start, output partial frame");
+                frame_done = true;
+                continue;
+            }
             restart_cam_hw(hw, pclk_invert);
-            packer.reset();
+            if (!frame_locked) {
+                for (uint8_t i = 0; i < kPhaseCount; ++i) {
+                    phases[i].reset(i);
+                }
+                search_phase = static_cast<uint8_t>((search_phase + 1U) % kPhaseCount);
+                ESP_LOGW(TAG, "sync not found before timeout, try phase=%u",
+                         static_cast<unsigned>(search_phase));
+            }
             ++timeouts;
             continue;
         }
 
         size_t raw_len = std::min(done.received, ctx.buffer_len);
         const uint8_t *raw = done.buffer;
-        if (raw_len <= kPackedRawPhaseOffset) {
-            continue;
-        }
-        raw += kPackedRawPhaseOffset;
-        raw_len -= kPackedRawPhaseOffset;
+        for (size_t i = 0; i < raw_len && !frame_done;) {
+            // 每个 DMA byte 的 bit[1:0] 是一次 PCLK 上采到的 D1/D0。
+            uint8_t out = 0;
 
-        size_t packed_len = packer.push(raw, raw_len, packed, sizeof(packed));
-#if APP_CAMERA_RAW_ONE_SHOT_ENABLE
-        if (packed_len > 0U) {
-            size_t room = capture_cap - capture_len;
-            size_t copy_len = std::min(packed_len, room);
-            if (copy_len > 0U) {
-                std::memcpy(capture + capture_len, packed, copy_len);
-                capture_len += copy_len;
+            if (frame_locked) {
+                if (phases[locked_phase].phase == 0U &&
+                    phases[locked_phase].skip_samples == 0U &&
+                    i + kSamplesPerByte <= raw_len) {
+                    // 锁定 phase 后直接 pack，减少逐 sample 状态机开销。
+                    out = pack_lsb_samples(raw + i);
+                    phases[locked_phase].sync_word =
+                        (phases[locked_phase].sync_word << 8U) | out;
+                    i += kSamplesPerByte;
+                } else {
+                    if (!phases[locked_phase].push_sample(raw[i] & kSampleMask, &out)) {
+                        ++i;
+                        continue;
+                    }
+                    ++i;
+                }
+
+                if (capture_len < capture_cap) {
+                    capture[capture_len++] = out;
+                    if (phases[locked_phase].sync_word == kFrameEndWord &&
+                        capture_len > 4U) {
+                        frame_done = true;
+                    }
+                } else {
+                    if (!frame_done) {
+                        ESP_LOGW(TAG, "frame buffer full before FF FF FF 00");
+                        frame_done = true;
+                    }
+                }
+                continue;
             }
-            if (copy_len < packed_len) {
-                ESP_LOGW(TAG, "packed capture buffer full, dropping %u bytes",
-                         static_cast<unsigned>(packed_len - copy_len));
+
+            // 未同步前不存储数据。为了跟上 DMA，只检查当前 phase；
+            // 如果 2 秒内没有找到帧头，timeout 分支会切到下一个 phase。
+            if (phases[search_phase].push_sample(raw[i] & kSampleMask, &out) &&
+                phases[search_phase].sync_word == kFrameStartWord) {
+                frame_locked = true;
+                locked_phase = search_phase;
+                capture[0] = 0xffU;
+                capture[1] = 0xffU;
+                capture[2] = 0xffU;
+                capture[3] = kSyncFrameStart;
+                capture_len = 4U;
+                ESP_LOGI(TAG, "frame start locked: phase=%u samples_seen=%u",
+                         static_cast<unsigned>(locked_phase),
+                         static_cast<unsigned>(samples_seen + i + 1U));
             }
+            ++i;
         }
-#else
-        if (packed_len > 0U) {
-            uart_write_bytes(kUart, packed, packed_len);
-        }
-#endif
-        samples_sent += raw_len;
+        samples_seen += raw_len;
 
         if ((++windows % 128U) == 0U) {
-            ESP_LOGI(TAG, "packed windows=%" PRIu32 " timeouts=%" PRIu32,
-                     windows, timeouts);
-        }
-
-#if APP_CAMERA_RAW_ONE_SHOT_ENABLE
-        if (capture_len >= capture_cap) {
-            cam_ll_stop(hw);
-            gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
-            ESP_LOGI(TAG, "packed capture complete: samples=%u packed_bytes=%u",
-                     static_cast<unsigned>(samples_sent),
+            ESP_LOGI(TAG, "packed windows=%" PRIu32 " timeouts=%" PRIu32
+                     " queue_drops=%" PRIu32 " locked=%u bytes=%u",
+                     windows, timeouts, ctx.queue_drops,
+                     frame_locked ? 1U : 0U,
                      static_cast<unsigned>(capture_len));
-#if APP_CAMERA_OUTPUT_PPM_ENABLE
-            esp_err_t ppm_err = output_ppm_from_gc032a_stream(capture, capture_len);
-            if (ppm_err != ESP_OK) {
-                ESP_LOGE(TAG, "PPM output failed: %s, dumping raw packed stream",
-                         esp_err_to_name(ppm_err));
-#endif
-            for (size_t off = 0; off < capture_len;) {
-                size_t chunk = std::min(static_cast<size_t>(APP_CAMERA_UART_CHUNK_BYTES),
-                                        capture_len - off);
-                uart_write_bytes(kUart, capture + off, chunk);
-                off += chunk;
-                vTaskDelay(1);
-            }
-            uart_wait_tx_done(kUart, pdMS_TO_TICKS(30000));
-#if APP_CAMERA_OUTPUT_PPM_ENABLE
-            } else {
-                ESP_LOGI(TAG, "PPM UART output complete");
-            }
-#endif
-            heap_caps_free(capture);
-            ESP_LOGI(TAG, "LCD_CAM stopped, GC032A PWDN asserted, UART output complete");
-            vTaskDelete(nullptr);
         }
-#endif
+        if (!frame_locked && (windows % kSyncSearchWindowsPerPhase) == 0U) {
+            search_phase = static_cast<uint8_t>((search_phase + 1U) % kPhaseCount);
+            phases[search_phase].reset(search_phase);
+            ESP_LOGI(TAG, "sync search rotate phase=%u",
+                     static_cast<unsigned>(search_phase));
+        }
+        if ((windows % kIdleDelayEveryWindows) == 0U) {
+            vTaskDelay(1);
+        } else {
+            taskYIELD();
+        }
+    }
+
+    cam_ll_stop(hw);
+    gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
+    ESP_LOGI(TAG, "frame capture complete: phase=%u samples=%u bytes=%u end=%u queue_drops=%u",
+             static_cast<unsigned>(locked_phase),
+             static_cast<unsigned>(samples_seen),
+             static_cast<unsigned>(capture_len),
+             phases[locked_phase].sync_word == kFrameEndWord ? 1U : 0U,
+             static_cast<unsigned>(ctx.queue_drops));
+    if (capture_len >= 16U) {
+        ESP_LOGI(TAG,
+                 "UART dump first16: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                 capture[0], capture[1], capture[2], capture[3],
+                 capture[4], capture[5], capture[6], capture[7],
+                 capture[8], capture[9], capture[10], capture[11],
+                 capture[12], capture[13], capture[14], capture[15]);
+    }
+
+    for (size_t off = 0; off < capture_len;) {
+        size_t chunk = std::min(static_cast<size_t>(APP_CAMERA_UART_CHUNK_BYTES),
+                                capture_len - off);
+        int written = uart_write_bytes(kUart, capture + off, chunk);
+        if (written < 0 || static_cast<size_t>(written) != chunk) {
+            ESP_LOGE(TAG, "UART write failed: off=%u requested=%u written=%d",
+                     static_cast<unsigned>(off),
+                     static_cast<unsigned>(chunk),
+                     written);
+            break;
+        }
+        off += chunk;
         vTaskDelay(1);
     }
+    esp_err_t tx_done = uart_wait_tx_done(kUart, pdMS_TO_TICKS(30000));
+    if (tx_done != ESP_OK) {
+        ESP_LOGE(TAG, "UART wait tx done failed: %s", esp_err_to_name(tx_done));
+    }
+    heap_caps_free(capture);
+    ESP_LOGI(TAG, "LCD_CAM stopped, GC032A PWDN asserted, UART output complete");
+    vTaskDelete(nullptr);
 }
 
 esp_err_t CameraUartStreamer::start_mclk()
@@ -997,62 +647,10 @@ esp_err_t CameraUartStreamer::gc032a_write_reg(uint8_t reg, uint8_t val)
 esp_err_t CameraUartStreamer::init_gc032a_sensor()
 {
     ESP_RETURN_ON_ERROR(attach_gc032a(), TAG, "attach");
-
-    uint8_t idh = 0, idl = 0;
-    ESP_RETURN_ON_ERROR(gc032a_read_reg(kGc032aIdHighReg, &idh), TAG, "id high");
-    ESP_RETURN_ON_ERROR(gc032a_read_reg(kGc032aIdLowReg, &idl), TAG, "id low");
-    if (static_cast<uint16_t>((idh << 8) | idl) != kGc032aExpectedId) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
     for (const auto &rv : kGc032aInitRegs) {
         ESP_RETURN_ON_ERROR(gc032a_write_reg(rv.reg, rv.val), TAG, "init reg");
         vTaskDelay(pdMS_TO_TICKS(1));
     }
-
-#if APP_GC032A_TIMING_PATCH_ENABLE
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0xfe, 0x00), TAG, "timing page");
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0x05, APP_GC032A_PATCH_HB_HI), TAG, "timing hb hi");
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0x06, APP_GC032A_PATCH_HB_LO), TAG, "timing hb lo");
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0x07, APP_GC032A_PATCH_VB_HI), TAG, "timing vb hi");
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0x08, APP_GC032A_PATCH_VB_LO), TAG, "timing vb lo");
-    ESP_LOGI(TAG, "gc032a timing patch: HB=%02x%02x VB=%02x%02x",
-             APP_GC032A_PATCH_HB_HI, APP_GC032A_PATCH_HB_LO,
-             APP_GC032A_PATCH_VB_HI, APP_GC032A_PATCH_VB_LO);
-#endif
-
-#if APP_GC032A_SPI_1SDR_ENABLE
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0xfe, 0x03), TAG, "1sdr page");
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0x52, 0x58), TAG, "1sdr mode");
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0x53, 0x21), TAG, "1sdr line num");
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0x5a, 0x01), TAG, "1sdr output");
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0x64, 0x0c), TAG, "1sdr sck");
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0xfe, 0x00), TAG, "1sdr page0");
-    ESP_LOGI(TAG, "gc032a 1-line SDR patch applied: MCLK=%uHz p03[52]=58 p03[53]=21 p03[5a]=01 p03[64]=0c",
-             static_cast<unsigned>(APP_GC032A_MCLK_HZ));
-#endif
-
-#if APP_GC032A_PCLK_DELAY_ENABLE
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0xfe, 0x00), TAG, "pclk delay page0");
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(APP_GC032A_PCLK_DELAY_REG,
-                                         APP_GC032A_PCLK_DELAY_VAL),
-                        TAG, "pclk delay");
-    ESP_LOGI(TAG, "gc032a pclk delay patch: p00 r%02x=%02x",
-             APP_GC032A_PCLK_DELAY_REG, APP_GC032A_PCLK_DELAY_VAL);
-#endif
-
-#if APP_GC032A_PCLK_POLARITY_ENABLE
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0xfe, 0x00), TAG, "pclk polarity page0");
-    ESP_RETURN_ON_ERROR(gc032a_write_reg(0x46, APP_GC032A_PCLK_POLARITY_VAL),
-                        TAG, "pclk polarity");
-    ESP_LOGI(TAG, "gc032a pclk polarity patch: p00 r46=%02x, lcd_cam_pclk_invert=%u",
-             APP_GC032A_PCLK_POLARITY_VAL,
-             static_cast<unsigned>(APP_CAMERA_DVP_PCLK_INVERT));
-#endif
-
-    ESP_LOGI(TAG, "gc032a: sensor ready, %u regs written",
-             static_cast<unsigned>(sizeof(kGc032aInitRegs) /
-                                   sizeof(kGc032aInitRegs[0])));
     dump_gc032a_init_regs();
     dump_gc032a_spi_regs();
     return ESP_OK;
@@ -1106,7 +704,8 @@ void CameraUartStreamer::dump_gc032a_spi_regs()
     }
 
     constexpr uint8_t regs[] = {
-        0x53, 0x55, 0x5a, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67,
+        0x53, 0x55, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e,
+        0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67,
     };
     uint8_t vals[sizeof(regs)] = {};
     for (size_t i = 0; i < sizeof(regs); ++i) {
@@ -1118,10 +717,13 @@ void CameraUartStreamer::dump_gc032a_spi_regs()
     }
 
     ESP_LOGI(TAG,
-             "gc032a spi regs: 53=%02x 55=%02x 5a=%02x 60=%02x 61=%02x "
-             "62=%02x 63=%02x 64=%02x 65=%02x 66=%02x 67=%02x",
-             vals[0], vals[1], vals[2], vals[3], vals[4],
-             vals[5], vals[6], vals[7], vals[8], vals[9], vals[10]);
+             "gc032a spi regs: 53=%02x 55=%02x 5a=%02x "
+             "5b=%02x 5c=%02x 5d=%02x 5e=%02x "
+             "60=%02x 61=%02x 62=%02x 63=%02x 64=%02x 65=%02x 66=%02x 67=%02x",
+             vals[0], vals[1], vals[2],
+             vals[3], vals[4], vals[5], vals[6],
+             vals[7], vals[8], vals[9], vals[10],
+             vals[11], vals[12], vals[13], vals[14]);
     gc032a_write_reg(0xfe, 0x00);
 }
 

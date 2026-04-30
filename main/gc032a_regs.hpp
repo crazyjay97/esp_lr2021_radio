@@ -2,6 +2,10 @@
 
 #include <stdint.h>
 
+#ifndef APP_GC032A_SPI_1SDR_ENABLE
+#define APP_GC032A_SPI_1SDR_ENABLE 0
+#endif
+
 struct Gc032aRegVal {
     uint8_t reg;
     uint8_t val;
@@ -24,6 +28,7 @@ static constexpr Gc032aRegVal kGc032aInitRegs[] = {
     {0x79,0x60},
     /*Analog&Cisctl*/
     {0xfe,0x00},
+    {0xfa,0x11}, // Pclk = mclk / 4
     {0x03,0x01},
     {0x04,0xc2},
     {0x05,0x01},
@@ -55,15 +60,19 @@ static constexpr Gc032aRegVal kGc032aInitRegs[] = {
     {0xfe,0x03},
     {0x51,0x01},
     {0x52,0x58}, // 0x58: ddr disable, LSB; 0xd8: ddr disable, MSB
-    {0x53,0x24}, // Disable CRC
+#if APP_GC032A_SPI_1SDR_ENABLE
+    {0x53,0x21}, // add sync, data_bandwidth=0: 1-bit SDR on SDO0, sequence=1
+#else
+    {0x53,0x24}, // add sync, data_bandwidth=1: 2-bit SDR on SDO0/SDO1
+#endif
     {0x54,0x20},
     {0x55,0x00},
     {0x59,0x10},
-    {0x5a,0x00},
-    {0x5b,0x80},
-    {0x5c,0x02},
-    {0x5d,0xe0},
-    {0x5e,0x01},
+    {0x5a,0x00}, // sync_format, not data-line count
+    {0x5b,0x40}, // output width low:  0x0140 = 320
+    {0x5c,0x01}, // output width high
+    {0x5d,0xf0}, // output height low: 0x00f0 = 240
+    {0x5e,0x00}, // output height high
     {0x64,0x04}, //SCK Always OFF , gavin 20160820
 
     /*blk*/

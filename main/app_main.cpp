@@ -41,6 +41,21 @@ extern "C" void app_main(void)
 
     esp_err_t e;
     ESP_ERROR_CHECK(bsp_i2c_init());
+
+#if APP_CAMERA_ONLY_BRINGUP
+    ESP_LOGW(TAG, "camera-only bring-up: skipping CON6 detect, LED, audio, LR2021 radio, buttons, LCD, chime");
+#if APP_CAMERA_UART_ENABLE
+    if ((e = g_camera_uart.start()) != ESP_OK) {
+        ESP_LOGE(TAG, "camera uart start: %s", esp_err_to_name(e));
+    }
+    ESP_LOGI(TAG, "camera UART2: %d baud on GPIO%d TX / GPIO%d RX; camera-only GC032A stream",
+             APP_CAMERA_UART_BAUD, BSP_UART2_TX_GPIO, BSP_UART2_RX_GPIO);
+#else
+    ESP_LOGW(TAG, "APP_CAMERA_UART_ENABLE is disabled");
+#endif
+    return;
+#endif
+
     bsp_i2c_scan();
 
     bsp_con6_peripheral_t con6 = BSP_CON6_PERIPHERAL_LCD_ST7789;

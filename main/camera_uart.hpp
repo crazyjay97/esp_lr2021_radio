@@ -25,7 +25,6 @@ private:
     void probe_i2c();
     void write_status(const char *msg);
     void dvp_stream_loop();
-    void spi_slave_stream_loop();
     i2c_master_dev_handle_t gc032a_ = nullptr;
     uint8_t  gc032a_addr_  = 0;
     bool     mclk_started_ = false;

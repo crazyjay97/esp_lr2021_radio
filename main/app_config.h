@@ -170,65 +170,40 @@
  * shared I2C bus for a sensor, and streams framed image data on UART2. */
 #define APP_CAMERA_UART_ENABLE          1
 
+/* Camera-only bring-up mode. This skips audio, LR2021 radio, buttons, LEDs,
+ * LCD detection/demo, and startup chime so camera sampling runs alone. */
+#define APP_CAMERA_ONLY_BRINGUP         1
+
 /* Force CON6 into GC032A camera mode for camera bring-up and logic analyzer
  * capture, even if the automatic I2C probe does not see the sensor. */
 #define APP_CON6_FORCE_CAMERA           1
 
-/* Packed 2-bit SPI byte stream on UART2. Host-side hex view should show
+/* Packed GC032A SPI byte stream on UART2. Host-side hex view should show
  * GC032A default sync bytes such as FF FF FF 01/02/40/80 directly. */
 #define APP_CAMERA_UART_BAUD            2000000
 
-/* Capture a bounded packed raw stream into PSRAM, then stop LCD_CAM/camera
- * output and dump the captured bytes over UART2. This avoids UART backpressure
- * while sampling. */
-#define APP_CAMERA_RAW_ONE_SHOT_ENABLE  1
-#define APP_CAMERA_PACKED_CAPTURE_BYTES (1U * 1024U * 1024U)
-#define APP_CAMERA_OUTPUT_PPM_ENABLE    1
-#define APP_CAMERA_IMAGE_MAX_WIDTH      640U
-#define APP_CAMERA_IMAGE_MAX_HEIGHT     480U
-#define APP_CAMERA_CAPTURE_USE_SPI_SLAVE 0
-#define APP_CAMERA_SPI_SLAVE_CAPTURE_MS  1500U
-#define APP_CAMERA_RAW_ONE_SHOT_MARGIN_SAMPLES (1U * 1024U)
-#define APP_CAMERA_RAW_ONE_SHOT_SAMPLES \
-    ((APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT * 2U * 4U) + \
-     APP_CAMERA_RAW_ONE_SHOT_MARGIN_SAMPLES)
+/* 1: GC032A 单线 SDR；0: 双线 2-bit，只采 D0/D1。 */
+#define APP_GC032A_SPI_1SDR_ENABLE      1
+/* 1SDR 当前逻辑分析仪显示数据在 SD1/SDO1 上，因此 ESP 侧采 D1。 */
+#define APP_GC032A_SPI_1SDR_USE_SD1     1
 
-/* Drive GC032A MCLK at an LEDC/APB-exact 20 MHz for stable scope timing. */
-#define APP_GC032A_MCLK_HZ              20000000U
+/* 摄像头调试路径：在 PSRAM 保存一帧 packet 预算大小。
+ * DMA 消费时先在线查找 FF FF FF 01，找到帧头后才开始存 packet。 */
+#define APP_CAMERA_FRAME_PACKET_BYTES \
+    (9U + (APP_CAMERA_SENSOR_HEIGHT * \
+           (12U + APP_CAMERA_SENSOR_WIDTH * 2U + 1U)) + 4U)
+#define APP_CAMERA_PACKED_CAPTURE_BYTES APP_CAMERA_FRAME_PACKET_BYTES
+
+/* GC032A MCLK。当前保留 20 MHz，便于和逻辑分析仪时序对齐。 */
+#define APP_GC032A_MCLK_HZ              8000000U
 #define APP_GC032A_I2C_ADDR             0x21U
 
-/* Keep the main GC032A register list untouched and apply only post-init
- * experiments here. */
-#define APP_GC032A_SPI_1SDR_ENABLE      0
-#define APP_GC032A_PCLK_DELAY_ENABLE    0
-#define APP_GC032A_PCLK_DELAY_REG       0x05U
-#define APP_GC032A_PCLK_DELAY_VAL       0x02U
-
-/* P0:0x46[2] controls the GC032A PCLK/data edge relationship on similar GalaxyCore
- * sensors. Pair this with LCD_CAM pclk inversion so ESP samples the opposite
- * edge after moving the sensor output edge. */
-#define APP_GC032A_PCLK_POLARITY_ENABLE 0
-#define APP_GC032A_PCLK_POLARITY_VAL    0x26U
+/* LCD_CAM 采样 PCLK 边沿。逻辑分析仪确认后只保留这个开关。 */
 #define APP_CAMERA_DVP_PCLK_INVERT      0
 
-/* Temporary timing experiment: keep the main GC032A register list untouched,
- * then increase page0 HB/VB after init to reduce frame rate/average output. */
-#define APP_GC032A_TIMING_PATCH_ENABLE  0
-#define APP_GC032A_PATCH_HB_HI          0x03U
-#define APP_GC032A_PATCH_HB_LO          0x00U
-#define APP_GC032A_PATCH_VB_HI          0x01U
-#define APP_GC032A_PATCH_VB_LO          0x00U
-
-/* GC032A SPI mode emits YVYU/YUV422 with in-band sync bytes. */
+/* GC032A packet 模式输出 YVYU/YUV422。 */
 #define APP_CAMERA_SENSOR_WIDTH         320U
 #define APP_CAMERA_SENSOR_HEIGHT        240U
-#define APP_CAMERA_PREVIEW_WIDTH        64U
-#define APP_CAMERA_PREVIEW_HEIGHT       48U
-#define APP_CAMERA_FULL_FRAME_ENABLE    1
-#define APP_CAMERA_RAW_ACCUM_ENABLE     0
-#define APP_CAMERA_DVP_DMA_PROBE_ENABLE 1
-#define APP_CAMERA_PREVIEW_FPS          1U
-#define APP_CAMERA_CAPTURE_SAMPLE_BYTES (60U * 1024U)
 #define APP_CAMERA_UART_CHUNK_BYTES     512U
 #define APP_CAMERA_TASK_PRIORITY        3
 #define APP_CAMERA_TASK_STACK_BYTES     12288U
