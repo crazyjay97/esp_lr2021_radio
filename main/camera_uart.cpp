@@ -4,15 +4,16 @@
 // 中文说明：
 // GC032A 当前输出 packet 数据流。1SDR 模式只采 D0，每 8 个 sample 拼 1 byte；
 // 2-bit 模式采 D0/D1，每 4 个 sample 拼 1 byte。
-// 因为 DMA 起点不一定落在 GC032A 字节边界，采样过程中会同时尝试
-// phase。只有找到 FF FF FF 01 帧头后才固定 phase 并开始保存，
-// 保存的第一个字节序列就是 FF FF FF 01，最后通过 UART2 输出。
+// 因为 DMA 起点不一定落在 GC032A 字节边界，所以需要 phase 校准。
+// 调试模式下先抓一大段原始 sample 到 PSRAM，停止采集后再离线找
+// FF FF FF 01 帧头，避免实时解析拖慢 DMA 消费。
 // ============================================================
 
 #include "camera_uart.hpp"
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstring>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -52,9 +53,13 @@ constexpr uint8_t  kGc032aIdLowReg  = 0xF1;
 constexpr uint16_t kGc032aExpectedId = 0x232A;
 
 // LCD_CAM DMA 每个 byte 只用低位数据：1SDR 用 bit0=D0，2-bit 用 bit0=D0/bit1=D1。
-// DMA buffer 必须在 internal SRAM；一帧 packet 数据另存到 PSRAM。
-constexpr size_t kDvpRawBytes = 64U * 1024U;
-constexpr size_t kDvpBufferCount = 4U;
+// ESP32-S3 LCD_CAM 的 receive byte length 字段是 16 bit，单次 DMA window 保持 <=64 KiB；
+// 找到同步后的 packet 帧另存到较大的 PSRAM capture buffer。
+constexpr size_t kDvpWindowBytes = APP_CAMERA_DVP_DMA_WINDOW_BYTES;
+static_assert(kDvpWindowBytes > 0U && kDvpWindowBytes <= 64U * 1024U,
+              "APP_CAMERA_DVP_DMA_WINDOW_BYTES must fit ESP32-S3 LCD_CAM byte length");
+constexpr size_t kDvpBufferCount = APP_CAMERA_DVP_DMA_BUFFER_COUNT;
+static_assert(kDvpBufferCount >= 2U, "APP_CAMERA_DVP_DMA_BUFFER_COUNT must be at least 2");
 constexpr bool kUse1Sdr = APP_GC032A_SPI_1SDR_ENABLE != 0;
 constexpr uint8_t kSampleBits = kUse1Sdr ? 1U : 2U;
 constexpr uint8_t kSamplesPerByte = static_cast<uint8_t>(8U / kSampleBits);
@@ -68,6 +73,9 @@ constexpr uint8_t kSyncFrameEnd = 0x00U;
 constexpr uint32_t kSyncPrefix = 0xffffff00UL;
 constexpr uint32_t kFrameStartWord = kSyncPrefix | kSyncFrameStart;
 constexpr uint32_t kFrameEndWord = kSyncPrefix | kSyncFrameEnd;
+constexpr bool kCaptureThenFindFrame =
+    APP_CAMERA_CAPTURE_THEN_FIND_FRAME_ENABLE != 0;
+constexpr size_t kRawSearchCaptureBytes = APP_CAMERA_RAW_SEARCH_CAPTURE_BYTES;
 
 struct DvpProbeDone {
     uint8_t *buffer = nullptr;
@@ -167,6 +175,220 @@ static inline uint8_t pack_lsb_samples(const uint8_t *raw)
     return out;
 }
 
+static bool find_frame_in_raw_samples(const uint8_t *raw,
+                                      size_t raw_len,
+                                      uint8_t *frame,
+                                      size_t frame_cap,
+                                      size_t *frame_len,
+                                      uint8_t *locked_phase,
+                                      bool *saw_frame_end)
+{
+    for (uint8_t phase = 0; phase < kPhaseCount; ++phase) {
+        PhaseSyncCandidate sync;
+        sync.reset(phase);
+        bool locked = false;
+        size_t out_len = 0;
+
+        for (size_t i = 0; i < raw_len; ++i) {
+            uint8_t out = 0;
+            if (!sync.push_sample(raw[i] & kSampleMask, &out)) {
+                continue;
+            }
+
+            if (!locked) {
+                if (sync.sync_word == kFrameStartWord) {
+                    locked = true;
+                    if (frame_cap < 4U) {
+                        return false;
+                    }
+                    frame[0] = 0xffU;
+                    frame[1] = 0xffU;
+                    frame[2] = 0xffU;
+                    frame[3] = kSyncFrameStart;
+                    out_len = 4U;
+                }
+                continue;
+            }
+
+            if (out_len >= frame_cap) {
+                *frame_len = out_len;
+                *locked_phase = phase;
+                *saw_frame_end = false;
+                return true;
+            }
+            frame[out_len++] = out;
+            if (sync.sync_word == kFrameEndWord && out_len > 4U) {
+                *frame_len = out_len;
+                *locked_phase = phase;
+                *saw_frame_end = true;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+struct CaptureStats {
+    uint32_t windows = 0;
+    uint32_t timeouts = 0;
+    size_t samples_seen = 0;
+    uint8_t locked_phase = 0;
+    bool saw_frame_end = false;
+};
+
+static void yield_after_window(uint32_t windows)
+{
+    if ((windows % kIdleDelayEveryWindows) == 0U) {
+        vTaskDelay(1);
+    } else {
+        taskYIELD();
+    }
+}
+
+static void capture_raw_samples(DvpProbeContext *ctx,
+                                lcd_cam_dev_t *hw,
+                                bool pclk_invert,
+                                uint8_t *capture,
+                                size_t capture_cap,
+                                size_t *capture_len,
+                                CaptureStats *stats)
+{
+    while (*capture_len < capture_cap) {
+        DvpProbeDone done;
+        if (xQueueReceive(ctx->done_queue, &done, pdMS_TO_TICKS(2000)) != pdTRUE) {
+            // 原始模式超时只复位 LCD_CAM，不查同步、不改 phase。
+            ESP_LOGW(TAG, "dvp raw capture timeout, restarting LCD_CAM");
+            restart_cam_hw(hw, pclk_invert);
+            ++stats->timeouts;
+            continue;
+        }
+
+        // 采集热路径只保存 LCD_CAM 原始 sample。
+        size_t raw_len = std::min(done.received, ctx->buffer_len);
+        size_t room = capture_cap - *capture_len;
+        size_t copy_len = std::min(raw_len, room);
+        if (copy_len > 0U) {
+            std::memcpy(capture + *capture_len, done.buffer, copy_len);
+            *capture_len += copy_len;
+        }
+        stats->samples_seen += raw_len;
+
+        if ((++stats->windows % 128U) == 0U) {
+            ESP_LOGI(TAG, "raw-search windows=%" PRIu32 " timeouts=%" PRIu32
+                     " queue_drops=%" PRIu32 " raw_bytes=%u/%u",
+                     stats->windows, stats->timeouts, ctx->queue_drops,
+                     static_cast<unsigned>(*capture_len),
+                     static_cast<unsigned>(capture_cap));
+        }
+        yield_after_window(stats->windows);
+    }
+}
+
+static void capture_packet_online(DvpProbeContext *ctx,
+                                  lcd_cam_dev_t *hw,
+                                  bool pclk_invert,
+                                  uint8_t *capture,
+                                  size_t capture_cap,
+                                  size_t *capture_len,
+                                  CaptureStats *stats)
+{
+    PhaseSyncCandidate phases[kPhaseCount];
+    for (uint8_t i = 0; i < kPhaseCount; ++i) {
+        phases[i].reset(i);
+    }
+
+    bool frame_locked = false;
+    bool frame_done = false;
+    uint8_t search_phase = kPreferredPhase;
+
+    while (!frame_done) {
+        DvpProbeDone done;
+        if (xQueueReceive(ctx->done_queue, &done, pdMS_TO_TICKS(2000)) != pdTRUE) {
+            ESP_LOGW(TAG, "dvp stream timeout, restarting LCD_CAM");
+            if (frame_locked) {
+                ESP_LOGW(TAG, "timeout after frame start, output partial frame");
+                break;
+            }
+            restart_cam_hw(hw, pclk_invert);
+            for (uint8_t i = 0; i < kPhaseCount; ++i) {
+                phases[i].reset(i);
+            }
+            search_phase = static_cast<uint8_t>((search_phase + 1U) % kPhaseCount);
+            ESP_LOGW(TAG, "sync not found before timeout, try phase=%u",
+                     static_cast<unsigned>(search_phase));
+            ++stats->timeouts;
+            continue;
+        }
+
+        size_t raw_len = std::min(done.received, ctx->buffer_len);
+        const uint8_t *raw = done.buffer;
+        for (size_t i = 0; i < raw_len && !frame_done;) {
+            uint8_t out = 0;
+
+            if (frame_locked) {
+                if (phases[stats->locked_phase].phase == 0U &&
+                    phases[stats->locked_phase].skip_samples == 0U &&
+                    i + kSamplesPerByte <= raw_len) {
+                    // 锁定 phase 后直接 pack，减少逐 sample 状态机开销。
+                    out = pack_lsb_samples(raw + i);
+                    phases[stats->locked_phase].sync_word =
+                        (phases[stats->locked_phase].sync_word << 8U) | out;
+                    i += kSamplesPerByte;
+                } else {
+                    if (!phases[stats->locked_phase].push_sample(raw[i] & kSampleMask, &out)) {
+                        ++i;
+                        continue;
+                    }
+                    ++i;
+                }
+
+                if (*capture_len < capture_cap) {
+                    capture[(*capture_len)++] = out;
+                    stats->saw_frame_end =
+                        phases[stats->locked_phase].sync_word == kFrameEndWord;
+                    frame_done = stats->saw_frame_end && *capture_len > 4U;
+                } else {
+                    ESP_LOGW(TAG, "frame buffer full before FF FF FF 00");
+                    frame_done = true;
+                }
+                continue;
+            }
+
+            // 未同步前不存储数据，只检查当前 phase。
+            if (phases[search_phase].push_sample(raw[i] & kSampleMask, &out) &&
+                phases[search_phase].sync_word == kFrameStartWord) {
+                frame_locked = true;
+                stats->locked_phase = search_phase;
+                capture[0] = 0xffU;
+                capture[1] = 0xffU;
+                capture[2] = 0xffU;
+                capture[3] = kSyncFrameStart;
+                *capture_len = 4U;
+                ESP_LOGI(TAG, "frame start locked: phase=%u samples_seen=%u",
+                         static_cast<unsigned>(stats->locked_phase),
+                         static_cast<unsigned>(stats->samples_seen + i + 1U));
+            }
+            ++i;
+        }
+        stats->samples_seen += raw_len;
+
+        if ((++stats->windows % 128U) == 0U) {
+            ESP_LOGI(TAG, "packed windows=%" PRIu32 " timeouts=%" PRIu32
+                     " queue_drops=%" PRIu32 " locked=%u bytes=%u",
+                     stats->windows, stats->timeouts, ctx->queue_drops,
+                     frame_locked ? 1U : 0U,
+                     static_cast<unsigned>(*capture_len));
+        }
+        if (!frame_locked && (stats->windows % kSyncSearchWindowsPerPhase) == 0U) {
+            search_phase = static_cast<uint8_t>((search_phase + 1U) % kPhaseCount);
+            phases[search_phase].reset(search_phase);
+            ESP_LOGI(TAG, "sync search rotate phase=%u",
+                     static_cast<unsigned>(search_phase));
+        }
+        yield_after_window(stats->windows);
+    }
+}
+
 } // namespace
 
 esp_err_t CameraUartStreamer::init()
@@ -233,9 +455,13 @@ void CameraUartStreamer::dvp_stream_loop()
     for (int i = 0; i < CAM_DVP_DATA_SIG_NUM; ++i) {
         pin_cfg.data_io[i] = GPIO_NUM_NC;
     }
-    pin_cfg.data_io[0] = BSP_GC032A_DATA0_GPIO;
 #if !APP_GC032A_SPI_1SDR_ENABLE
+    pin_cfg.data_io[0] = BSP_GC032A_DATA0_GPIO;
     pin_cfg.data_io[1] = BSP_GC032A_DATA1_GPIO;
+#elif APP_GC032A_SPI_1SDR_USE_SD1
+    pin_cfg.data_io[0] = BSP_GC032A_DATA1_GPIO;
+#else
+    pin_cfg.data_io[0] = BSP_GC032A_DATA0_GPIO;
 #endif
     pin_cfg.vsync_io = GPIO_NUM_NC;
     pin_cfg.de_io = GPIO_NUM_NC;
@@ -246,7 +472,7 @@ void CameraUartStreamer::dvp_stream_loop()
         .ctlr_id = 0,
         .clk_src = CAM_CLK_SRC_PLL240M,
         .h_res = 256,
-        .v_res = static_cast<uint32_t>(kDvpRawBytes / 256U),
+        .v_res = static_cast<uint32_t>(kDvpWindowBytes / 256U),
         .input_data_color_type = CAM_CTLR_COLOR_RAW8,
         .cam_data_width = 8,
         .bit_swap_en = false,
@@ -266,12 +492,14 @@ void CameraUartStreamer::dvp_stream_loop()
         vTaskDelete(nullptr);
     }
 
-    size_t capture_cap = APP_CAMERA_PACKED_CAPTURE_BYTES;
+    size_t capture_cap = kCaptureThenFindFrame ?
+        kRawSearchCaptureBytes : APP_CAMERA_PACKED_CAPTURE_BYTES;
     size_t capture_len = 0;
     uint8_t *capture = static_cast<uint8_t *>(
         heap_caps_malloc(capture_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!capture) {
-        ESP_LOGE(TAG, "packed capture PSRAM alloc failed: %u bytes, largest_psram=%u",
+        ESP_LOGE(TAG, "%s capture PSRAM alloc failed: %u bytes, largest_psram=%u",
+                 kCaptureThenFindFrame ? "raw-search" : "packet",
                  static_cast<unsigned>(capture_cap),
                  static_cast<unsigned>(
                      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM |
@@ -279,13 +507,16 @@ void CameraUartStreamer::dvp_stream_loop()
         gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
         vTaskDelete(nullptr);
     }
-    ESP_LOGI(TAG, "packed one-frame PSRAM capture buffer=%u bytes",
-             static_cast<unsigned>(capture_cap));
+    ESP_LOGI(TAG, "%s PSRAM capture buffer=%u bytes, DVP DMA window=%u x %u",
+             kCaptureThenFindFrame ? "raw-search" : "packet",
+             static_cast<unsigned>(capture_cap),
+             static_cast<unsigned>(kDvpWindowBytes),
+             static_cast<unsigned>(kDvpBufferCount));
 
     DvpProbeContext ctx = {};
-    ctx.buffer_len = kDvpRawBytes;
+    ctx.buffer_len = kDvpWindowBytes;
     ctx.done_queue = xQueueCreate(kDvpBufferCount, sizeof(DvpProbeDone));
-    // DMA buffer 必须在 internal SRAM，不能放 PSRAM。
+    // DMA window 放 internal SRAM，完成后再复制到 PSRAM 大缓存。
     uint32_t buf_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
     for (size_t i = 0; i < kDvpBufferCount; ++i) {
         ctx.buffers[i] = static_cast<uint8_t *>(
@@ -324,7 +555,7 @@ void CameraUartStreamer::dvp_stream_loop()
     esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_H_SYNC_IDX, false);
     cam_ll_set_vh_de_mode(hw, false);
     cam_ll_enable_vsync_generate_eof(hw, false);
-    cam_ll_set_recv_data_bytelen(hw, static_cast<uint32_t>(kDvpRawBytes - 1U));
+    cam_ll_set_recv_data_bytelen(hw, static_cast<uint32_t>(kDvpWindowBytes - 1U));
     cam_ll_enable_invert_pclk(hw, pclk_invert);
     cam_ll_fifo_reset(hw);
     cam_ll_start(hw);
@@ -332,7 +563,9 @@ void CameraUartStreamer::dvp_stream_loop()
 
     ESP_LOGI(TAG, "packed binary stream: UART%d %u baud, mode=%s",
              static_cast<int>(kUart), static_cast<unsigned>(APP_CAMERA_UART_BAUD),
-             kUse1Sdr ? "1SDR D0-only" : "2-bit D0/D1");
+             kUse1Sdr ?
+                 (APP_GC032A_SPI_1SDR_USE_SD1 ? "1SDR SD1-only" : "1SDR SD0-only") :
+                 "2-bit D0/D1");
 
     uint8_t spi52 = 0xff;
     if (gc032a_write_reg(0xfe, 0x03) == ESP_OK &&
@@ -344,156 +577,121 @@ void CameraUartStreamer::dvp_stream_loop()
     }
     gc032a_write_reg(0xfe, 0x00);
 
-    PhaseSyncCandidate phases[kPhaseCount];
-    for (uint8_t i = 0; i < kPhaseCount; ++i) {
-        phases[i].reset(i);
+    CaptureStats stats = {};
+    if (kCaptureThenFindFrame) {
+        ESP_LOGI(TAG, "%s raw-search mode: capture %u raw samples, then find FF FF FF 01 offline",
+                 kUse1Sdr ? "1SDR" : "2-bit",
+                 static_cast<unsigned>(capture_cap));
+    } else {
+        ESP_LOGI(TAG, "%s online sync: search phase=%u/%u, lock on FF FF FF 01, LSB-first",
+                 kUse1Sdr ? "1SDR" : "2-bit",
+                 static_cast<unsigned>(kPreferredPhase),
+                 static_cast<unsigned>(kPhaseCount));
     }
-    uint32_t windows = 0;
-    uint32_t timeouts = 0;
-    size_t samples_seen = 0;
-    bool frame_locked = false;
-    bool frame_done = false;
-    uint8_t locked_phase = 0;
-    uint8_t search_phase = kPreferredPhase;
-    ESP_LOGI(TAG, "%s online sync: search phase=%u/%u, lock on FF FF FF 01, LSB-first",
-             kUse1Sdr ? "1SDR" : "2-bit",
-             static_cast<unsigned>(search_phase),
-             static_cast<unsigned>(kPhaseCount));
 
-    while (!frame_done) {
-        DvpProbeDone done;
-        if (xQueueReceive(ctx.done_queue, &done, pdMS_TO_TICKS(2000)) != pdTRUE) {
-            ESP_LOGW(TAG, "dvp stream timeout, restarting LCD_CAM");
-            if (frame_locked) {
-                ESP_LOGW(TAG, "timeout after frame start, output partial frame");
-                frame_done = true;
-                continue;
-            }
-            restart_cam_hw(hw, pclk_invert);
-            if (!frame_locked) {
-                for (uint8_t i = 0; i < kPhaseCount; ++i) {
-                    phases[i].reset(i);
-                }
-                search_phase = static_cast<uint8_t>((search_phase + 1U) % kPhaseCount);
-                ESP_LOGW(TAG, "sync not found before timeout, try phase=%u",
-                         static_cast<unsigned>(search_phase));
-            }
-            ++timeouts;
-            continue;
-        }
-
-        size_t raw_len = std::min(done.received, ctx.buffer_len);
-        const uint8_t *raw = done.buffer;
-        for (size_t i = 0; i < raw_len && !frame_done;) {
-            // 每个 DMA byte 的 bit[1:0] 是一次 PCLK 上采到的 D1/D0。
-            uint8_t out = 0;
-
-            if (frame_locked) {
-                if (phases[locked_phase].phase == 0U &&
-                    phases[locked_phase].skip_samples == 0U &&
-                    i + kSamplesPerByte <= raw_len) {
-                    // 锁定 phase 后直接 pack，减少逐 sample 状态机开销。
-                    out = pack_lsb_samples(raw + i);
-                    phases[locked_phase].sync_word =
-                        (phases[locked_phase].sync_word << 8U) | out;
-                    i += kSamplesPerByte;
-                } else {
-                    if (!phases[locked_phase].push_sample(raw[i] & kSampleMask, &out)) {
-                        ++i;
-                        continue;
-                    }
-                    ++i;
-                }
-
-                if (capture_len < capture_cap) {
-                    capture[capture_len++] = out;
-                    if (phases[locked_phase].sync_word == kFrameEndWord &&
-                        capture_len > 4U) {
-                        frame_done = true;
-                    }
-                } else {
-                    if (!frame_done) {
-                        ESP_LOGW(TAG, "frame buffer full before FF FF FF 00");
-                        frame_done = true;
-                    }
-                }
-                continue;
-            }
-
-            // 未同步前不存储数据。为了跟上 DMA，只检查当前 phase；
-            // 如果 2 秒内没有找到帧头，timeout 分支会切到下一个 phase。
-            if (phases[search_phase].push_sample(raw[i] & kSampleMask, &out) &&
-                phases[search_phase].sync_word == kFrameStartWord) {
-                frame_locked = true;
-                locked_phase = search_phase;
-                capture[0] = 0xffU;
-                capture[1] = 0xffU;
-                capture[2] = 0xffU;
-                capture[3] = kSyncFrameStart;
-                capture_len = 4U;
-                ESP_LOGI(TAG, "frame start locked: phase=%u samples_seen=%u",
-                         static_cast<unsigned>(locked_phase),
-                         static_cast<unsigned>(samples_seen + i + 1U));
-            }
-            ++i;
-        }
-        samples_seen += raw_len;
-
-        if ((++windows % 128U) == 0U) {
-            ESP_LOGI(TAG, "packed windows=%" PRIu32 " timeouts=%" PRIu32
-                     " queue_drops=%" PRIu32 " locked=%u bytes=%u",
-                     windows, timeouts, ctx.queue_drops,
-                     frame_locked ? 1U : 0U,
-                     static_cast<unsigned>(capture_len));
-        }
-        if (!frame_locked && (windows % kSyncSearchWindowsPerPhase) == 0U) {
-            search_phase = static_cast<uint8_t>((search_phase + 1U) % kPhaseCount);
-            phases[search_phase].reset(search_phase);
-            ESP_LOGI(TAG, "sync search rotate phase=%u",
-                     static_cast<unsigned>(search_phase));
-        }
-        if ((windows % kIdleDelayEveryWindows) == 0U) {
-            vTaskDelay(1);
-        } else {
-            taskYIELD();
-        }
+    if (kCaptureThenFindFrame) {
+        capture_raw_samples(&ctx, hw, pclk_invert,
+                            capture, capture_cap, &capture_len, &stats);
+    } else {
+        capture_packet_online(&ctx, hw, pclk_invert,
+                              capture, capture_cap, &capture_len, &stats);
     }
 
     cam_ll_stop(hw);
     gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
-    ESP_LOGI(TAG, "frame capture complete: phase=%u samples=%u bytes=%u end=%u queue_drops=%u",
-             static_cast<unsigned>(locked_phase),
-             static_cast<unsigned>(samples_seen),
-             static_cast<unsigned>(capture_len),
-             phases[locked_phase].sync_word == kFrameEndWord ? 1U : 0U,
-             static_cast<unsigned>(ctx.queue_drops));
-    if (capture_len >= 16U) {
-        ESP_LOGI(TAG,
-                 "UART dump first16: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-                 capture[0], capture[1], capture[2], capture[3],
-                 capture[4], capture[5], capture[6], capture[7],
-                 capture[8], capture[9], capture[10], capture[11],
-                 capture[12], capture[13], capture[14], capture[15]);
+
+    uint8_t *frame = nullptr;
+    const uint8_t *uart_data = capture;
+    size_t uart_len = capture_len;
+    bool uart_frame_end = false;
+
+    if (kCaptureThenFindFrame) {
+        ESP_LOGI(TAG, "raw-search capture complete: raw_samples=%u raw_bytes=%u queue_drops=%u",
+                 static_cast<unsigned>(stats.samples_seen),
+                 static_cast<unsigned>(capture_len),
+                 static_cast<unsigned>(ctx.queue_drops));
+
+        size_t frame_cap = APP_CAMERA_PACKED_CAPTURE_BYTES;
+        frame = static_cast<uint8_t *>(
+            heap_caps_malloc(frame_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!frame) {
+            ESP_LOGE(TAG, "frame PSRAM alloc failed: %u bytes, largest_psram=%u",
+                     static_cast<unsigned>(frame_cap),
+                     static_cast<unsigned>(
+                         heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM |
+                                                          MALLOC_CAP_8BIT)));
+            uart_data = nullptr;
+            uart_len = 0;
+        } else {
+            size_t frame_len = 0;
+            uint8_t offline_phase = 0;
+            bool saw_end = false;
+            if (find_frame_in_raw_samples(capture, capture_len,
+                                          frame, frame_cap,
+                                          &frame_len, &offline_phase, &saw_end)) {
+                uart_data = frame;
+                uart_len = frame_len;
+                stats.locked_phase = offline_phase;
+                uart_frame_end = saw_end;
+                ESP_LOGI(TAG, "offline frame search: phase=%u bytes=%u end=%u",
+                         static_cast<unsigned>(offline_phase),
+                         static_cast<unsigned>(frame_len),
+                         saw_end ? 1U : 0U);
+            } else {
+                ESP_LOGE(TAG, "offline frame search: FF FF FF 01 not found in %u raw samples",
+                         static_cast<unsigned>(capture_len));
+                uart_data = nullptr;
+                uart_len = 0;
+            }
+        }
+    } else {
+        uart_frame_end = stats.saw_frame_end;
+        ESP_LOGI(TAG, "frame capture complete: phase=%u samples=%u bytes=%u end=%u queue_drops=%u",
+                 static_cast<unsigned>(stats.locked_phase),
+                 static_cast<unsigned>(stats.samples_seen),
+                 static_cast<unsigned>(capture_len),
+                 uart_frame_end ? 1U : 0U,
+                 static_cast<unsigned>(ctx.queue_drops));
     }
 
-    for (size_t off = 0; off < capture_len;) {
-        size_t chunk = std::min(static_cast<size_t>(APP_CAMERA_UART_CHUNK_BYTES),
-                                capture_len - off);
-        int written = uart_write_bytes(kUart, capture + off, chunk);
-        if (written < 0 || static_cast<size_t>(written) != chunk) {
-            ESP_LOGE(TAG, "UART write failed: off=%u requested=%u written=%d",
-                     static_cast<unsigned>(off),
-                     static_cast<unsigned>(chunk),
-                     written);
-            break;
+    if (uart_data && uart_len >= 16U) {
+        ESP_LOGI(TAG,
+                 "UART dump first16: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                 uart_data[0], uart_data[1], uart_data[2], uart_data[3],
+                 uart_data[4], uart_data[5], uart_data[6], uart_data[7],
+                 uart_data[8], uart_data[9], uart_data[10], uart_data[11],
+                 uart_data[12], uart_data[13], uart_data[14], uart_data[15]);
+
+        ESP_LOGI(TAG,
+                 "UART dump last4: %02x %02x %02x %02x",
+                 uart_data[uart_len-4], uart_data[uart_len-3],
+                 uart_data[uart_len-2], uart_data[uart_len-1]);
+    }
+
+    ESP_LOGI(TAG, "UART write len: %u end=%u",
+             static_cast<unsigned>(uart_len),
+             uart_frame_end ? 1U : 0U);
+    if (uart_data && uart_len > 0U) {
+        for (size_t off = 0; off < uart_len;) {
+            size_t chunk = std::min(static_cast<size_t>(APP_CAMERA_UART_CHUNK_BYTES),
+                                    uart_len - off);
+            int written = uart_write_bytes(kUart, uart_data + off, chunk);
+            if (written < 0 || static_cast<size_t>(written) != chunk) {
+                ESP_LOGE(TAG, "UART write failed: off=%u requested=%u written=%d",
+                         static_cast<unsigned>(off),
+                         static_cast<unsigned>(chunk),
+                         written);
+                break;
+            }
+            off += chunk;
+            vTaskDelay(1);
         }
-        off += chunk;
-        vTaskDelay(1);
+        esp_err_t tx_done = uart_wait_tx_done(kUart, pdMS_TO_TICKS(30000));
+        if (tx_done != ESP_OK) {
+            ESP_LOGE(TAG, "UART wait tx done failed: %s", esp_err_to_name(tx_done));
+        }
     }
-    esp_err_t tx_done = uart_wait_tx_done(kUart, pdMS_TO_TICKS(30000));
-    if (tx_done != ESP_OK) {
-        ESP_LOGE(TAG, "UART wait tx done failed: %s", esp_err_to_name(tx_done));
-    }
+    heap_caps_free(frame);
     heap_caps_free(capture);
     ESP_LOGI(TAG, "LCD_CAM stopped, GC032A PWDN asserted, UART output complete");
     vTaskDelete(nullptr);

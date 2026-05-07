@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 #include "app_config.h"
 #include "bsp.h"
@@ -41,6 +42,9 @@ extern "C" void app_main(void)
 
     esp_err_t e;
     ESP_ERROR_CHECK(bsp_i2c_init());
+
+    printf("PSRAM free: %d\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    printf("PSRAM total: %d\n", heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
 
 #if APP_CAMERA_ONLY_BRINGUP
     ESP_LOGW(TAG, "camera-only bring-up: skipping CON6 detect, LED, audio, LR2021 radio, buttons, LCD, chime");

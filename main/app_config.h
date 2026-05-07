@@ -183,15 +183,24 @@
 #define APP_CAMERA_UART_BAUD            2000000
 
 /* 1: GC032A 单线 SDR；0: 双线 2-bit，只采 D0/D1。 */
-#define APP_GC032A_SPI_1SDR_ENABLE      1
+#define APP_GC032A_SPI_1SDR_ENABLE      0
 /* 1SDR 当前逻辑分析仪显示数据在 SD1/SDO1 上，因此 ESP 侧采 D1。 */
-#define APP_GC032A_SPI_1SDR_USE_SD1     1
+#define APP_GC032A_SPI_1SDR_USE_SD1     0
 
-/* 摄像头调试路径：在 PSRAM 保存一帧 packet 预算大小。
- * DMA 消费时先在线查找 FF FF FF 01，找到帧头后才开始存 packet。 */
+/* 1: 先把 LCD_CAM 原始 sample 抓到 2 MiB PSRAM，再离线找一帧；
+ * 0: DMA 消费时在线找 FF FF FF 01，找到帧头后才开始存 packet。 */
+#define APP_CAMERA_CAPTURE_THEN_FIND_FRAME_ENABLE 1
+#define APP_CAMERA_RAW_SEARCH_CAPTURE_BYTES (2U * 1024U * 1024U)
+
+/* 一帧 GC032A packet 预算大小，当前按无 CRC 计算。 */
 #define APP_CAMERA_FRAME_PACKET_BYTES \
     (9U + (APP_CAMERA_SENSOR_HEIGHT * \
-           (12U + APP_CAMERA_SENSOR_WIDTH * 2U + 1U)) + 4U)
+           (12U + APP_CAMERA_SENSOR_WIDTH * 2U)) + 4U)
+/* LCD_CAM cam_rec_data_bytelen is 16-bit on ESP32-S3, so one DMA transaction
+ * must stay <= 64 KiB. DMA windows stay in internal SRAM for stable LCD_CAM/GDMA
+ * writes; raw-search mode copies them into a separate 2 MiB PSRAM buffer. */
+#define APP_CAMERA_DVP_DMA_WINDOW_BYTES (64U * 1024U)
+#define APP_CAMERA_DVP_DMA_BUFFER_COUNT 4U
 #define APP_CAMERA_PACKED_CAPTURE_BYTES APP_CAMERA_FRAME_PACKET_BYTES
 
 /* GC032A MCLK。当前保留 20 MHz，便于和逻辑分析仪时序对齐。 */
