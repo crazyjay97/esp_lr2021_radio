@@ -144,6 +144,7 @@ void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
             playback_active_ = false;
             have_expected_play_seq_ = false;
             codec_.reset_encoder();
+            audio_proc_.reset();
             if (voice_queue_ != nullptr) {
                 xQueueReset(voice_queue_);
             }
@@ -223,6 +224,7 @@ void RadioPing::play_task()
             continue;
         }
 
+        audio_proc_.process_rx_frame(rx_pcm_, static_cast<size_t>(decoded));
         play_mono_frame(rx_pcm_, static_cast<size_t>(decoded));
         last_rx_audio_ms_ = smtc_modem_hal_get_time_in_ms();
         playback_active_ = true;
@@ -430,6 +432,8 @@ void RadioPing::capture_voice_packet()
     if (!ptt_active_) {
         return;
     }
+
+    audio_proc_.process_tx_frame(tx_pcm_, APP_AUDIO_FRAME_SAMPLES);
 
     TxFrame frame = {
         .seq = tx_seq_++,

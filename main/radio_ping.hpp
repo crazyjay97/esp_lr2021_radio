@@ -10,6 +10,7 @@
 #include "bsp.h"
 #include "LiotLr2021.h"
 #include "opus_codec.hpp"
+#include "audio_processor.hpp"
 
 class RadioPing {
 public:
@@ -66,6 +67,7 @@ private:
 
     ralf_t radio_ = RALF_LR20XX_INSTANTIATE(nullptr);
     OpusCodec codec_;
+    AudioProcessor audio_proc_;
     QueueHandle_t voice_queue_ = nullptr;
     QueueHandle_t tx_queue_ = nullptr;
     Mode mode_ = Mode::idle;

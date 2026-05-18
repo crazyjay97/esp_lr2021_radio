@@ -146,6 +146,24 @@
 /* Keep Opus encode away from the radio/control task on CPU0. */
 #define APP_VOICE_TX_TASK_CORE          1
 
+/* ----- Audio DSP (noise suppression / voice enhancement) -------------------- */
+
+#define APP_AUDIO_DSP_ENABLE              1
+#define APP_AUDIO_DSP_PREEMPH_ALPHA_Q15   31785   /* 0.97 in Q15 — speech HF boost */
+#define APP_AUDIO_DSP_NOISE_GATE_THRESH   200     /* RMS threshold to open gate */
+#define APP_AUDIO_DSP_NOISE_GATE_ATTACK   3       /* frames above thresh to open */
+#define APP_AUDIO_DSP_NOISE_GATE_RELEASE  4       /* smoothing shift (larger = slower) */
+#define APP_AUDIO_DSP_NS_FLOOR_ADAPT      6       /* noise floor rise speed shift (larger = slower) */
+#define APP_AUDIO_DSP_NS_FLOOR_DECAY      2       /* noise floor drop speed shift (larger = slower) */
+#define APP_AUDIO_DSP_NS_MIN_GAIN_Q15     3277    /* minimum suppression gain ~0.10 (full atten floor) */
+#define APP_AUDIO_DSP_NS_OVERSUBTRACT     3       /* over-subtraction factor shift (1=2x, 2=4x, 3=8x) */
+#define APP_AUDIO_DSP_LIMITER_THRESHOLD   30000   /* soft-clip knee on RX playback */
+#define APP_AUDIO_DSP_TX_MUTE_FRAMES      5       /* mute first N frames after PTT to suppress echo tail */
+#define APP_AUDIO_DSP_AGC_TARGET_Q15      22000   /* target RMS level in Q15 (~0.67 FS) */
+#define APP_AUDIO_DSP_AGC_MAX_GAIN_Q15    (4 << 15) /* max 4x amplification */
+#define APP_AUDIO_DSP_AGC_ATTACK_SHIFT    3       /* gain ramp-up speed (larger = slower) */
+#define APP_AUDIO_DSP_AGC_RELEASE_SHIFT   5       /* gain ramp-down speed (larger = slower) */
+
 /* ----- Local diagnostic tones ------------------------------------------------ */
 
 #define APP_BEEP_FREQ_HZ                1800
@@ -168,15 +186,15 @@
 
 /* Enable the camera-adapter bring-up task. It powers the adapter, probes the
  * shared I2C bus for a sensor, and streams framed image data on UART2. */
-#define APP_CAMERA_UART_ENABLE          1
+#define APP_CAMERA_UART_ENABLE          0
 
 /* Camera-only bring-up mode. This skips audio, LR2021 radio, buttons, LEDs,
  * LCD detection/demo, and startup chime so camera sampling runs alone. */
-#define APP_CAMERA_ONLY_BRINGUP         1
+#define APP_CAMERA_ONLY_BRINGUP         0
 
 /* Force CON6 into GC032A camera mode for camera bring-up and logic analyzer
  * capture, even if the automatic I2C probe does not see the sensor. */
-#define APP_CON6_FORCE_CAMERA           1
+#define APP_CON6_FORCE_CAMERA           0
 
 /* Packed GC032A SPI byte stream on UART2. Host-side hex view should show
  * GC032A default sync bytes such as FF FF FF 01/02/40/80 directly. */
