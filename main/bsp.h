@@ -15,6 +15,7 @@ extern "C" {
 
 /* ---------- Shared I2C0 bus + TCA9554A GPIO expander -------------------- */
 esp_err_t bsp_i2c_init(void);
+esp_err_t bsp_i2c_reinit(void);
 i2c_master_bus_handle_t bsp_i2c_bus(void);
 
 /* Probe each 7-bit address on I2C0 and log the ones that ACK. Handy for
@@ -24,10 +25,10 @@ esp_err_t bsp_i2c_scan(void);
 
 typedef enum {
     BSP_CON6_PERIPHERAL_LCD_ST7789 = 0,
-    BSP_CON6_PERIPHERAL_CAMERA_GC032A,
+    BSP_CON6_PERIPHERAL_CAMERA,
 } bsp_con6_peripheral_t;
 
-/* Detect what is attached to CON6.  GC032A has priority when its I2C address
+/* Detect what is attached to CON6.  Camera has priority when its I2C address
  * ACKs; otherwise the connector is treated as the ST7789T3 LCD variant. */
 esp_err_t bsp_con6_detect(bsp_con6_peripheral_t *out_peripheral);
 

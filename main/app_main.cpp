@@ -52,8 +52,8 @@ extern "C" void app_main(void)
     if ((e = g_camera_uart.start()) != ESP_OK) {
         ESP_LOGE(TAG, "camera uart start: %s", esp_err_to_name(e));
     }
-    ESP_LOGI(TAG, "camera UART2: %d baud on GPIO%d TX / GPIO%d RX; camera-only GC032A stream",
-             APP_CAMERA_UART_BAUD, BSP_UART2_TX_GPIO, BSP_UART2_RX_GPIO);
+    ESP_LOGI(TAG, "camera-only SP0A39 one-frame capture: MCLK GPIO%d, PWDN IOEXP P%d",
+             BSP_SP0A39_MCLK_GPIO, BSP_SP0A39_PWDN_IOEXP_PIN);
 #else
     ESP_LOGW(TAG, "APP_CAMERA_UART_ENABLE is disabled");
 #endif
@@ -67,7 +67,7 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "CON6 detect: %s", esp_err_to_name(e));
     }
 #if APP_CON6_FORCE_CAMERA
-    con6 = BSP_CON6_PERIPHERAL_CAMERA_GC032A;
+    con6 = BSP_CON6_PERIPHERAL_CAMERA;
     ESP_LOGW(TAG, "CON6 force camera mode enabled; skipping LCD path");
 #endif
 
@@ -86,13 +86,13 @@ extern "C" void app_main(void)
     if ((e = g_radio.start()) != ESP_OK) {
         ESP_LOGE(TAG, "radio task start: %s", esp_err_to_name(e));
     }
-    if (con6 == BSP_CON6_PERIPHERAL_CAMERA_GC032A) {
+    if (con6 == BSP_CON6_PERIPHERAL_CAMERA) {
 #if APP_CAMERA_UART_ENABLE
         if ((e = g_camera_uart.start()) != ESP_OK) {
             ESP_LOGE(TAG, "camera uart start: %s", esp_err_to_name(e));
         }
 #else
-        ESP_LOGW(TAG, "GC032A detected but APP_CAMERA_UART_ENABLE is disabled");
+        ESP_LOGW(TAG, "SP0A39 detected but APP_CAMERA_UART_ENABLE is disabled");
 #endif
     } else {
         if ((e = bsp_lcd_init()) != ESP_OK) {
@@ -110,8 +110,8 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "voice config: Opus %u Hz, %u ms, %d bps CBR; FLRC %lu Hz, %lu bps",
              APP_AUDIO_SAMPLE_RATE_HZ, APP_AUDIO_FRAME_MS, APP_OPUS_BITRATE_BPS,
              APP_FLRC_FREQUENCY_HZ, APP_FLRC_BITRATE_BPS);
-    if (con6 == BSP_CON6_PERIPHERAL_CAMERA_GC032A) {
-        ESP_LOGI(TAG, "camera UART2: %d baud on GPIO%d TX / GPIO%d RX; framed GC032A YVYU stream",
+    if (con6 == BSP_CON6_PERIPHERAL_CAMERA) {
+        ESP_LOGI(TAG, "camera UART2: %d baud on GPIO%d TX / GPIO%d RX; SP0A39 SPI_1BIT grayscale PGM output",
                  APP_CAMERA_UART_BAUD, BSP_UART2_TX_GPIO, BSP_UART2_RX_GPIO);
     } else {
         ESP_LOGI(TAG, "CON6 display: ST7789T3 %ux%u SPI 4W with LVGL touch",

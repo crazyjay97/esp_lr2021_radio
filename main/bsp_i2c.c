@@ -140,8 +140,10 @@ static esp_err_t ioexp_attach(void)
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_bus, &dev_cfg, &s_ioexp),
                         TAG, "ioexp add");
 
-    s_ioexp_lock = xSemaphoreCreateMutex();
-    if (!s_ioexp_lock) return ESP_ERR_NO_MEM;
+    if (!s_ioexp_lock) {
+        s_ioexp_lock = xSemaphoreCreateMutex();
+        if (!s_ioexp_lock) return ESP_ERR_NO_MEM;
+    }
 
     esp_err_t err = ioexp_write(TCA9554_REG_OUTPUT, s_ioexp_output);
     if (err != ESP_OK) {
@@ -151,6 +153,26 @@ static esp_err_t ioexp_attach(void)
         return err;
     }
     return ioexp_write(TCA9554_REG_CONFIG, s_ioexp_cfg);
+}
+
+esp_err_t bsp_i2c_reinit(void)
+{
+    if (s_ioexp) {
+        i2c_master_bus_rm_device(s_ioexp);
+        s_ioexp = NULL;
+    }
+
+    if (s_bus) {
+        esp_err_t err = i2c_del_master_bus(s_bus);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "i2c del bus failed: %s", esp_err_to_name(err));
+            i2c_master_bus_reset(s_bus);
+            return err;
+        }
+        s_bus = NULL;
+    }
+
+    return bsp_i2c_init();
 }
 
 esp_err_t bsp_ioexp_set_pin(uint8_t pin, bool level)
@@ -175,17 +197,17 @@ esp_err_t bsp_ioexp_set_pin(uint8_t pin, bool level)
         if (err == ESP_OK) s_ioexp_cfg = new_cfg;
     }
 
-    if (pin == BSP_IO_EXP_PA_MUTE_PIN) {
+    if (pin == BSP_IO_EXP_PA_MUTE_PIN || pin == BSP_SP0A39_PWDN_IOEXP_PIN) {
         uint8_t input = 0, output = 0, cfg = 0;
         esp_err_t r0 = ioexp_read(TCA9554_REG_INPUT, &input);
         esp_err_t r1 = ioexp_read(TCA9554_REG_OUTPUT, &output);
         esp_err_t r2 = ioexp_read(TCA9554_REG_CONFIG, &cfg);
         if (r0 == ESP_OK && r1 == ESP_OK && r2 == ESP_OK) {
-            ESP_LOGI(TAG, "PA P6=%d: TCA9554 input=0x%02X output=0x%02X config=0x%02X",
-                     level, input, output, cfg);
+            ESP_LOGI(TAG, "TCA9554 P%d=%d: input=0x%02X output=0x%02X config=0x%02X",
+                     pin, level, input, output, cfg);
         } else {
-            ESP_LOGW(TAG, "PA P6=%d: TCA9554 readback failed input=%s output=%s config=%s",
-                     level, esp_err_to_name(r0), esp_err_to_name(r1), esp_err_to_name(r2));
+            ESP_LOGW(TAG, "TCA9554 P%d=%d: readback failed input=%s output=%s config=%s",
+                     pin, level, esp_err_to_name(r0), esp_err_to_name(r1), esp_err_to_name(r2));
         }
     }
 

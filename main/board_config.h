@@ -30,7 +30,6 @@
 
 #define BSP_I2C_ADDR_ES8311         0x18   /* Audio codec                     */
 #define BSP_I2C_ADDR_IO_EXPANDER    0x38   /* TCA9554A, confirmed by scan     */
-#define BSP_I2C_ADDR_GC032A         0x21   /* Camera sensor on CON6 adapter    */
 /* Touch panel I2C address depends on the controller fitted on the FPC. */
 
 /* ---------- I2S0 (ES8311 codec audio path) ------------------------------- */
@@ -80,27 +79,19 @@
 #define BSP_TP_INT_GPIO             GPIO_NUM_11
 #define BSP_TP_RST_GPIO             GPIO_NUM_3
 
-/* ---------- GC032A SPI camera adapter on CON6 LCD FPC -------------------- */
-/* SCH_Schematic1_摄像头转接板.pdf maps the LCD FPC pins to a 24-pin camera FPC.
- * The adapter has a PWR_EN net for the 2.8 V regulator on CON6 pin 3
- * (LCD_D2/GPIO9), but it is not a GC032A sensor pin. Leave it alone by default
- * unless a specific adapter build needs MCU-controlled regulator enable.
- *
- * Adapter mapping, checked against the GC032A 24-pin FPC pin table:
- *   24-pin  8 PWDN -> LCD_D0/GPIO13
- *   24-pin 13 MCLK -> LCD_D1/GPIO2
- *   24-pin 17 PCLK -> LCD_CLK/GPIO12
- *   24-pin 19 D0   -> LCD_TE/GPIO6
- *   24-pin 21 D1   -> LCD_LED/GPIO7
- * PWDN is active high; keep it low for normal operation. */
-#define BSP_CAMERA_PWR_EN_CONTROL   0
-#define BSP_CAMERA_PWR_EN_GPIO      GPIO_NUM_9
-#define BSP_GC032A_MCLK_GPIO        GPIO_NUM_2
-#define BSP_GC032A_PWDN_GPIO        GPIO_NUM_13
-#define BSP_GC032A_SPI_CLK_GPIO     GPIO_NUM_12
-#define BSP_GC032A_DATA0_GPIO       GPIO_NUM_6
-#define BSP_GC032A_DATA1_GPIO       GPIO_NUM_7
-#define BSP_GC032A_SPI_CS_GPIO      GPIO_NUM_4
+/* ---------- SP0A39 SPI camera on CON6 ------------------------------------ */
+/* 1-bit sensor data path using VSYNC as SPI CS and PCLK as SPI DCLK.
+ * PWDN is active high, controlled via IO expander P7. */
+#define BSP_SP0A39_VSYNC_GPIO       GPIO_NUM_7
+#define BSP_SP0A39_HSYNC_GPIO       GPIO_NUM_6
+#define BSP_SP0A39_MCLK_GPIO        GPIO_NUM_3
+#define BSP_SP0A39_PCLK_GPIO        GPIO_NUM_8
+#define BSP_SP0A39_D0_GPIO          GPIO_NUM_2
+#define BSP_SP0A39_D1_GPIO          GPIO_NUM_9
+#define BSP_SP0A39_D2_GPIO          GPIO_NUM_13
+#define BSP_SP0A39_D3_GPIO          GPIO_NUM_4
+#define BSP_SP0A39_PWDN_IOEXP_PIN   7
+#define BSP_I2C_ADDR_SP0A39         0x21
 
 /* ---------- RGB status LED (driven by the GPIO expander) ----------------- */
 #define BSP_IO_EXP_LED_G_PIN        0

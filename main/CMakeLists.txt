@@ -23,4 +23,6 @@ idf_component_register(SRCS
                            esp_lcd
                            esp_timer
                            esp_adc
+                           esp_cam_sensor
+                           esp_video
                            lvgl)

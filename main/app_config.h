@@ -182,56 +182,37 @@
 #define APP_STARTUP_CHIME_GAP_MS        35
 #define APP_STARTUP_CHIME_AMP           3500
 
-/* ----- Camera UART bring-up ------------------------------------------------- */
+/* ----- SP0A39 SPI_1BIT Camera ---------------------------------------------- */
 
-/* Enable the camera-adapter bring-up task. It powers the adapter, probes the
- * shared I2C bus for a sensor, and streams framed image data on UART2. */
-#define APP_CAMERA_UART_ENABLE          0
+#define APP_CAMERA_UART_ENABLE          1
 
-/* Camera-only bring-up mode. This skips audio, LR2021 radio, buttons, LEDs,
- * LCD detection/demo, and startup chime so camera sampling runs alone. */
-#define APP_CAMERA_ONLY_BRINGUP         0
+#define APP_CAMERA_ONLY_BRINGUP         1
 
-/* Force CON6 into GC032A camera mode for camera bring-up and logic analyzer
- * capture, even if the automatic I2C probe does not see the sensor. */
-#define APP_CON6_FORCE_CAMERA           0
+#define APP_CON6_FORCE_CAMERA           1
 
-/* Packed GC032A SPI byte stream on UART2. Host-side hex view should show
- * GC032A default sync bytes such as FF FF FF 01/02/40/80 directly. */
 #define APP_CAMERA_UART_BAUD            2000000
 
-/* 1: GC032A 单线 SDR；0: 双线 2-bit，只采 D0/D1。 */
-#define APP_GC032A_SPI_1SDR_ENABLE      0
-/* 1SDR 当前逻辑分析仪显示数据在 SD1/SDO1 上，因此 ESP 侧采 D1。 */
-#define APP_GC032A_SPI_1SDR_USE_SD1     0
+/* The current SP0A39 reference table is for SPI 1-bit grayscale with 24 MHz input. */
+#define APP_SP0A39_MCLK_HZ              24000000U
+#define APP_SP0A39_I2C_ADDR             0x21U
 
-/* 1: 先把 LCD_CAM 原始 sample 抓到 2 MiB PSRAM，再离线找一帧；
- * 0: DMA 消费时在线找 FF FF FF 01，找到帧头后才开始存 packet。 */
-#define APP_CAMERA_CAPTURE_THEN_FIND_FRAME_ENABLE 1
-#define APP_CAMERA_RAW_SEARCH_CAPTURE_BYTES (2U * 1024U * 1024U)
-
-/* 一帧 GC032A packet 预算大小，当前按无 CRC 计算。 */
-#define APP_CAMERA_FRAME_PACKET_BYTES \
-    (9U + (APP_CAMERA_SENSOR_HEIGHT * \
-           (12U + APP_CAMERA_SENSOR_WIDTH * 2U)) + 4U)
-/* LCD_CAM cam_rec_data_bytelen is 16-bit on ESP32-S3, so one DMA transaction
- * must stay <= 64 KiB. DMA windows stay in internal SRAM for stable LCD_CAM/GDMA
- * writes; raw-search mode copies them into a separate 2 MiB PSRAM buffer. */
-#define APP_CAMERA_DVP_DMA_WINDOW_BYTES (64U * 1024U)
-#define APP_CAMERA_DVP_DMA_BUFFER_COUNT 4U
-#define APP_CAMERA_PACKED_CAPTURE_BYTES APP_CAMERA_FRAME_PACKET_BYTES
-
-/* GC032A MCLK。当前保留 20 MHz，便于和逻辑分析仪时序对齐。 */
-#define APP_GC032A_MCLK_HZ              8000000U
-#define APP_GC032A_I2C_ADDR             0x21U
-
-/* LCD_CAM 采样 PCLK 边沿。逻辑分析仪确认后只保留这个开关。 */
+/* LCD_CAM DVP input polarity. Toggle these when the sensor clocks/syncs are
+ * visible but DMA captures only blank data. */
+#define APP_CAMERA_DVP_VSYNC_INVERT     1
+#define APP_CAMERA_DVP_HSYNC_INVERT     1
+/* LCD_CAM DVP PCLK sampling edge. 0 = rising, 1 = falling. */
 #define APP_CAMERA_DVP_PCLK_INVERT      0
 
-/* GC032A packet 模式输出 YVYU/YUV422。 */
-#define APP_CAMERA_SENSOR_WIDTH         320U
-#define APP_CAMERA_SENSOR_HEIGHT        240U
-#define APP_CAMERA_UART_CHUNK_BYTES     512U
+/* VGA 640x480 grayscale after SPI packet headers are stripped. */
+#define APP_CAMERA_SENSOR_WIDTH         640U
+#define APP_CAMERA_SENSOR_HEIGHT        480U
+#define APP_CAMERA_FRAME_BYTES          (APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT)
+
+/* DMA buffer configuration for DVP capture. */
+#define APP_CAMERA_DVP_DMA_WINDOW_BYTES (16U * 1024U)
+#define APP_CAMERA_DVP_DMA_BUFFER_COUNT 4U
+
+#define APP_CAMERA_UART_CHUNK_BYTES     2048U
 #define APP_CAMERA_TASK_PRIORITY        3
 #define APP_CAMERA_TASK_STACK_BYTES     12288U
 #define APP_CAMERA_TASK_CORE            1

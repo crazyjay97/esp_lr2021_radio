@@ -1,418 +1,159 @@
-// ============================================================
-// camera_uart.cpp - GC032A packet stream capture over LCD_CAM
-//
-// 中文说明：
-// GC032A 当前输出 packet 数据流。1SDR 模式只采 D0，每 8 个 sample 拼 1 byte；
-// 2-bit 模式采 D0/D1，每 4 个 sample 拼 1 byte。
-// 因为 DMA 起点不一定落在 GC032A 字节边界，所以需要 phase 校准。
-// 调试模式下先抓一大段原始 sample 到 PSRAM，停止采集后再离线找
-// FF FF FF 01 帧头，避免实时解析拖慢 DMA 消费。
-// ============================================================
-
 #include "camera_uart.hpp"
 
-#include <algorithm>
-#include <cinttypes>
-#include <cstring>
+#include <fcntl.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
 #include "driver/uart.h"
-#include "esp_cam_ctlr.h"
-#include "esp_cam_ctlr_dvp.h"
 #include "esp_check.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_rom_sys.h"
-#include "hal/cam_ll.h"
-#include "soc/gpio_pins.h"
-#include "soc/gpio_sig_map.h"
-#include "soc/lcd_cam_struct.h"
+#include "esp_cam_sensor_types.h"
+#include "esp_video_device.h"
+#include "esp_video_init.h"
+#include "esp_video_ioctl.h"
+#include "linux/videodev2.h"
 #include "app_config.h"
 #include "bsp.h"
-#include "gc032a_regs.hpp"
 
 namespace {
 
-constexpr const char *TAG = "camera_uart";
-constexpr uart_port_t kUart = UART_NUM_2;
+constexpr const char *TAG = "camera_video";
 
-constexpr ledc_mode_t      kMclkSpeedMode      = LEDC_LOW_SPEED_MODE;
-constexpr ledc_timer_t     kMclkTimer          = LEDC_TIMER_0;
-constexpr ledc_channel_t   kMclkChannel        = LEDC_CHANNEL_0;
-constexpr ledc_timer_bit_t kMclkDutyResolution = LEDC_TIMER_1_BIT;
-constexpr ledc_clk_cfg_t   kMclkClockSource    = LEDC_USE_APB_CLK;
-constexpr uint32_t         kMclkDuty50Percent  = 1U;
+constexpr ledc_mode_t kMclkSpeedMode = LEDC_LOW_SPEED_MODE;
+constexpr ledc_timer_t kMclkTimer = LEDC_TIMER_0;
+constexpr ledc_channel_t kMclkChannel = LEDC_CHANNEL_0;
+constexpr ledc_clk_cfg_t kMclkClockSource = LEDC_USE_APB_CLK;
+constexpr TickType_t kPwdnSettleTicks = pdMS_TO_TICKS(1000);
+constexpr int kCaptureBuffers = 2;
+constexpr int kMaxFrameDequeues = 8;
+constexpr int kVideoType = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+constexpr int kUartTxTimeoutTicks = pdMS_TO_TICKS(1000);
 
-constexpr uint8_t  kGc032aIdHighReg = 0xF0;
-constexpr uint8_t  kGc032aIdLowReg  = 0xF1;
-constexpr uint16_t kGc032aExpectedId = 0x232A;
-
-// LCD_CAM DMA 每个 byte 只用低位数据：1SDR 用 bit0=D0，2-bit 用 bit0=D0/bit1=D1。
-// ESP32-S3 LCD_CAM 的 receive byte length 字段是 16 bit，单次 DMA window 保持 <=64 KiB；
-// 找到同步后的 packet 帧另存到较大的 PSRAM capture buffer。
-constexpr size_t kDvpWindowBytes = APP_CAMERA_DVP_DMA_WINDOW_BYTES;
-static_assert(kDvpWindowBytes > 0U && kDvpWindowBytes <= 64U * 1024U,
-              "APP_CAMERA_DVP_DMA_WINDOW_BYTES must fit ESP32-S3 LCD_CAM byte length");
-constexpr size_t kDvpBufferCount = APP_CAMERA_DVP_DMA_BUFFER_COUNT;
-static_assert(kDvpBufferCount >= 2U, "APP_CAMERA_DVP_DMA_BUFFER_COUNT must be at least 2");
-constexpr bool kUse1Sdr = APP_GC032A_SPI_1SDR_ENABLE != 0;
-constexpr uint8_t kSampleBits = kUse1Sdr ? 1U : 2U;
-constexpr uint8_t kSamplesPerByte = static_cast<uint8_t>(8U / kSampleBits);
-constexpr uint8_t kPhaseCount = kSamplesPerByte;
-constexpr uint8_t kSampleMask = static_cast<uint8_t>((1U << kSampleBits) - 1U);
-constexpr uint8_t kPreferredPhase = kUse1Sdr ? 0U : 3U;
-constexpr uint32_t kSyncSearchWindowsPerPhase = 128U;
-constexpr uint32_t kIdleDelayEveryWindows = 16U;
-constexpr uint8_t kSyncFrameStart = 0x01U;
-constexpr uint8_t kSyncFrameEnd = 0x00U;
-constexpr uint32_t kSyncPrefix = 0xffffff00UL;
-constexpr uint32_t kFrameStartWord = kSyncPrefix | kSyncFrameStart;
-constexpr uint32_t kFrameEndWord = kSyncPrefix | kSyncFrameEnd;
-constexpr bool kCaptureThenFindFrame =
-    APP_CAMERA_CAPTURE_THEN_FIND_FRAME_ENABLE != 0;
-constexpr size_t kRawSearchCaptureBytes = APP_CAMERA_RAW_SEARCH_CAPTURE_BYTES;
-
-struct DvpProbeDone {
-    uint8_t *buffer = nullptr;
-    size_t received = 0;
-};
-
-struct DvpProbeContext {
-    uint8_t *buffers[kDvpBufferCount] = {};
-    size_t buffer_len = 0;
-    uint32_t next = 0;
-    uint32_t queue_drops = 0;
-    portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
-    QueueHandle_t done_queue = nullptr;
-};
-
-static bool IRAM_ATTR dvp_get_new_trans(esp_cam_ctlr_handle_t,
-                                        esp_cam_ctlr_trans_t *trans,
-                                        void *user_data)
+uint32_t sensor_pixformat_to_v4l2(esp_cam_sensor_output_format_t format)
 {
-    auto *ctx = static_cast<DvpProbeContext *>(user_data);
-    uint32_t idx = ctx->next++ % kDvpBufferCount;
-    trans->buffer = ctx->buffers[idx];
-    trans->buflen = ctx->buffer_len;
-    return false;
-}
-
-static bool IRAM_ATTR dvp_trans_finished(esp_cam_ctlr_handle_t,
-                                         esp_cam_ctlr_trans_t *trans,
-                                         void *user_data)
-{
-    auto *ctx = static_cast<DvpProbeContext *>(user_data);
-    DvpProbeDone done = {
-        .buffer = static_cast<uint8_t *>(trans->buffer),
-        .received = trans->received_size,
-    };
-    BaseType_t woken = pdFALSE;
-    if (xQueueSendFromISR(ctx->done_queue, &done, &woken) != pdTRUE) {
-        portENTER_CRITICAL_ISR(&ctx->lock);
-        ++ctx->queue_drops;
-        portEXIT_CRITICAL_ISR(&ctx->lock);
+    switch (format) {
+    case ESP_CAM_SENSOR_PIXFORMAT_GRAYSCALE:
+        return V4L2_PIX_FMT_GREY;
+    case ESP_CAM_SENSOR_PIXFORMAT_YUV422_UYVY:
+        return V4L2_PIX_FMT_UYVY;
+    default:
+        return 0;
     }
-    return woken == pdTRUE;
 }
 
-static void restart_cam_hw(lcd_cam_dev_t *hw, bool pclk_invert)
+esp_err_t checked_ioctl(int fd, unsigned long cmd, void *arg, const char *name)
 {
-    // LCD_CAM 偶尔收不到 DMA 完成事件时，复位 FIFO 并重新打开采样。
-    cam_ll_stop(hw);
-    cam_ll_fifo_reset(hw);
-    esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ZERO_INPUT,
-                                   CAM_V_SYNC_IDX, false);
-    cam_ll_enable_invert_pclk(hw, pclk_invert);
-    cam_ll_start(hw);
-    esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT,
-                                   CAM_V_SYNC_IDX, false);
+    if (ioctl(fd, cmd, arg) != 0) {
+        ESP_LOGE(TAG, "%s failed errno=%d", name, errno);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
-struct PhaseSyncCandidate {
-    uint8_t skip_samples = 0;
-    uint8_t byte = 0;
-    uint8_t phase = 0;
-    uint32_t sync_word = 0;
-
-    void reset(uint8_t initial_skip)
-    {
-        skip_samples = initial_skip;
-        byte = 0;
-        phase = 0;
-        sync_word = 0;
-    }
-
-    bool push_sample(uint8_t sample, uint8_t *out)
-    {
-        if (skip_samples > 0U) {
-            --skip_samples;
-            return false;
+esp_err_t uart_write_all(const uint8_t *data, size_t len)
+{
+    size_t offset = 0;
+    while (offset < len) {
+        const size_t chunk = (len - offset) > APP_CAMERA_UART_CHUNK_BYTES ?
+            APP_CAMERA_UART_CHUNK_BYTES : (len - offset);
+        const int written = uart_write_bytes(UART_NUM_2,
+                                             reinterpret_cast<const char *>(data + offset),
+                                             chunk);
+        if (written < 0) {
+            return ESP_FAIL;
         }
-        // GC032A 当前配置是 LSB-first：第 1 个 sample 放在 byte 的低位。
-        byte = static_cast<uint8_t>(byte | ((sample & kSampleMask) << (phase * kSampleBits)));
-        if (++phase == kSamplesPerByte) {
-            *out = byte;
-            sync_word = (sync_word << 8U) | byte;
-            byte = 0;
-            phase = 0;
-            return true;
+        offset += static_cast<size_t>(written);
+        if (written == 0) {
+            vTaskDelay(1);
         }
-        return false;
     }
-};
-
-static inline uint8_t pack_lsb_samples(const uint8_t *raw)
-{
-    uint8_t out = 0;
-    for (uint8_t i = 0; i < kSamplesPerByte; ++i) {
-        out = static_cast<uint8_t>(out | ((raw[i] & kSampleMask) << (i * kSampleBits)));
-    }
-    return out;
+    ESP_RETURN_ON_ERROR(uart_wait_tx_done(UART_NUM_2, kUartTxTimeoutTicks),
+                        TAG, "uart wait tx done");
+    return ESP_OK;
 }
 
-static bool find_frame_in_raw_samples(const uint8_t *raw,
-                                      size_t raw_len,
-                                      uint8_t *frame,
-                                      size_t frame_cap,
-                                      size_t *frame_len,
-                                      uint8_t *locked_phase,
-                                      bool *saw_frame_end)
+esp_err_t uart_write_pgm_image(const uint8_t *data,
+                               size_t len,
+                               uint32_t pixelformat,
+                               uint32_t width,
+                               uint32_t height)
 {
-    for (uint8_t phase = 0; phase < kPhaseCount; ++phase) {
-        PhaseSyncCandidate sync;
-        sync.reset(phase);
-        bool locked = false;
-        size_t out_len = 0;
+    char header[96];
+    const int header_len = snprintf(header, sizeof(header),
+                                    "P5\n%lu %lu\n255\n",
+                                    static_cast<unsigned long>(width),
+                                    static_cast<unsigned long>(height));
+    ESP_RETURN_ON_FALSE(header_len > 0 && header_len < static_cast<int>(sizeof(header)),
+                        ESP_FAIL, TAG, "format UART header");
+    ESP_RETURN_ON_ERROR(uart_write_all(reinterpret_cast<const uint8_t *>(header),
+                                       static_cast<size_t>(header_len)),
+                        TAG, "write UART header");
 
-        for (size_t i = 0; i < raw_len; ++i) {
-            uint8_t out = 0;
-            if (!sync.push_sample(raw[i] & kSampleMask, &out)) {
-                continue;
-            }
+    const size_t pixel_count = static_cast<size_t>(width) * height;
+    if (pixelformat == V4L2_PIX_FMT_GREY) {
+        ESP_RETURN_ON_FALSE(len >= pixel_count, ESP_ERR_INVALID_SIZE, TAG,
+                            "short GREY frame: %u/%u bytes",
+                            static_cast<unsigned>(len),
+                            static_cast<unsigned>(pixel_count));
+        return uart_write_all(data, pixel_count);
+    }
 
-            if (!locked) {
-                if (sync.sync_word == kFrameStartWord) {
-                    locked = true;
-                    if (frame_cap < 4U) {
-                        return false;
-                    }
-                    frame[0] = 0xffU;
-                    frame[1] = 0xffU;
-                    frame[2] = 0xffU;
-                    frame[3] = kSyncFrameStart;
-                    out_len = 4U;
+    if (pixelformat == V4L2_PIX_FMT_UYVY) {
+        const size_t yuv_bytes = pixel_count * 2U;
+        ESP_RETURN_ON_FALSE(width <= APP_CAMERA_SENSOR_WIDTH, ESP_ERR_INVALID_SIZE,
+                            TAG, "PGM line buffer too small for width %lu",
+                            static_cast<unsigned long>(width));
+        ESP_RETURN_ON_FALSE(len >= yuv_bytes, ESP_ERR_INVALID_SIZE, TAG,
+                            "short UYVY frame: %u/%u bytes",
+                            static_cast<unsigned>(len),
+                            static_cast<unsigned>(yuv_bytes));
+
+        uint8_t gray_line[APP_CAMERA_SENSOR_WIDTH];
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint8_t *src = data + static_cast<size_t>(y) * width * 2U;
+            for (uint32_t x = 0; x < width; x += 2U) {
+                gray_line[x] = src[x * 2U + 1U];
+                if (x + 1U < width) {
+                    gray_line[x + 1U] = src[x * 2U + 3U];
                 }
-                continue;
             }
-
-            if (out_len >= frame_cap) {
-                *frame_len = out_len;
-                *locked_phase = phase;
-                *saw_frame_end = false;
-                return true;
-            }
-            frame[out_len++] = out;
-            if (sync.sync_word == kFrameEndWord && out_len > 4U) {
-                *frame_len = out_len;
-                *locked_phase = phase;
-                *saw_frame_end = true;
-                return true;
-            }
+            ESP_RETURN_ON_ERROR(uart_write_all(gray_line, width),
+                                TAG, "write UART UYVY luma line");
         }
-    }
-    return false;
-}
-
-struct CaptureStats {
-    uint32_t windows = 0;
-    uint32_t timeouts = 0;
-    size_t samples_seen = 0;
-    uint8_t locked_phase = 0;
-    bool saw_frame_end = false;
-};
-
-static void yield_after_window(uint32_t windows)
-{
-    if ((windows % kIdleDelayEveryWindows) == 0U) {
-        vTaskDelay(1);
-    } else {
-        taskYIELD();
-    }
-}
-
-static void capture_raw_samples(DvpProbeContext *ctx,
-                                lcd_cam_dev_t *hw,
-                                bool pclk_invert,
-                                uint8_t *capture,
-                                size_t capture_cap,
-                                size_t *capture_len,
-                                CaptureStats *stats)
-{
-    while (*capture_len < capture_cap) {
-        DvpProbeDone done;
-        if (xQueueReceive(ctx->done_queue, &done, pdMS_TO_TICKS(2000)) != pdTRUE) {
-            // 原始模式超时只复位 LCD_CAM，不查同步、不改 phase。
-            ESP_LOGW(TAG, "dvp raw capture timeout, restarting LCD_CAM");
-            restart_cam_hw(hw, pclk_invert);
-            ++stats->timeouts;
-            continue;
-        }
-
-        // 采集热路径只保存 LCD_CAM 原始 sample。
-        size_t raw_len = std::min(done.received, ctx->buffer_len);
-        size_t room = capture_cap - *capture_len;
-        size_t copy_len = std::min(raw_len, room);
-        if (copy_len > 0U) {
-            std::memcpy(capture + *capture_len, done.buffer, copy_len);
-            *capture_len += copy_len;
-        }
-        stats->samples_seen += raw_len;
-
-        if ((++stats->windows % 128U) == 0U) {
-            ESP_LOGI(TAG, "raw-search windows=%" PRIu32 " timeouts=%" PRIu32
-                     " queue_drops=%" PRIu32 " raw_bytes=%u/%u",
-                     stats->windows, stats->timeouts, ctx->queue_drops,
-                     static_cast<unsigned>(*capture_len),
-                     static_cast<unsigned>(capture_cap));
-        }
-        yield_after_window(stats->windows);
-    }
-}
-
-static void capture_packet_online(DvpProbeContext *ctx,
-                                  lcd_cam_dev_t *hw,
-                                  bool pclk_invert,
-                                  uint8_t *capture,
-                                  size_t capture_cap,
-                                  size_t *capture_len,
-                                  CaptureStats *stats)
-{
-    PhaseSyncCandidate phases[kPhaseCount];
-    for (uint8_t i = 0; i < kPhaseCount; ++i) {
-        phases[i].reset(i);
+        return ESP_OK;
     }
 
-    bool frame_locked = false;
-    bool frame_done = false;
-    uint8_t search_phase = kPreferredPhase;
-
-    while (!frame_done) {
-        DvpProbeDone done;
-        if (xQueueReceive(ctx->done_queue, &done, pdMS_TO_TICKS(2000)) != pdTRUE) {
-            ESP_LOGW(TAG, "dvp stream timeout, restarting LCD_CAM");
-            if (frame_locked) {
-                ESP_LOGW(TAG, "timeout after frame start, output partial frame");
-                break;
-            }
-            restart_cam_hw(hw, pclk_invert);
-            for (uint8_t i = 0; i < kPhaseCount; ++i) {
-                phases[i].reset(i);
-            }
-            search_phase = static_cast<uint8_t>((search_phase + 1U) % kPhaseCount);
-            ESP_LOGW(TAG, "sync not found before timeout, try phase=%u",
-                     static_cast<unsigned>(search_phase));
-            ++stats->timeouts;
-            continue;
-        }
-
-        size_t raw_len = std::min(done.received, ctx->buffer_len);
-        const uint8_t *raw = done.buffer;
-        for (size_t i = 0; i < raw_len && !frame_done;) {
-            uint8_t out = 0;
-
-            if (frame_locked) {
-                if (phases[stats->locked_phase].phase == 0U &&
-                    phases[stats->locked_phase].skip_samples == 0U &&
-                    i + kSamplesPerByte <= raw_len) {
-                    // 锁定 phase 后直接 pack，减少逐 sample 状态机开销。
-                    out = pack_lsb_samples(raw + i);
-                    phases[stats->locked_phase].sync_word =
-                        (phases[stats->locked_phase].sync_word << 8U) | out;
-                    i += kSamplesPerByte;
-                } else {
-                    if (!phases[stats->locked_phase].push_sample(raw[i] & kSampleMask, &out)) {
-                        ++i;
-                        continue;
-                    }
-                    ++i;
-                }
-
-                if (*capture_len < capture_cap) {
-                    capture[(*capture_len)++] = out;
-                    stats->saw_frame_end =
-                        phases[stats->locked_phase].sync_word == kFrameEndWord;
-                    frame_done = stats->saw_frame_end && *capture_len > 4U;
-                } else {
-                    ESP_LOGW(TAG, "frame buffer full before FF FF FF 00");
-                    frame_done = true;
-                }
-                continue;
-            }
-
-            // 未同步前不存储数据，只检查当前 phase。
-            if (phases[search_phase].push_sample(raw[i] & kSampleMask, &out) &&
-                phases[search_phase].sync_word == kFrameStartWord) {
-                frame_locked = true;
-                stats->locked_phase = search_phase;
-                capture[0] = 0xffU;
-                capture[1] = 0xffU;
-                capture[2] = 0xffU;
-                capture[3] = kSyncFrameStart;
-                *capture_len = 4U;
-                ESP_LOGI(TAG, "frame start locked: phase=%u samples_seen=%u",
-                         static_cast<unsigned>(stats->locked_phase),
-                         static_cast<unsigned>(stats->samples_seen + i + 1U));
-            }
-            ++i;
-        }
-        stats->samples_seen += raw_len;
-
-        if ((++stats->windows % 128U) == 0U) {
-            ESP_LOGI(TAG, "packed windows=%" PRIu32 " timeouts=%" PRIu32
-                     " queue_drops=%" PRIu32 " locked=%u bytes=%u",
-                     stats->windows, stats->timeouts, ctx->queue_drops,
-                     frame_locked ? 1U : 0U,
-                     static_cast<unsigned>(*capture_len));
-        }
-        if (!frame_locked && (stats->windows % kSyncSearchWindowsPerPhase) == 0U) {
-            search_phase = static_cast<uint8_t>((search_phase + 1U) % kPhaseCount);
-            phases[search_phase].reset(search_phase);
-            ESP_LOGI(TAG, "sync search rotate phase=%u",
-                     static_cast<unsigned>(search_phase));
-        }
-        yield_after_window(stats->windows);
-    }
+    ESP_LOGE(TAG, "unsupported UART frame pixelformat=0x%08lx",
+             static_cast<unsigned long>(pixelformat));
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 } // namespace
 
 esp_err_t CameraUartStreamer::init()
 {
-    if (initialized_) return ESP_OK;
+    if (initialized_) {
+        return ESP_OK;
+    }
 
-    ESP_RETURN_ON_ERROR(start_mclk(), TAG, "mclk");
+    ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c init");
+    ESP_RETURN_ON_ERROR(configure_camera_pins(), TAG, "camera pins");
+    ESP_RETURN_ON_ERROR(init_uart(), TAG, "uart2");
 
-    uart_config_t cfg = {
-        .baud_rate = APP_CAMERA_UART_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    ESP_RETURN_ON_ERROR(uart_driver_install(kUart, 8192, 0, 0, nullptr, 0),
-                        TAG, "uart driver");
-    ESP_RETURN_ON_ERROR(uart_param_config(kUart, &cfg), TAG, "uart config");
-    ESP_RETURN_ON_ERROR(uart_set_pin(kUart, BSP_UART2_TX_GPIO, BSP_UART2_RX_GPIO,
-                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE),
-                        TAG, "uart pins");
+    ESP_LOGI(TAG, "releasing SP0A39 PWDN: IO expander P%d low",
+             BSP_SP0A39_PWDN_IOEXP_PIN);
+    ESP_RETURN_ON_ERROR(set_pwdn(false), TAG, "pwdn low");
+    vTaskDelay(kPwdnSettleTicks);
 
-    ESP_RETURN_ON_ERROR(power_on_camera(), TAG, "camera power");
     initialized_ = true;
     return ESP_OK;
 }
@@ -420,11 +161,13 @@ esp_err_t CameraUartStreamer::init()
 esp_err_t CameraUartStreamer::start()
 {
     ESP_RETURN_ON_ERROR(init(), TAG, "init");
-    BaseType_t ok = xTaskCreatePinnedToCore(
-        task_entry, "cam_uart",
+
+    const BaseType_t ok = xTaskCreatePinnedToCore(
+        task_entry, "cam_power",
         APP_CAMERA_TASK_STACK_BYTES, this,
         APP_CAMERA_TASK_PRIORITY, nullptr,
         APP_CAMERA_TASK_CORE);
+
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
@@ -435,515 +178,318 @@ void CameraUartStreamer::task_entry(void *arg)
 
 void CameraUartStreamer::task()
 {
-    ESP_LOGI(TAG, "gc032a bring-up: MCLK, PWDN, I2C init, UART image/raw output");
-    probe_i2c();
-
-    if (init_gc032a_sensor() != ESP_OK) {
-        ESP_LOGE(TAG, "gc032a: sensor init failed");
-        vTaskDelete(nullptr);
-    }
-
-    dvp_stream_loop();
-}
-
-void CameraUartStreamer::dvp_stream_loop()
-{
-    // 使用 LCD_CAM 的 DVP 输入采 GC032A 的 PCLK/D0/D1。
-    // 1SDR 只接 D0；2-bit 模式接 D0/D1。LCD_CAM 按 RAW8 收，有效数据在低位。
-    esp_cam_ctlr_dvp_pin_config_t pin_cfg = {};
-    pin_cfg.data_width = CAM_CTLR_DATA_WIDTH_8;
-    for (int i = 0; i < CAM_DVP_DATA_SIG_NUM; ++i) {
-        pin_cfg.data_io[i] = GPIO_NUM_NC;
-    }
-#if !APP_GC032A_SPI_1SDR_ENABLE
-    pin_cfg.data_io[0] = BSP_GC032A_DATA0_GPIO;
-    pin_cfg.data_io[1] = BSP_GC032A_DATA1_GPIO;
-#elif APP_GC032A_SPI_1SDR_USE_SD1
-    pin_cfg.data_io[0] = BSP_GC032A_DATA1_GPIO;
-#else
-    pin_cfg.data_io[0] = BSP_GC032A_DATA0_GPIO;
-#endif
-    pin_cfg.vsync_io = GPIO_NUM_NC;
-    pin_cfg.de_io = GPIO_NUM_NC;
-    pin_cfg.pclk_io = BSP_GC032A_SPI_CLK_GPIO;
-    pin_cfg.xclk_io = GPIO_NUM_NC;
-
-    esp_cam_ctlr_dvp_config_t dvp_cfg = {
-        .ctlr_id = 0,
-        .clk_src = CAM_CLK_SRC_PLL240M,
-        .h_res = 256,
-        .v_res = static_cast<uint32_t>(kDvpWindowBytes / 256U),
-        .input_data_color_type = CAM_CTLR_COLOR_RAW8,
-        .cam_data_width = 8,
-        .bit_swap_en = false,
-        .byte_swap_en = false,
-        .bk_buffer_dis = true,
-        .pin_dont_init = false,
-        .pic_format_jpeg = false,
-        .external_xtal = true,
-        .dma_burst_size = 64,
-        .xclk_freq = 0,
-        .pin = &pin_cfg,
-    };
-
-    esp_cam_ctlr_handle_t cam = nullptr;
-    if (esp_cam_new_dvp_ctlr(&dvp_cfg, &cam) != ESP_OK) {
-        ESP_LOGE(TAG, "dvp: controller init failed");
-        vTaskDelete(nullptr);
-    }
-
-    size_t capture_cap = kCaptureThenFindFrame ?
-        kRawSearchCaptureBytes : APP_CAMERA_PACKED_CAPTURE_BYTES;
-    size_t capture_len = 0;
-    uint8_t *capture = static_cast<uint8_t *>(
-        heap_caps_malloc(capture_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!capture) {
-        ESP_LOGE(TAG, "%s capture PSRAM alloc failed: %u bytes, largest_psram=%u",
-                 kCaptureThenFindFrame ? "raw-search" : "packet",
-                 static_cast<unsigned>(capture_cap),
-                 static_cast<unsigned>(
-                     heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM |
-                                                      MALLOC_CAP_8BIT)));
-        gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
-        vTaskDelete(nullptr);
-    }
-    ESP_LOGI(TAG, "%s PSRAM capture buffer=%u bytes, DVP DMA window=%u x %u",
-             kCaptureThenFindFrame ? "raw-search" : "packet",
-             static_cast<unsigned>(capture_cap),
-             static_cast<unsigned>(kDvpWindowBytes),
-             static_cast<unsigned>(kDvpBufferCount));
-
-    DvpProbeContext ctx = {};
-    ctx.buffer_len = kDvpWindowBytes;
-    ctx.done_queue = xQueueCreate(kDvpBufferCount, sizeof(DvpProbeDone));
-    // DMA window 放 internal SRAM，完成后再复制到 PSRAM 大缓存。
-    uint32_t buf_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
-    for (size_t i = 0; i < kDvpBufferCount; ++i) {
-        ctx.buffers[i] = static_cast<uint8_t *>(
-            esp_cam_ctlr_alloc_buffer(cam, ctx.buffer_len, buf_caps));
-    }
-    bool dma_alloc_ok = ctx.done_queue != nullptr;
-    for (size_t i = 0; i < kDvpBufferCount; ++i) {
-        dma_alloc_ok = dma_alloc_ok && ctx.buffers[i] != nullptr;
-    }
-    if (!dma_alloc_ok) {
-        ESP_LOGE(TAG, "dvp: DMA buffer alloc failed, window=%u count=%u largest_dma=%u",
-                 static_cast<unsigned>(ctx.buffer_len),
-                 static_cast<unsigned>(kDvpBufferCount),
-                 static_cast<unsigned>(
-                     heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
-                                                      MALLOC_CAP_DMA |
-                                                      MALLOC_CAP_8BIT)));
-        heap_caps_free(capture);
-        vTaskDelete(nullptr);
-    }
-
-    esp_cam_ctlr_evt_cbs_t cbs = {
-        .on_get_new_trans = dvp_get_new_trans,
-        .on_trans_finished = dvp_trans_finished,
-    };
-    ESP_ERROR_CHECK(esp_cam_ctlr_register_event_callbacks(cam, &cbs, &ctx));
-    ESP_ERROR_CHECK(esp_cam_ctlr_enable(cam));
-    ESP_ERROR_CHECK(esp_cam_ctlr_start(cam));
-
-    auto *hw = CAM_LL_GET_HW(0);
-    bool pclk_invert = APP_CAMERA_DVP_PCLK_INVERT != 0;
-
-    cam_ll_stop(hw);
-    esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ZERO_INPUT, CAM_V_SYNC_IDX, false);
-    esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_H_ENABLE_IDX, false);
-    esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_H_SYNC_IDX, false);
-    cam_ll_set_vh_de_mode(hw, false);
-    cam_ll_enable_vsync_generate_eof(hw, false);
-    cam_ll_set_recv_data_bytelen(hw, static_cast<uint32_t>(kDvpWindowBytes - 1U));
-    cam_ll_enable_invert_pclk(hw, pclk_invert);
-    cam_ll_fifo_reset(hw);
-    cam_ll_start(hw);
-    esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, CAM_V_SYNC_IDX, false);
-
-    ESP_LOGI(TAG, "packed binary stream: UART%d %u baud, mode=%s",
-             static_cast<int>(kUart), static_cast<unsigned>(APP_CAMERA_UART_BAUD),
-             kUse1Sdr ?
-                 (APP_GC032A_SPI_1SDR_USE_SD1 ? "1SDR SD1-only" : "1SDR SD0-only") :
-                 "2-bit D0/D1");
-
-    uint8_t spi52 = 0xff;
-    if (gc032a_write_reg(0xfe, 0x03) == ESP_OK &&
-        gc032a_read_reg(0x52, &spi52) == ESP_OK) {
-        ESP_LOGI(TAG, "gc032a spi reg 52=%02x, default pack order=%s",
-                 spi52, (spi52 & 0x80U) ? "MSB-first" : "LSB-first");
+    ESP_LOGW(TAG, "SP0A39 one-frame capture via official esp_video SPI device");
+    esp_err_t ret = init_sp0a39_video();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_video SP0A39 init failed: %s", esp_err_to_name(ret));
     } else {
-        ESP_LOGW(TAG, "gc032a spi reg 52 read failed, defaulting MSB-first");
-    }
-    gc032a_write_reg(0xfe, 0x00);
-
-    CaptureStats stats = {};
-    if (kCaptureThenFindFrame) {
-        ESP_LOGI(TAG, "%s raw-search mode: capture %u raw samples, then find FF FF FF 01 offline",
-                 kUse1Sdr ? "1SDR" : "2-bit",
-                 static_cast<unsigned>(capture_cap));
-    } else {
-        ESP_LOGI(TAG, "%s online sync: search phase=%u/%u, lock on FF FF FF 01, LSB-first",
-                 kUse1Sdr ? "1SDR" : "2-bit",
-                 static_cast<unsigned>(kPreferredPhase),
-                 static_cast<unsigned>(kPhaseCount));
-    }
-
-    if (kCaptureThenFindFrame) {
-        capture_raw_samples(&ctx, hw, pclk_invert,
-                            capture, capture_cap, &capture_len, &stats);
-    } else {
-        capture_packet_online(&ctx, hw, pclk_invert,
-                              capture, capture_cap, &capture_len, &stats);
-    }
-
-    cam_ll_stop(hw);
-    gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
-
-    uint8_t *frame = nullptr;
-    const uint8_t *uart_data = capture;
-    size_t uart_len = capture_len;
-    bool uart_frame_end = false;
-
-    if (kCaptureThenFindFrame) {
-        ESP_LOGI(TAG, "raw-search capture complete: raw_samples=%u raw_bytes=%u queue_drops=%u",
-                 static_cast<unsigned>(stats.samples_seen),
-                 static_cast<unsigned>(capture_len),
-                 static_cast<unsigned>(ctx.queue_drops));
-
-        size_t frame_cap = APP_CAMERA_PACKED_CAPTURE_BYTES;
-        frame = static_cast<uint8_t *>(
-            heap_caps_malloc(frame_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!frame) {
-            ESP_LOGE(TAG, "frame PSRAM alloc failed: %u bytes, largest_psram=%u",
-                     static_cast<unsigned>(frame_cap),
-                     static_cast<unsigned>(
-                         heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM |
-                                                          MALLOC_CAP_8BIT)));
-            uart_data = nullptr;
-            uart_len = 0;
-        } else {
-            size_t frame_len = 0;
-            uint8_t offline_phase = 0;
-            bool saw_end = false;
-            if (find_frame_in_raw_samples(capture, capture_len,
-                                          frame, frame_cap,
-                                          &frame_len, &offline_phase, &saw_end)) {
-                uart_data = frame;
-                uart_len = frame_len;
-                stats.locked_phase = offline_phase;
-                uart_frame_end = saw_end;
-                ESP_LOGI(TAG, "offline frame search: phase=%u bytes=%u end=%u",
-                         static_cast<unsigned>(offline_phase),
-                         static_cast<unsigned>(frame_len),
-                         saw_end ? 1U : 0U);
-            } else {
-                ESP_LOGE(TAG, "offline frame search: FF FF FF 01 not found in %u raw samples",
-                         static_cast<unsigned>(capture_len));
-                uart_data = nullptr;
-                uart_len = 0;
-            }
-        }
-    } else {
-        uart_frame_end = stats.saw_frame_end;
-        ESP_LOGI(TAG, "frame capture complete: phase=%u samples=%u bytes=%u end=%u queue_drops=%u",
-                 static_cast<unsigned>(stats.locked_phase),
-                 static_cast<unsigned>(stats.samples_seen),
-                 static_cast<unsigned>(capture_len),
-                 uart_frame_end ? 1U : 0U,
-                 static_cast<unsigned>(ctx.queue_drops));
-    }
-
-    if (uart_data && uart_len >= 16U) {
-        ESP_LOGI(TAG,
-                 "UART dump first16: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-                 uart_data[0], uart_data[1], uart_data[2], uart_data[3],
-                 uart_data[4], uart_data[5], uart_data[6], uart_data[7],
-                 uart_data[8], uart_data[9], uart_data[10], uart_data[11],
-                 uart_data[12], uart_data[13], uart_data[14], uart_data[15]);
-
-        ESP_LOGI(TAG,
-                 "UART dump last4: %02x %02x %02x %02x",
-                 uart_data[uart_len-4], uart_data[uart_len-3],
-                 uart_data[uart_len-2], uart_data[uart_len-1]);
-    }
-
-    ESP_LOGI(TAG, "UART write len: %u end=%u",
-             static_cast<unsigned>(uart_len),
-             uart_frame_end ? 1U : 0U);
-    if (uart_data && uart_len > 0U) {
-        for (size_t off = 0; off < uart_len;) {
-            size_t chunk = std::min(static_cast<size_t>(APP_CAMERA_UART_CHUNK_BYTES),
-                                    uart_len - off);
-            int written = uart_write_bytes(kUart, uart_data + off, chunk);
-            if (written < 0 || static_cast<size_t>(written) != chunk) {
-                ESP_LOGE(TAG, "UART write failed: off=%u requested=%u written=%d",
-                         static_cast<unsigned>(off),
-                         static_cast<unsigned>(chunk),
-                         written);
-                break;
-            }
-            off += chunk;
-            vTaskDelay(1);
-        }
-        esp_err_t tx_done = uart_wait_tx_done(kUart, pdMS_TO_TICKS(30000));
-        if (tx_done != ESP_OK) {
-            ESP_LOGE(TAG, "UART wait tx done failed: %s", esp_err_to_name(tx_done));
+        read_sp0a39_id();
+        ret = capture_and_send_one_frame();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "capture/send frame failed: %s", esp_err_to_name(ret));
         }
     }
-    heap_caps_free(frame);
-    heap_caps_free(capture);
-    ESP_LOGI(TAG, "LCD_CAM stopped, GC032A PWDN asserted, UART output complete");
+
     vTaskDelete(nullptr);
 }
 
-esp_err_t CameraUartStreamer::start_mclk()
+esp_err_t CameraUartStreamer::configure_camera_pins()
 {
-    if (mclk_started_) return ESP_OK;
+    uint64_t mask = 0;
+    mask |= 1ULL << BSP_SP0A39_PCLK_GPIO;
+    mask |= 1ULL << BSP_SP0A39_VSYNC_GPIO;
+    mask |= 1ULL << BSP_SP0A39_HSYNC_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D0_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D1_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D2_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D3_GPIO;
 
-    ledc_timer_config_t timer = {
-        .speed_mode = kMclkSpeedMode,
-        .duty_resolution = kMclkDutyResolution,
-        .timer_num = kMclkTimer,
-        .freq_hz = APP_GC032A_MCLK_HZ,
-        .clk_cfg = kMclkClockSource,
-        .deconfigure = false,
-    };
-    ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG, "mclk timer");
+    gpio_config_t input_conf = {};
+    input_conf.pin_bit_mask = mask;
+    input_conf.mode = GPIO_MODE_INPUT;
+    input_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    input_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    input_conf.intr_type = GPIO_INTR_DISABLE;
 
-    ledc_channel_config_t ch = {
-        .gpio_num = BSP_GC032A_MCLK_GPIO,
-        .speed_mode = kMclkSpeedMode,
-        .channel = kMclkChannel,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = kMclkTimer,
-        .duty = kMclkDuty50Percent,
-        .hpoint = 0,
-        .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
-    };
-    ESP_RETURN_ON_ERROR(ledc_channel_config(&ch), TAG, "mclk channel");
-    mclk_started_ = true;
+    ESP_RETURN_ON_ERROR(gpio_config(&input_conf), TAG, "gpio input config");
+    ESP_LOGI(TAG, "camera data/sync pins configured as high-Z inputs");
     return ESP_OK;
 }
 
-esp_err_t CameraUartStreamer::power_on_camera()
+esp_err_t CameraUartStreamer::init_uart()
 {
-    gpio_config_t pwr = {
-        .pin_bit_mask = 1ULL << BSP_CAMERA_PWR_EN_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&pwr), TAG, "pwr_en");
-    gpio_set_level(BSP_CAMERA_PWR_EN_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    gpio_config_t pwdn = {
-        .pin_bit_mask = 1ULL << BSP_GC032A_PWDN_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&pwdn), TAG, "pwdn");
-    gpio_set_level(BSP_GC032A_PWDN_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(5));
-    gpio_set_level(BSP_GC032A_PWDN_GPIO, 0);
-    vTaskDelay(pdMS_TO_TICKS(200));
-
-    gpio_config_t in = {
-        .pin_bit_mask = (1ULL << BSP_GC032A_SPI_CLK_GPIO) |
-                        (1ULL << BSP_GC032A_DATA0_GPIO) |
-                        (1ULL << BSP_GC032A_DATA1_GPIO),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    return gpio_config(&in);
-}
-
-esp_err_t CameraUartStreamer::attach_gc032a()
-{
-    if (gc032a_) return ESP_OK;
-    ESP_RETURN_ON_ERROR(select_gc032a_address(), TAG, "select addr");
-
-    i2c_master_bus_handle_t bus = bsp_i2c_bus();
-    if (!bus) {
-        ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c init");
-        bus = bsp_i2c_bus();
+    if (uart_initialized_) {
+        return ESP_OK;
     }
-    if (!bus) return ESP_ERR_INVALID_STATE;
 
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = gc032a_addr_,
-        .scl_speed_hz = BSP_I2C0_FREQ_HZ,
-    };
-    esp_err_t e = i2c_master_bus_add_device(bus, &dev_cfg, &gc032a_);
-    if (e != ESP_OK) gc032a_ = nullptr;
-    return e;
-}
+    uart_config_t cfg = {};
+    cfg.baud_rate = APP_CAMERA_UART_BAUD;
+    cfg.data_bits = UART_DATA_8_BITS;
+    cfg.parity = UART_PARITY_DISABLE;
+    cfg.stop_bits = UART_STOP_BITS_1;
+    cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+    cfg.source_clk = UART_SCLK_DEFAULT;
 
-esp_err_t CameraUartStreamer::select_gc032a_address()
-{
-    if (gc032a_addr_ != 0) return ESP_OK;
+    ESP_RETURN_ON_ERROR(uart_driver_install(UART_NUM_2, 4096, 0, 0, nullptr, 0),
+                        TAG, "uart driver install");
+    ESP_RETURN_ON_ERROR(uart_param_config(UART_NUM_2, &cfg), TAG, "uart param");
+    ESP_RETURN_ON_ERROR(uart_set_pin(UART_NUM_2,
+                                     BSP_UART2_TX_GPIO,
+                                     BSP_UART2_RX_GPIO,
+                                     UART_PIN_NO_CHANGE,
+                                     UART_PIN_NO_CHANGE),
+                        TAG, "uart pins");
 
-    i2c_master_bus_handle_t bus = bsp_i2c_bus();
-    if (!bus) {
-        ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c init");
-        bus = bsp_i2c_bus();
-    }
-    if (!bus) return ESP_ERR_INVALID_STATE;
-
-    constexpr uint8_t candidates[] = {
-        APP_GC032A_I2C_ADDR, 0x21, 0x31, 0x3C, 0x42, 0x5C, 0x6E,
-    };
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        for (uint8_t addr : candidates) {
-            if (addr == 0 || addr >= 0x78) continue;
-            if (i2c_master_probe(bus, addr, 50) != ESP_OK) continue;
-
-            i2c_master_dev_handle_t dev = nullptr;
-            i2c_device_config_t cfg = {
-                .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-                .device_address = addr,
-                .scl_speed_hz = BSP_I2C0_FREQ_HZ,
-            };
-            if (i2c_master_bus_add_device(bus, &cfg, &dev) != ESP_OK) continue;
-
-            uint8_t idh = 0, idl = 0, reg = kGc032aIdHighReg;
-            esp_err_t e0 = i2c_master_transmit_receive(dev, &reg, 1, &idh, 1, 100);
-            reg = kGc032aIdLowReg;
-            esp_err_t e1 = i2c_master_transmit_receive(dev, &reg, 1, &idl, 1, 100);
-            i2c_master_bus_rm_device(dev);
-            if (e0 == ESP_OK && e1 == ESP_OK &&
-                static_cast<uint16_t>((idh << 8) | idl) == kGc032aExpectedId) {
-                gc032a_addr_ = addr;
-                return ESP_OK;
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    return ESP_ERR_NOT_FOUND;
-}
-
-esp_err_t CameraUartStreamer::gc032a_read_reg(uint8_t reg, uint8_t *val)
-{
-    if (!gc032a_) return ESP_ERR_INVALID_STATE;
-    return i2c_master_transmit_receive(gc032a_, &reg, 1, val, 1, 100);
-}
-
-esp_err_t CameraUartStreamer::gc032a_write_reg(uint8_t reg, uint8_t val)
-{
-    if (!gc032a_) return ESP_ERR_INVALID_STATE;
-    uint8_t buf[2] = {reg, val};
-    return i2c_master_transmit(gc032a_, buf, 2, 100);
-}
-
-esp_err_t CameraUartStreamer::init_gc032a_sensor()
-{
-    ESP_RETURN_ON_ERROR(attach_gc032a(), TAG, "attach");
-    for (const auto &rv : kGc032aInitRegs) {
-        ESP_RETURN_ON_ERROR(gc032a_write_reg(rv.reg, rv.val), TAG, "init reg");
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-    dump_gc032a_init_regs();
-    dump_gc032a_spi_regs();
+    uart_initialized_ = true;
+    ESP_LOGI(TAG, "UART2 ready: %u baud TX GPIO%d RX GPIO%d",
+             APP_CAMERA_UART_BAUD, BSP_UART2_TX_GPIO, BSP_UART2_RX_GPIO);
     return ESP_OK;
 }
 
-void CameraUartStreamer::dump_gc032a_init_regs()
+esp_err_t CameraUartStreamer::set_pwdn(bool asserted)
 {
-    uint8_t page = 0;
-    uint32_t checked = 0;
-    uint32_t mismatches = 0;
-
-    ESP_LOGI(TAG, "gc032a init regs readback begin");
-    for (const auto &rv : kGc032aInitRegs) {
-        if (rv.reg == 0xfe) {
-            page = rv.val;
-            if (gc032a_write_reg(0xfe, page) != ESP_OK) {
-                ESP_LOGW(TAG, "gc032a readback: select page %02x failed", page);
-                return;
-            }
-            ESP_LOGI(TAG, "gc032a readback: page=%02x", page);
-            continue;
-        }
-
-        uint8_t actual = 0;
-        esp_err_t err = gc032a_read_reg(rv.reg, &actual);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "gc032a readback: p%02x r%02x failed: %s",
-                     page, rv.reg, esp_err_to_name(err));
-            continue;
-        }
-
-        ++checked;
-        if (actual != rv.val) ++mismatches;
-        ESP_LOGI(TAG, "gc032a readback: p%02x r%02x=%02x expected=%02x%s",
-                 page, rv.reg, actual, rv.val,
-                 actual == rv.val ? "" : " mismatch");
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-
-    gc032a_write_reg(0xfe, 0x00);
-    ESP_LOGI(TAG, "gc032a init regs readback done: checked=%" PRIu32
-                  " mismatches=%" PRIu32,
-             checked, mismatches);
+    return bsp_ioexp_set_pin(BSP_SP0A39_PWDN_IOEXP_PIN, asserted);
 }
 
-void CameraUartStreamer::dump_gc032a_spi_regs()
-{
-    if (gc032a_write_reg(0xfe, 0x03) != ESP_OK) {
-        ESP_LOGW(TAG, "gc032a spi regs: select page failed");
-        return;
-    }
-
-    constexpr uint8_t regs[] = {
-        0x53, 0x55, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e,
-        0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67,
-    };
-    uint8_t vals[sizeof(regs)] = {};
-    for (size_t i = 0; i < sizeof(regs); ++i) {
-        if (gc032a_read_reg(regs[i], &vals[i]) != ESP_OK) {
-            ESP_LOGW(TAG, "gc032a spi regs: read failed");
-            gc032a_write_reg(0xfe, 0x00);
-            return;
-        }
-    }
-
-    ESP_LOGI(TAG,
-             "gc032a spi regs: 53=%02x 55=%02x 5a=%02x "
-             "5b=%02x 5c=%02x 5d=%02x 5e=%02x "
-             "60=%02x 61=%02x 62=%02x 63=%02x 64=%02x 65=%02x 66=%02x 67=%02x",
-             vals[0], vals[1], vals[2],
-             vals[3], vals[4], vals[5], vals[6],
-             vals[7], vals[8], vals[9], vals[10],
-             vals[11], vals[12], vals[13], vals[14]);
-    gc032a_write_reg(0xfe, 0x00);
-}
-
-void CameraUartStreamer::probe_i2c()
+void CameraUartStreamer::read_sp0a39_id()
 {
     i2c_master_bus_handle_t bus = bsp_i2c_bus();
     if (!bus) {
-        ESP_LOGW(TAG, "i2c: bus unavailable");
+        ESP_LOGW(TAG, "read SP0A39 id: I2C bus unavailable");
         return;
     }
 
-    int found = 0;
-    for (uint8_t addr = 0x08; addr < 0x78; ++addr) {
-        if (i2c_master_probe(bus, addr, 50) == ESP_OK) {
-            ESP_LOGI(TAG, "i2c ack: 0x%02X", addr);
-            ++found;
-        }
+    i2c_master_dev_handle_t dev = nullptr;
+    i2c_device_config_t dev_cfg = {};
+    dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    dev_cfg.device_address = APP_SP0A39_I2C_ADDR;
+    dev_cfg.scl_speed_hz = BSP_I2C0_FREQ_HZ;
+
+    esp_err_t ret = i2c_master_bus_add_device(bus, &dev_cfg, &dev);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "read SP0A39 id: add device failed: %s", esp_err_to_name(ret));
+        return;
     }
-    ESP_LOGI(TAG, "i2c scan: %d device(s)", found);
+
+    uint8_t page_sel[2] = {0xfd, 0x00};
+    ret = i2c_master_transmit(dev, page_sel, sizeof(page_sel), 100);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "read SP0A39 id: select page0 failed: %s", esp_err_to_name(ret));
+        i2c_master_bus_rm_device(dev);
+        return;
+    }
+
+    uint8_t id_h = 0;
+    uint8_t id_l = 0;
+    uint8_t reg = 0x00;
+    ret = i2c_master_transmit_receive(dev, &reg, 1, &id_h, 1, 100);
+    if (ret == ESP_OK) {
+        reg = 0x01;
+        ret = i2c_master_transmit_receive(dev, &reg, 1, &id_l, 1, 100);
+    }
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "SP0A39 id read: reg00=0x%02X reg01=0x%02X pid=0x%02X%02X",
+                 id_h, id_l, id_h, id_l);
+    } else {
+        ESP_LOGW(TAG, "read SP0A39 id failed: %s", esp_err_to_name(ret));
+    }
+
+    i2c_master_bus_rm_device(dev);
 }
 
-void CameraUartStreamer::write_status(const char *msg)
+esp_err_t CameraUartStreamer::init_sp0a39_video()
 {
-    ESP_LOGI(TAG, "%s", msg);
+    if (video_initialized_) {
+        return ESP_OK;
+    }
+
+    i2c_master_bus_handle_t bus = bsp_i2c_bus();
+    if (!bus) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_video_init_spi_config_t spi = {};
+    spi.sccb_config.init_sccb = false;
+    spi.sccb_config.i2c_handle = bus;
+    spi.sccb_config.freq = BSP_I2C0_FREQ_HZ;
+    spi.intf = ESP_CAM_CTLR_SPI_CAM_INTF_SPI;
+    spi.io_mode = ESP_CAM_CTLR_SPI_CAM_IO_MODE_1BIT;
+    spi.spi_port = SPI3_HOST;
+    spi.spi_cs_pin = BSP_SP0A39_VSYNC_GPIO;
+    spi.spi_sclk_pin = BSP_SP0A39_PCLK_GPIO;
+    spi.spi_data0_io_pin = BSP_SP0A39_D0_GPIO;
+    spi.spi_data1_io_pin = GPIO_NUM_NC;
+    spi.spi_data2_io_pin = GPIO_NUM_NC;
+    spi.spi_data3_io_pin = GPIO_NUM_NC;
+    spi.reset_pin = GPIO_NUM_NC;
+    spi.pwdn_pin = GPIO_NUM_NC;
+    spi.xclk_source = ESP_CAM_SENSOR_XCLK_LEDC;
+    spi.xclk_freq = APP_SP0A39_MCLK_HZ;
+    spi.xclk_pin = BSP_SP0A39_MCLK_GPIO;
+#if CONFIG_CAMERA_XCLK_USE_LEDC
+    spi.xclk_ledc_cfg.timer = kMclkTimer;
+    spi.xclk_ledc_cfg.clk_cfg = kMclkClockSource;
+    spi.xclk_ledc_cfg.channel = kMclkChannel;
+#endif
+
+    esp_video_init_config_t config = {};
+    config.spi = &spi;
+
+    ESP_LOGI(TAG, "esp_video SPI_1BIT init: dev=%s MCLK GPIO%d DATA0 GPIO%d DCLK GPIO%d CS GPIO%d",
+             ESP_VIDEO_SPI_DEVICE_NAME,
+             BSP_SP0A39_MCLK_GPIO,
+             BSP_SP0A39_D0_GPIO,
+             BSP_SP0A39_PCLK_GPIO,
+             BSP_SP0A39_VSYNC_GPIO);
+    ESP_RETURN_ON_ERROR(esp_video_init_with_flags(&config, ESP_VIDEO_INIT_FLAGS_SPI),
+                        TAG, "esp_video_init SPI");
+
+    video_initialized_ = true;
+    ESP_LOGI(TAG, "esp_video SP0A39 SPI_1BIT device initialized");
+
+    return ESP_OK;
+}
+
+esp_err_t CameraUartStreamer::capture_and_send_one_frame()
+{
+    int fd = open(ESP_VIDEO_SPI_DEVICE_NAME, O_RDONLY);
+    ESP_RETURN_ON_FALSE(fd >= 0, ESP_FAIL, TAG, "open %s failed errno=%d",
+                        ESP_VIDEO_SPI_DEVICE_NAME, errno);
+
+    esp_err_t ret = ESP_OK;
+    uint8_t *buffers[kCaptureBuffers] = {};
+    size_t buffer_lengths[kCaptureBuffers] = {};
+    bool streaming = false;
+    int stream_type = kVideoType;
+    struct v4l2_capability capability = {};
+    struct v4l2_format format = {};
+    esp_cam_sensor_format_t sensor_format = {};
+    struct v4l2_requestbuffers req = {};
+    struct v4l2_buffer frame = {};
+
+    ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_QUERYCAP, &capability, "VIDIOC_QUERYCAP"),
+                      cleanup, TAG, "querycap");
+    ESP_LOGI(TAG, "video driver=%s card=%s bus=%s caps=0x%08lx",
+             capability.driver, capability.card, capability.bus_info,
+             static_cast<unsigned long>(capability.capabilities));
+
+    ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_G_SENSOR_FMT, &sensor_format,
+                                    "VIDIOC_G_SENSOR_FMT"),
+                      cleanup, TAG, "get sensor format");
+
+    format.type = kVideoType;
+    format.fmt.pix.width = APP_CAMERA_SENSOR_WIDTH;
+    format.fmt.pix.height = APP_CAMERA_SENSOR_HEIGHT;
+    format.fmt.pix.pixelformat = sensor_pixformat_to_v4l2(sensor_format.format);
+    ESP_GOTO_ON_FALSE(format.fmt.pix.pixelformat != 0, ESP_ERR_NOT_SUPPORTED,
+                      cleanup, TAG, "unsupported sensor pixel format=%d",
+                      sensor_format.format);
+    if (sensor_format.spi_info.frame_info) {
+        format.fmt.pix.sizeimage = sensor_format.spi_info.frame_info->frame_size;
+        ESP_LOGI(TAG, "sensor format: %s %ux%u frame_size=%lu line_size=%lu",
+                 sensor_format.name ? sensor_format.name : "(unnamed)",
+                 sensor_format.width,
+                 sensor_format.height,
+                 static_cast<unsigned long>(sensor_format.spi_info.frame_info->frame_size),
+                 static_cast<unsigned long>(sensor_format.spi_info.frame_info->line_size));
+    }
+    ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_S_FMT, &format, "VIDIOC_S_FMT"),
+                      cleanup, TAG, "set format");
+    ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_G_FMT, &format, "VIDIOC_G_FMT"),
+                      cleanup, TAG, "get format");
+    ESP_LOGI(TAG, "capture format: %lux%lu fourcc=0x%08lx sizeimage=%lu",
+             static_cast<unsigned long>(format.fmt.pix.width),
+             static_cast<unsigned long>(format.fmt.pix.height),
+             static_cast<unsigned long>(format.fmt.pix.pixelformat),
+             static_cast<unsigned long>(format.fmt.pix.sizeimage));
+
+    req.count = kCaptureBuffers;
+    req.type = kVideoType;
+    req.memory = V4L2_MEMORY_MMAP;
+    ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_REQBUFS, &req, "VIDIOC_REQBUFS"),
+                      cleanup, TAG, "request buffers");
+    ESP_GOTO_ON_FALSE(req.count >= kCaptureBuffers, ESP_ERR_NO_MEM, cleanup,
+                      TAG, "not enough video buffers: %lu", static_cast<unsigned long>(req.count));
+
+    for (int i = 0; i < kCaptureBuffers; ++i) {
+        struct v4l2_buffer buf = {};
+        buf.type = kVideoType;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_QUERYBUF, &buf, "VIDIOC_QUERYBUF"),
+                          cleanup, TAG, "query buffer");
+
+        buffers[i] = static_cast<uint8_t *>(mmap(nullptr, buf.length,
+                                                 PROT_READ | PROT_WRITE,
+                                                 MAP_SHARED, fd, buf.m.offset));
+        ESP_GOTO_ON_FALSE(buffers[i] != MAP_FAILED, ESP_FAIL, cleanup,
+                          TAG, "mmap buffer %d failed errno=%d", i, errno);
+        buffer_lengths[i] = buf.length;
+
+        ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF"),
+                          cleanup, TAG, "queue buffer");
+    }
+
+    ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_STREAMON, &stream_type, "VIDIOC_STREAMON"),
+                      cleanup, TAG, "stream on");
+    streaming = true;
+
+    for (int attempt = 0; attempt < kMaxFrameDequeues; ++attempt) {
+        frame = {};
+        frame.type = kVideoType;
+        frame.memory = V4L2_MEMORY_MMAP;
+        ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_DQBUF, &frame, "VIDIOC_DQBUF"),
+                          cleanup, TAG, "dequeue frame");
+
+        ESP_GOTO_ON_FALSE(frame.index < kCaptureBuffers, ESP_ERR_INVALID_SIZE, cleanup,
+                          TAG, "bad frame index %lu", static_cast<unsigned long>(frame.index));
+        ESP_LOGI(TAG, "captured frame attempt=%d index=%lu bytesused=%lu flags=0x%08lx length=%lu",
+                 attempt + 1,
+                 static_cast<unsigned long>(frame.index),
+                 static_cast<unsigned long>(frame.bytesused),
+                 static_cast<unsigned long>(frame.flags),
+                 static_cast<unsigned long>(frame.length));
+
+        if (frame.bytesused > 0 && (frame.flags & V4L2_BUF_FLAG_DONE)) {
+            break;
+        }
+
+        ESP_LOGW(TAG, "skip empty/error camera frame attempt=%d flags=0x%08lx",
+                 attempt + 1, static_cast<unsigned long>(frame.flags));
+        ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_QBUF, &frame, "VIDIOC_QBUF skip"),
+                          cleanup, TAG, "return skipped buffer");
+        frame = {};
+        vTaskDelay(1);
+    }
+    ESP_GOTO_ON_FALSE(frame.bytesused > 0 && (frame.flags & V4L2_BUF_FLAG_DONE),
+                      ESP_ERR_INVALID_SIZE, cleanup, TAG,
+                      "no valid camera frame after %d dequeues", kMaxFrameDequeues);
+
+    ESP_GOTO_ON_ERROR(uart_write_pgm_image(buffers[frame.index],
+                                           frame.bytesused,
+                                           format.fmt.pix.pixelformat,
+                                           format.fmt.pix.width,
+                                           format.fmt.pix.height),
+                      cleanup, TAG, "write UART PGM frame");
+    ESP_LOGI(TAG, "UART frame output complete: %lu bytes",
+             static_cast<unsigned long>(frame.bytesused));
+
+    ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_QBUF, &frame, "VIDIOC_QBUF return"),
+                      cleanup, TAG, "return buffer");
+
+cleanup:
+    if (streaming) {
+        int type = kVideoType;
+        if (ioctl(fd, VIDIOC_STREAMOFF, &type) != 0) {
+            ESP_LOGW(TAG, "VIDIOC_STREAMOFF failed errno=%d", errno);
+        }
+    }
+    for (int i = 0; i < kCaptureBuffers; ++i) {
+        if (buffers[i] && buffers[i] != MAP_FAILED) {
+            munmap(buffers[i], buffer_lengths[i]);
+        }
+    }
+    close(fd);
+    return ret;
 }
