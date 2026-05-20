@@ -1,11 +1,13 @@
 #include "camera_uart.hpp"
 
-#include <fcntl.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
@@ -16,11 +18,13 @@
 #include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_rom_gpio.h"
 #include "esp_cam_sensor_types.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
 #include "esp_video_ioctl.h"
 #include "linux/videodev2.h"
+#include "soc/gpio_sig_map.h"
 #include "app_config.h"
 #include "bsp.h"
 
@@ -37,6 +41,11 @@ constexpr int kCaptureBuffers = 2;
 constexpr int kMaxFrameDequeues = 8;
 constexpr int kVideoType = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 constexpr int kUartTxTimeoutTicks = pdMS_TO_TICKS(1000);
+
+void force_spi3_cs_active_high_input()
+{
+    esp_rom_gpio_connect_in_signal(BSP_SP0A39_VSYNC_GPIO, SPI3_CS0_IN_IDX, true);
+}
 
 uint32_t sensor_pixformat_to_v4l2(esp_cam_sensor_output_format_t format)
 {
@@ -336,7 +345,7 @@ esp_err_t CameraUartStreamer::init_sp0a39_video()
     esp_video_init_config_t config = {};
     config.spi = &spi;
 
-    ESP_LOGI(TAG, "esp_video SPI_1BIT init: dev=%s MCLK GPIO%d DATA0 GPIO%d DCLK GPIO%d CS GPIO%d",
+    ESP_LOGI(TAG, "esp_video SPI_1BIT init: dev=%s MCLK GPIO%d DATA0 GPIO%d DCLK GPIO%d CS/VSYNC GPIO%d",
              ESP_VIDEO_SPI_DEVICE_NAME,
              BSP_SP0A39_MCLK_GPIO,
              BSP_SP0A39_D0_GPIO,
@@ -344,6 +353,7 @@ esp_err_t CameraUartStreamer::init_sp0a39_video()
              BSP_SP0A39_VSYNC_GPIO);
     ESP_RETURN_ON_ERROR(esp_video_init_with_flags(&config, ESP_VIDEO_INIT_FLAGS_SPI),
                         TAG, "esp_video_init SPI");
+    force_spi3_cs_active_high_input();
 
     video_initialized_ = true;
     ESP_LOGI(TAG, "esp_video SP0A39 SPI_1BIT device initialized");
@@ -367,35 +377,110 @@ esp_err_t CameraUartStreamer::capture_and_send_one_frame()
     esp_cam_sensor_format_t sensor_format = {};
     struct v4l2_requestbuffers req = {};
     struct v4l2_buffer frame = {};
+    esp_cam_sensor_id_t chip_id = {};
+    struct v4l2_ext_control control = {};
+    struct v4l2_ext_controls controls = {};
+    struct v4l2_frmivalenum frmival = {};
+    struct timeval dqbuf_timeout = {};
 
     ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_QUERYCAP, &capability, "VIDIOC_QUERYCAP"),
                       cleanup, TAG, "querycap");
-    ESP_LOGI(TAG, "video driver=%s card=%s bus=%s caps=0x%08lx",
+    ESP_LOGI(TAG, "version: %u.%u.%u",
+             static_cast<unsigned>((capability.version >> 16) & 0xff),
+             static_cast<unsigned>((capability.version >> 8) & 0xff),
+             static_cast<unsigned>(capability.version & 0xff));
+    ESP_LOGI(TAG, "video driver=%s card=%s bus=%s caps=0x%08lx device_caps=0x%08lx",
              capability.driver, capability.card, capability.bus_info,
-             static_cast<unsigned long>(capability.capabilities));
+             static_cast<unsigned long>(capability.capabilities),
+             static_cast<unsigned long>(capability.device_caps));
+
+    dqbuf_timeout.tv_sec = 3;
+    dqbuf_timeout.tv_usec = 0;
+    if (ioctl(fd, VIDIOC_S_DQBUF_TIMEOUT, &dqbuf_timeout) != 0) {
+        ESP_LOGW(TAG, "VIDIOC_S_DQBUF_TIMEOUT failed errno=%d", errno);
+    }
+
+    controls.ctrl_class = V4L2_CTRL_CLASS_ESP_CAM_IOCTL;
+    controls.count = 1;
+    controls.controls = &control;
+    control.id = ESP_CAM_SENSOR_IOC_G_CHIP_ID;
+    control.p_u8 = reinterpret_cast<uint8_t *>(&chip_id);
+    control.size = sizeof(chip_id);
+    if (ioctl(fd, VIDIOC_G_EXT_CTRLS, &controls) == 0) {
+        ESP_LOGI(TAG, "video chip id: 0x%04" PRIx16, chip_id.pid);
+    } else {
+        ESP_LOGW(TAG, "VIDIOC_G_EXT_CTRLS chip id failed errno=%d", errno);
+    }
 
     ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_G_SENSOR_FMT, &sensor_format,
                                     "VIDIOC_G_SENSOR_FMT"),
                       cleanup, TAG, "get sensor format");
 
     format.type = kVideoType;
-    format.fmt.pix.width = APP_CAMERA_SENSOR_WIDTH;
-    format.fmt.pix.height = APP_CAMERA_SENSOR_HEIGHT;
+    format.fmt.pix.width = sensor_format.width;
+    format.fmt.pix.height = sensor_format.height;
     format.fmt.pix.pixelformat = sensor_pixformat_to_v4l2(sensor_format.format);
     ESP_GOTO_ON_FALSE(format.fmt.pix.pixelformat != 0, ESP_ERR_NOT_SUPPORTED,
                       cleanup, TAG, "unsupported sensor pixel format=%d",
                       sensor_format.format);
+
     if (sensor_format.spi_info.frame_info) {
         format.fmt.pix.sizeimage = sensor_format.spi_info.frame_info->frame_size;
-        ESP_LOGI(TAG, "sensor format: %s %ux%u frame_size=%lu line_size=%lu",
+        ESP_LOGI(TAG,
+                 "sensor format: %s %ux%u frame_size=%lu line_size=%lu cs_active_high=%u",
                  sensor_format.name ? sensor_format.name : "(unnamed)",
                  sensor_format.width,
                  sensor_format.height,
                  static_cast<unsigned long>(sensor_format.spi_info.frame_info->frame_size),
-                 static_cast<unsigned long>(sensor_format.spi_info.frame_info->line_size));
+                 static_cast<unsigned long>(sensor_format.spi_info.frame_info->line_size),
+                 static_cast<unsigned>(sensor_format.spi_info.frame_info->high_level_active));
     }
+
+    for (uint32_t index = 0; index < 8; ++index) {
+        struct v4l2_fmtdesc fmtdesc = {};
+        fmtdesc.index = index;
+        fmtdesc.type = kVideoType;
+        if (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) != 0) {
+            break;
+        }
+        ESP_LOGI(TAG, "enum format[%lu]: %s fourcc=0x%08lx",
+                 static_cast<unsigned long>(index),
+                 reinterpret_cast<char *>(fmtdesc.description),
+                 static_cast<unsigned long>(fmtdesc.pixelformat));
+    }
+
     ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_S_FMT, &format, "VIDIOC_S_FMT"),
                       cleanup, TAG, "set format");
+
+    frmival.index = 0;
+    frmival.pixel_format = format.fmt.pix.pixelformat;
+    frmival.type = kVideoType;
+    frmival.width = format.fmt.pix.width;
+    frmival.height = format.fmt.pix.height;
+    if (ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) == 0) {
+        struct v4l2_streamparm sparm = {};
+        sparm.type = kVideoType;
+        sparm.parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+        sparm.parm.capture.timeperframe = frmival.discrete;
+        if (ioctl(fd, VIDIOC_S_PARM, &sparm) != 0) {
+            ESP_LOGW(TAG, "VIDIOC_S_PARM failed errno=%d", errno);
+        } else {
+            ESP_LOGI(TAG, "stream interval set: %lu/%lu s",
+                     static_cast<unsigned long>(frmival.discrete.numerator),
+                     static_cast<unsigned long>(frmival.discrete.denominator));
+        }
+    } else {
+        struct v4l2_streamparm sparm = {};
+        sparm.type = kVideoType;
+        sparm.parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+        if (ioctl(fd, VIDIOC_G_PARM, &sparm) == 0 &&
+            sparm.parm.capture.timeperframe.denominator != 0) {
+            ESP_LOGI(TAG, "stream interval current: %lu/%lu s",
+                     static_cast<unsigned long>(sparm.parm.capture.timeperframe.numerator),
+                     static_cast<unsigned long>(sparm.parm.capture.timeperframe.denominator));
+        }
+    }
+
     ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_G_FMT, &format, "VIDIOC_G_FMT"),
                       cleanup, TAG, "get format");
     ESP_LOGI(TAG, "capture format: %lux%lu fourcc=0x%08lx sizeimage=%lu",
@@ -423,7 +508,7 @@ esp_err_t CameraUartStreamer::capture_and_send_one_frame()
         buffers[i] = static_cast<uint8_t *>(mmap(nullptr, buf.length,
                                                  PROT_READ | PROT_WRITE,
                                                  MAP_SHARED, fd, buf.m.offset));
-        ESP_GOTO_ON_FALSE(buffers[i] != MAP_FAILED, ESP_FAIL, cleanup,
+        ESP_GOTO_ON_FALSE(buffers[i] && buffers[i] != MAP_FAILED, ESP_FAIL, cleanup,
                           TAG, "mmap buffer %d failed errno=%d", i, errno);
         buffer_lengths[i] = buf.length;
 
@@ -434,11 +519,13 @@ esp_err_t CameraUartStreamer::capture_and_send_one_frame()
     ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_STREAMON, &stream_type, "VIDIOC_STREAMON"),
                       cleanup, TAG, "stream on");
     streaming = true;
+    force_spi3_cs_active_high_input();
 
     for (int attempt = 0; attempt < kMaxFrameDequeues; ++attempt) {
         frame = {};
         frame.type = kVideoType;
         frame.memory = V4L2_MEMORY_MMAP;
+        force_spi3_cs_active_high_input();
         ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_DQBUF, &frame, "VIDIOC_DQBUF"),
                           cleanup, TAG, "dequeue frame");
 
@@ -460,6 +547,7 @@ esp_err_t CameraUartStreamer::capture_and_send_one_frame()
         ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_QBUF, &frame, "VIDIOC_QBUF skip"),
                           cleanup, TAG, "return skipped buffer");
         frame = {};
+        force_spi3_cs_active_high_input();
         vTaskDelay(1);
     }
     ESP_GOTO_ON_FALSE(frame.bytesused > 0 && (frame.flags & V4L2_BUF_FLAG_DONE),
@@ -477,6 +565,8 @@ esp_err_t CameraUartStreamer::capture_and_send_one_frame()
 
     ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_QBUF, &frame, "VIDIOC_QBUF return"),
                       cleanup, TAG, "return buffer");
+    frame = {};
+    force_spi3_cs_active_high_input();
 
 cleanup:
     if (streaming) {

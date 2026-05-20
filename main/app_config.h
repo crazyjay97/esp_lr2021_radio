@@ -213,7 +213,9 @@
 #define APP_CAMERA_DVP_DMA_BUFFER_COUNT 4U
 
 #define APP_CAMERA_UART_CHUNK_BYTES     2048U
-#define APP_CAMERA_TASK_PRIORITY        3
+/* esp_video SPI preprocessing runs synchronously in the capture task. Keep this
+ * one-shot bring-up task at idle priority so task WDT IDLE1 can still run. */
+#define APP_CAMERA_TASK_PRIORITY        0
 #define APP_CAMERA_TASK_STACK_BYTES     12288U
 #define APP_CAMERA_TASK_CORE            1
 
