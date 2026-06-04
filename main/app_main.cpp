@@ -6,6 +6,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "linux/videodev2.h"
 
 #include "app_config.h"
 #include "bsp.h"
@@ -16,6 +17,77 @@ constexpr const char *TAG = "app";
 AudioDiagnostics g_audio;
 CameraUartStreamer g_camera_uart;
 RadioPing g_radio;
+volatile bool g_capture_busy = false;
+
+void camera_capture_task(void *arg)
+{
+    (void)arg;
+    uint8_t *frame = nullptr;
+    size_t len = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t pixfmt = 0;
+
+    bsp_lcd_set_camera_status("Preparing camera...");
+    esp_err_t e = bsp_lcd_release_for_camera();
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "release lcd for camera: %s", esp_err_to_name(e));
+        bsp_lcd_reinit_after_camera();
+        bsp_lcd_set_camera_status("LCD release failed");
+        g_capture_busy = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    e = g_camera_uart.capture_frame(&frame, &len, &width, &height, &pixfmt);
+    ESP_LOGI(TAG, "capture result=%s frame=%p len=%u %lux%lu fourcc=0x%08lx",
+             esp_err_to_name(e), frame, static_cast<unsigned>(len),
+             static_cast<unsigned long>(width),
+             static_cast<unsigned long>(height),
+             static_cast<unsigned long>(pixfmt));
+
+    esp_err_t lcd_e = bsp_lcd_reinit_after_camera();
+    if (lcd_e != ESP_OK) {
+        ESP_LOGE(TAG, "lcd reinit after camera: %s", esp_err_to_name(lcd_e));
+    }
+
+    if (e == ESP_OK && pixfmt == V4L2_PIX_FMT_GREY) {
+        if (bsp_lcd_show_gray_photo(frame, width, height) == ESP_OK) {
+            bsp_lcd_set_camera_status("Captured. Touch capture to retake");
+        } else {
+            bsp_lcd_set_camera_status("Display photo failed");
+        }
+    } else if (e == ESP_OK) {
+        bsp_lcd_set_camera_status("Unsupported camera pixel format");
+    } else {
+        bsp_lcd_set_camera_status("Capture failed");
+    }
+
+    heap_caps_free(frame);
+    g_capture_busy = false;
+    vTaskDelete(nullptr);
+}
+
+void on_lcd_capture(void *user)
+{
+    (void)user;
+    if (g_capture_busy) {
+        bsp_lcd_set_camera_status("Capture already running");
+        return;
+    }
+    g_capture_busy = true;
+    BaseType_t ok = xTaskCreatePinnedToCore(camera_capture_task,
+                                            "touch_capture",
+                                            APP_CAMERA_TASK_STACK_BYTES,
+                                            nullptr,
+                                            APP_CAMERA_TASK_PRIORITY + 3,
+                                            nullptr,
+                                            APP_CAMERA_TASK_CORE);
+    if (ok != pdPASS) {
+        g_capture_busy = false;
+        bsp_lcd_set_camera_status("Capture task start failed");
+    }
+}
 
 void on_button(bsp_btn_id_t id, bool pressed, void *user)
 {
@@ -45,6 +117,25 @@ extern "C" void app_main(void)
 
     printf("PSRAM free: %d\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     printf("PSRAM total: %d\n", heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+
+#if APP_CAMERA_LCD_BRINGUP
+    bsp_i2c_scan();
+    if ((e = g_camera_uart.init()) != ESP_OK) {
+        ESP_LOGE(TAG, "camera init: %s", esp_err_to_name(e));
+        return;
+    }
+    if ((e = bsp_lcd_init()) != ESP_OK) {
+        ESP_LOGE(TAG, "lcd init: %s", esp_err_to_name(e));
+        return;
+    } else if ((e = bsp_lcd_start_camera_ui(on_lcd_capture, nullptr)) != ESP_OK) {
+        ESP_LOGE(TAG, "camera ui start: %s", esp_err_to_name(e));
+        return;
+    }
+    ESP_LOGI(TAG, "V02 camera/LCD validation UI ready: ST7789V3 %ux%u, SP0A39 DVP %ux%u",
+             APP_LCD_H_RES, APP_LCD_V_RES,
+             APP_CAMERA_SENSOR_WIDTH, APP_CAMERA_SENSOR_HEIGHT);
+    return;
+#endif
 
 #if APP_CAMERA_ONLY_BRINGUP
     ESP_LOGW(TAG, "camera-only bring-up: skipping CON6 detect, LED, audio, LR2021 radio, buttons, LCD, chime");

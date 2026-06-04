@@ -18,6 +18,7 @@ static const char *TAG = "bsp_i2c";
 
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_ioexp;
+static uint8_t s_ioexp_addr;
 
 /* Cached expander state. Config defaults to all inputs. */
 static uint8_t s_ioexp_cfg    = 0xFF;
@@ -132,13 +133,34 @@ static esp_err_t ioexp_attach(void)
     if (s_ioexp) return ESP_OK;
     if (!s_bus) return ESP_ERR_INVALID_STATE;
 
+    uint8_t addr = BSP_I2C_ADDR_IO_EXPANDER;
+    esp_err_t probe = i2c_master_probe(s_bus, addr, 50);
+    if (probe != ESP_OK) {
+        ESP_LOGW(TAG, "TCA9554A configured address 0x%02X did not ACK; scanning 0x20..0x27",
+                 addr);
+        bool found = false;
+        for (uint8_t candidate = 0x20; candidate <= 0x27; ++candidate) {
+            if (i2c_master_probe(s_bus, candidate, 50) == ESP_OK) {
+                addr = candidate;
+                found = true;
+                ESP_LOGI(TAG, "TCA9554A candidate ACK @ 0x%02X", addr);
+                break;
+            }
+        }
+        if (!found) {
+            ESP_LOGE(TAG, "no TCA9554A ACK in 0x20..0x27; 0x38 is FT6206 touch, not the IO expander");
+            return ESP_ERR_NOT_FOUND;
+        }
+    }
+
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address  = BSP_I2C_ADDR_IO_EXPANDER,
+        .device_address  = addr,
         .scl_speed_hz    = BSP_I2C0_FREQ_HZ,
     };
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_bus, &dev_cfg, &s_ioexp),
                         TAG, "ioexp add");
+    s_ioexp_addr = addr;
 
     if (!s_ioexp_lock) {
         s_ioexp_lock = xSemaphoreCreateMutex();
@@ -147,12 +169,22 @@ static esp_err_t ioexp_attach(void)
 
     esp_err_t err = ioexp_write(TCA9554_REG_OUTPUT, s_ioexp_output);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ioexp write failed (%s) — check address 0x%02X, "
-                      "run bsp_i2c_scan() to find actual one",
-                 esp_err_to_name(err), BSP_I2C_ADDR_IO_EXPANDER);
+        ESP_LOGE(TAG, "TCA9554A write failed (%s) at 0x%02X",
+                 esp_err_to_name(err), s_ioexp_addr);
+        i2c_master_bus_rm_device(s_ioexp);
+        s_ioexp = NULL;
         return err;
     }
-    return ioexp_write(TCA9554_REG_CONFIG, s_ioexp_cfg);
+    err = ioexp_write(TCA9554_REG_CONFIG, s_ioexp_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "TCA9554A config failed (%s) at 0x%02X",
+                 esp_err_to_name(err), s_ioexp_addr);
+        i2c_master_bus_rm_device(s_ioexp);
+        s_ioexp = NULL;
+        return err;
+    }
+    ESP_LOGI(TAG, "TCA9554A attached at 0x%02X", s_ioexp_addr);
+    return ESP_OK;
 }
 
 esp_err_t bsp_i2c_reinit(void)

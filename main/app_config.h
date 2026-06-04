@@ -182,17 +182,19 @@
 #define APP_STARTUP_CHIME_GAP_MS        35
 #define APP_STARTUP_CHIME_AMP           3500
 
-/* ----- SP0A39 SPI_1BIT Camera ---------------------------------------------- */
+/* ----- Camera/LCD bring-up -------------------------------------------------- */
 
-#define APP_CAMERA_UART_ENABLE          1
+#define APP_CAMERA_LCD_BRINGUP          1
 
-#define APP_CAMERA_ONLY_BRINGUP         1
+#define APP_CAMERA_UART_ENABLE          0
 
-#define APP_CON6_FORCE_CAMERA           1
+#define APP_CAMERA_ONLY_BRINGUP         0
+
+#define APP_CON6_FORCE_CAMERA           0
 
 #define APP_CAMERA_UART_BAUD            2000000
 
-/* The current SP0A39 reference table is for SPI 1-bit grayscale with 24 MHz input. */
+/* SP0A39 DVP grayscale mode with 24 MHz input clock. */
 #define APP_SP0A39_MCLK_HZ              24000000U
 #define APP_SP0A39_I2C_ADDR             0x21U
 
@@ -203,7 +205,7 @@
 /* LCD_CAM DVP PCLK sampling edge. 0 = rising, 1 = falling. */
 #define APP_CAMERA_DVP_PCLK_INVERT      0
 
-/* VGA 640x480 grayscale after SPI packet headers are stripped. */
+/* VGA 640x480 grayscale from DVP. */
 #define APP_CAMERA_SENSOR_WIDTH         640U
 #define APP_CAMERA_SENSOR_HEIGHT        480U
 #define APP_CAMERA_FRAME_BYTES          (APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT)
@@ -219,7 +221,7 @@
 #define APP_CAMERA_TASK_STACK_BYTES     12288U
 #define APP_CAMERA_TASK_CORE            1
 
-/* ----- CON6 ST7789T3 LCD ---------------------------------------------------- */
+/* ----- ST7789V3 LCD --------------------------------------------------------- */
 
 #define APP_LCD_H_RES                   240U
 #define APP_LCD_V_RES                   280U
@@ -234,3 +236,4 @@
 #define APP_LCD_LVGL_TASK_STACK_BYTES   8192U
 #define APP_LCD_LVGL_TASK_PRIORITY      2
 #define APP_LCD_LVGL_TASK_CORE          1
+#define APP_LCD_PHOTO_PREVIEW_H         180U

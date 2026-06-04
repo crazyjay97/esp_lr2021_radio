@@ -12,40 +12,34 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "app_config.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
-#include "driver/ledc.h"
+#if APP_CAMERA_UART_ENABLE
 #include "driver/uart.h"
+#endif
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_rom_gpio.h"
 #include "esp_cam_sensor_types.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
 #include "esp_video_ioctl.h"
 #include "linux/videodev2.h"
-#include "soc/gpio_sig_map.h"
-#include "app_config.h"
 #include "bsp.h"
 
 namespace {
 
 constexpr const char *TAG = "camera_video";
 
-constexpr ledc_mode_t kMclkSpeedMode = LEDC_LOW_SPEED_MODE;
-constexpr ledc_timer_t kMclkTimer = LEDC_TIMER_0;
-constexpr ledc_channel_t kMclkChannel = LEDC_CHANNEL_0;
-constexpr ledc_clk_cfg_t kMclkClockSource = LEDC_USE_APB_CLK;
 constexpr TickType_t kPwdnSettleTicks = pdMS_TO_TICKS(1000);
+constexpr TickType_t kResetSettleTicks = pdMS_TO_TICKS(120);
 constexpr int kCaptureBuffers = 2;
 constexpr int kMaxFrameDequeues = 8;
 constexpr int kVideoType = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+#if APP_CAMERA_UART_ENABLE
 constexpr int kUartTxTimeoutTicks = pdMS_TO_TICKS(1000);
-
-void force_spi3_cs_active_high_input()
-{
-    esp_rom_gpio_connect_in_signal(BSP_SP0A39_VSYNC_GPIO, SPI3_CS0_IN_IDX, true);
-}
+#endif
 
 uint32_t sensor_pixformat_to_v4l2(esp_cam_sensor_output_format_t format)
 {
@@ -68,6 +62,7 @@ esp_err_t checked_ioctl(int fd, unsigned long cmd, void *arg, const char *name)
     return ESP_OK;
 }
 
+#if APP_CAMERA_UART_ENABLE
 esp_err_t uart_write_all(const uint8_t *data, size_t len)
 {
     size_t offset = 0;
@@ -89,7 +84,9 @@ esp_err_t uart_write_all(const uint8_t *data, size_t len)
                         TAG, "uart wait tx done");
     return ESP_OK;
 }
+#endif
 
+#if APP_CAMERA_UART_ENABLE
 esp_err_t uart_write_pgm_image(const uint8_t *data,
                                size_t len,
                                uint32_t pixelformat,
@@ -145,6 +142,7 @@ esp_err_t uart_write_pgm_image(const uint8_t *data,
              static_cast<unsigned long>(pixelformat));
     return ESP_ERR_NOT_SUPPORTED;
 }
+#endif
 
 } // namespace
 
@@ -155,13 +153,16 @@ esp_err_t CameraUartStreamer::init()
     }
 
     ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c init");
-    ESP_RETURN_ON_ERROR(configure_camera_pins(), TAG, "camera pins");
+#if APP_CAMERA_UART_ENABLE
     ESP_RETURN_ON_ERROR(init_uart(), TAG, "uart2");
+#endif
 
-    ESP_LOGI(TAG, "releasing SP0A39 PWDN: IO expander P%d low",
+    ESP_LOGI(TAG, "keeping SP0A39 powered down while LCD owns shared GPIOs: IO expander P%d high",
              BSP_SP0A39_PWDN_IOEXP_PIN);
-    ESP_RETURN_ON_ERROR(set_pwdn(false), TAG, "pwdn low");
-    vTaskDelay(kPwdnSettleTicks);
+    esp_err_t pwdn = set_pwdn(true);
+    if (pwdn != ESP_OK) {
+        ESP_LOGW(TAG, "SP0A39 PWDN control unavailable: %s", esp_err_to_name(pwdn));
+    }
 
     initialized_ = true;
     return ESP_OK;
@@ -187,16 +188,21 @@ void CameraUartStreamer::task_entry(void *arg)
 
 void CameraUartStreamer::task()
 {
-    ESP_LOGW(TAG, "SP0A39 one-frame capture via official esp_video SPI device");
-    esp_err_t ret = init_sp0a39_video();
+    uint8_t *frame = nullptr;
+    size_t len = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t pixfmt = 0;
+    esp_err_t ret = capture_frame(&frame, &len, &width, &height, &pixfmt);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_video SP0A39 init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "capture frame failed: %s", esp_err_to_name(ret));
     } else {
-        read_sp0a39_id();
-        ret = capture_and_send_one_frame();
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "capture/send frame failed: %s", esp_err_to_name(ret));
-        }
+        ESP_LOGI(TAG, "captured frame: %lux%lu fourcc=0x%08lx bytes=%u",
+                 static_cast<unsigned long>(width),
+                 static_cast<unsigned long>(height),
+                 static_cast<unsigned long>(pixfmt),
+                 static_cast<unsigned>(len));
+        heap_caps_free(frame);
     }
 
     vTaskDelete(nullptr);
@@ -212,6 +218,10 @@ esp_err_t CameraUartStreamer::configure_camera_pins()
     mask |= 1ULL << BSP_SP0A39_D1_GPIO;
     mask |= 1ULL << BSP_SP0A39_D2_GPIO;
     mask |= 1ULL << BSP_SP0A39_D3_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D4_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D5_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D6_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D7_GPIO;
 
     gpio_config_t input_conf = {};
     input_conf.pin_bit_mask = mask;
@@ -221,12 +231,13 @@ esp_err_t CameraUartStreamer::configure_camera_pins()
     input_conf.intr_type = GPIO_INTR_DISABLE;
 
     ESP_RETURN_ON_ERROR(gpio_config(&input_conf), TAG, "gpio input config");
-    ESP_LOGI(TAG, "camera data/sync pins configured as high-Z inputs");
+    ESP_LOGI(TAG, "camera DVP data/sync pins configured as high-Z inputs");
     return ESP_OK;
 }
 
 esp_err_t CameraUartStreamer::init_uart()
 {
+#if APP_CAMERA_UART_ENABLE
     if (uart_initialized_) {
         return ESP_OK;
     }
@@ -253,11 +264,49 @@ esp_err_t CameraUartStreamer::init_uart()
     ESP_LOGI(TAG, "UART2 ready: %u baud TX GPIO%d RX GPIO%d",
              APP_CAMERA_UART_BAUD, BSP_UART2_TX_GPIO, BSP_UART2_RX_GPIO);
     return ESP_OK;
+#else
+    return ESP_OK;
+#endif
 }
 
 esp_err_t CameraUartStreamer::set_pwdn(bool asserted)
 {
     return bsp_ioexp_set_pin(BSP_SP0A39_PWDN_IOEXP_PIN, asserted);
+}
+
+esp_err_t CameraUartStreamer::reset_sensor()
+{
+    gpio_config_t reset = {};
+    reset.pin_bit_mask = 1ULL << BSP_SP0A39_RESET_GPIO;
+    reset.mode = GPIO_MODE_OUTPUT;
+    reset.pull_up_en = GPIO_PULLUP_DISABLE;
+    reset.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    reset.intr_type = GPIO_INTR_DISABLE;
+    ESP_RETURN_ON_ERROR(gpio_config(&reset), TAG, "camera reset gpio");
+
+    gpio_set_level(BSP_SP0A39_RESET_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level(BSP_SP0A39_RESET_GPIO, 1);
+    vTaskDelay(kResetSettleTicks);
+    return ESP_OK;
+}
+
+esp_err_t CameraUartStreamer::power_down()
+{
+    if (video_initialized_) {
+        esp_err_t deinit = esp_video_deinit_with_flags(ESP_VIDEO_INIT_FLAGS_DVP);
+        if (deinit != ESP_OK) {
+            ESP_LOGW(TAG, "esp_video DVP deinit failed: %s", esp_err_to_name(deinit));
+        }
+        video_initialized_ = false;
+    }
+
+    esp_err_t pwdn = set_pwdn(true);
+    if (pwdn != ESP_OK) {
+        ESP_LOGW(TAG, "SP0A39 PWDN assert unavailable: %s", esp_err_to_name(pwdn));
+    }
+    gpio_reset_pin(BSP_SP0A39_RESET_GPIO);
+    return ESP_OK;
 }
 
 void CameraUartStreamer::read_sp0a39_id()
@@ -307,7 +356,7 @@ void CameraUartStreamer::read_sp0a39_id()
     i2c_master_bus_rm_device(dev);
 }
 
-esp_err_t CameraUartStreamer::init_sp0a39_video()
+esp_err_t CameraUartStreamer::init_sp0a39_dvp_video()
 {
     if (video_initialized_) {
         return ESP_OK;
@@ -318,54 +367,97 @@ esp_err_t CameraUartStreamer::init_sp0a39_video()
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_video_init_spi_config_t spi = {};
-    spi.sccb_config.init_sccb = false;
-    spi.sccb_config.i2c_handle = bus;
-    spi.sccb_config.freq = BSP_I2C0_FREQ_HZ;
-    spi.intf = ESP_CAM_CTLR_SPI_CAM_INTF_SPI;
-    spi.io_mode = ESP_CAM_CTLR_SPI_CAM_IO_MODE_1BIT;
-    spi.spi_port = SPI3_HOST;
-    spi.spi_cs_pin = BSP_SP0A39_VSYNC_GPIO;
-    spi.spi_sclk_pin = BSP_SP0A39_PCLK_GPIO;
-    spi.spi_data0_io_pin = BSP_SP0A39_D0_GPIO;
-    spi.spi_data1_io_pin = GPIO_NUM_NC;
-    spi.spi_data2_io_pin = GPIO_NUM_NC;
-    spi.spi_data3_io_pin = GPIO_NUM_NC;
-    spi.reset_pin = GPIO_NUM_NC;
-    spi.pwdn_pin = GPIO_NUM_NC;
-    spi.xclk_source = ESP_CAM_SENSOR_XCLK_LEDC;
-    spi.xclk_freq = APP_SP0A39_MCLK_HZ;
-    spi.xclk_pin = BSP_SP0A39_MCLK_GPIO;
-#if CONFIG_CAMERA_XCLK_USE_LEDC
-    spi.xclk_ledc_cfg.timer = kMclkTimer;
-    spi.xclk_ledc_cfg.clk_cfg = kMclkClockSource;
-    spi.xclk_ledc_cfg.channel = kMclkChannel;
-#endif
+    esp_video_init_dvp_config_t dvp = {};
+    dvp.sccb_config.init_sccb = false;
+    dvp.sccb_config.i2c_handle = bus;
+    dvp.sccb_config.freq = BSP_I2C0_FREQ_HZ;
+    dvp.reset_pin = GPIO_NUM_NC;
+    dvp.pwdn_pin = GPIO_NUM_NC;
+    dvp.dvp_pin.data_width = CAM_CTLR_DATA_WIDTH_8;
+    dvp.dvp_pin.data_io[0] = BSP_SP0A39_D0_GPIO;
+    dvp.dvp_pin.data_io[1] = BSP_SP0A39_D1_GPIO;
+    dvp.dvp_pin.data_io[2] = BSP_SP0A39_D2_GPIO;
+    dvp.dvp_pin.data_io[3] = BSP_SP0A39_D3_GPIO;
+    dvp.dvp_pin.data_io[4] = BSP_SP0A39_D4_GPIO;
+    dvp.dvp_pin.data_io[5] = BSP_SP0A39_D5_GPIO;
+    dvp.dvp_pin.data_io[6] = BSP_SP0A39_D6_GPIO;
+    dvp.dvp_pin.data_io[7] = BSP_SP0A39_D7_GPIO;
+    dvp.dvp_pin.vsync_io = BSP_SP0A39_VSYNC_GPIO;
+    dvp.dvp_pin.de_io = BSP_SP0A39_HSYNC_GPIO;
+    dvp.dvp_pin.pclk_io = BSP_SP0A39_PCLK_GPIO;
+    dvp.dvp_pin.xclk_io = BSP_SP0A39_MCLK_GPIO;
+    dvp.xclk_freq = APP_SP0A39_MCLK_HZ;
 
     esp_video_init_config_t config = {};
-    config.spi = &spi;
+    config.dvp = &dvp;
 
-    ESP_LOGI(TAG, "esp_video SPI_1BIT init: dev=%s MCLK GPIO%d DATA0 GPIO%d DCLK GPIO%d CS/VSYNC GPIO%d",
-             ESP_VIDEO_SPI_DEVICE_NAME,
+    ESP_LOGI(TAG, "esp_video DVP init: dev=%s MCLK=%d PCLK=%d VSYNC=%d HSYNC=%d D0..D7=%d,%d,%d,%d,%d,%d,%d,%d",
+             ESP_VIDEO_DVP_DEVICE_NAME,
              BSP_SP0A39_MCLK_GPIO,
-             BSP_SP0A39_D0_GPIO,
              BSP_SP0A39_PCLK_GPIO,
-             BSP_SP0A39_VSYNC_GPIO);
-    ESP_RETURN_ON_ERROR(esp_video_init_with_flags(&config, ESP_VIDEO_INIT_FLAGS_SPI),
-                        TAG, "esp_video_init SPI");
-    force_spi3_cs_active_high_input();
+             BSP_SP0A39_VSYNC_GPIO,
+             BSP_SP0A39_HSYNC_GPIO,
+             BSP_SP0A39_D0_GPIO,
+             BSP_SP0A39_D1_GPIO,
+             BSP_SP0A39_D2_GPIO,
+             BSP_SP0A39_D3_GPIO,
+             BSP_SP0A39_D4_GPIO,
+             BSP_SP0A39_D5_GPIO,
+             BSP_SP0A39_D6_GPIO,
+             BSP_SP0A39_D7_GPIO);
+    ESP_RETURN_ON_ERROR(esp_video_init_with_flags(&config, ESP_VIDEO_INIT_FLAGS_DVP),
+                        TAG, "esp_video_init DVP");
 
     video_initialized_ = true;
-    ESP_LOGI(TAG, "esp_video SP0A39 SPI_1BIT device initialized");
+    ESP_LOGI(TAG, "esp_video SP0A39 DVP device initialized");
 
     return ESP_OK;
 }
 
-esp_err_t CameraUartStreamer::capture_and_send_one_frame()
+esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
+                                            size_t *out_len,
+                                            uint32_t *out_width,
+                                            uint32_t *out_height,
+                                            uint32_t *out_pixelformat)
 {
-    int fd = open(ESP_VIDEO_SPI_DEVICE_NAME, O_RDONLY);
+    ESP_RETURN_ON_FALSE(out_data && out_len && out_width && out_height && out_pixelformat,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid capture output");
+    *out_data = nullptr;
+    *out_len = 0;
+    *out_width = 0;
+    *out_height = 0;
+    *out_pixelformat = 0;
+
+    ESP_RETURN_ON_ERROR(init(), TAG, "init");
+    ESP_RETURN_ON_ERROR(configure_camera_pins(), TAG, "camera pins");
+    ESP_LOGI(TAG, "releasing SP0A39 PWDN: IO expander P%d low",
+             BSP_SP0A39_PWDN_IOEXP_PIN);
+    esp_err_t pwdn = set_pwdn(false);
+    if (pwdn != ESP_OK) {
+        ESP_LOGW(TAG, "SP0A39 PWDN release unavailable: %s", esp_err_to_name(pwdn));
+    }
+    vTaskDelay(kPwdnSettleTicks);
+    ESP_RETURN_ON_ERROR(reset_sensor(), TAG, "camera reset");
+    ESP_RETURN_ON_ERROR(init_sp0a39_dvp_video(), TAG, "dvp init");
+    read_sp0a39_id();
+
+    esp_err_t ret = capture_one_frame(out_data, out_len, out_width, out_height, out_pixelformat);
+    esp_err_t pwr = power_down();
+    if (ret == ESP_OK && pwr != ESP_OK) {
+        ret = pwr;
+    }
+    return ret;
+}
+
+esp_err_t CameraUartStreamer::capture_one_frame(uint8_t **out_data,
+                                                size_t *out_len,
+                                                uint32_t *out_width,
+                                                uint32_t *out_height,
+                                                uint32_t *out_pixelformat)
+{
+    int fd = open(ESP_VIDEO_DVP_DEVICE_NAME, O_RDONLY);
     ESP_RETURN_ON_FALSE(fd >= 0, ESP_FAIL, TAG, "open %s failed errno=%d",
-                        ESP_VIDEO_SPI_DEVICE_NAME, errno);
+                        ESP_VIDEO_DVP_DEVICE_NAME, errno);
 
     esp_err_t ret = ESP_OK;
     uint8_t *buffers[kCaptureBuffers] = {};
@@ -424,17 +516,11 @@ esp_err_t CameraUartStreamer::capture_and_send_one_frame()
                       cleanup, TAG, "unsupported sensor pixel format=%d",
                       sensor_format.format);
 
-    if (sensor_format.spi_info.frame_info) {
-        format.fmt.pix.sizeimage = sensor_format.spi_info.frame_info->frame_size;
-        ESP_LOGI(TAG,
-                 "sensor format: %s %ux%u frame_size=%lu line_size=%lu cs_active_high=%u",
-                 sensor_format.name ? sensor_format.name : "(unnamed)",
-                 sensor_format.width,
-                 sensor_format.height,
-                 static_cast<unsigned long>(sensor_format.spi_info.frame_info->frame_size),
-                 static_cast<unsigned long>(sensor_format.spi_info.frame_info->line_size),
-                 static_cast<unsigned>(sensor_format.spi_info.frame_info->high_level_active));
-    }
+    format.fmt.pix.sizeimage = format.fmt.pix.width * format.fmt.pix.height;
+    ESP_LOGI(TAG, "sensor format: %s %ux%u",
+             sensor_format.name ? sensor_format.name : "(unnamed)",
+             sensor_format.width,
+             sensor_format.height);
 
     for (uint32_t index = 0; index < 8; ++index) {
         struct v4l2_fmtdesc fmtdesc = {};
@@ -519,13 +605,10 @@ esp_err_t CameraUartStreamer::capture_and_send_one_frame()
     ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_STREAMON, &stream_type, "VIDIOC_STREAMON"),
                       cleanup, TAG, "stream on");
     streaming = true;
-    force_spi3_cs_active_high_input();
-
     for (int attempt = 0; attempt < kMaxFrameDequeues; ++attempt) {
         frame = {};
         frame.type = kVideoType;
         frame.memory = V4L2_MEMORY_MMAP;
-        force_spi3_cs_active_high_input();
         ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_DQBUF, &frame, "VIDIOC_DQBUF"),
                           cleanup, TAG, "dequeue frame");
 
@@ -547,26 +630,34 @@ esp_err_t CameraUartStreamer::capture_and_send_one_frame()
         ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_QBUF, &frame, "VIDIOC_QBUF skip"),
                           cleanup, TAG, "return skipped buffer");
         frame = {};
-        force_spi3_cs_active_high_input();
         vTaskDelay(1);
     }
     ESP_GOTO_ON_FALSE(frame.bytesused > 0 && (frame.flags & V4L2_BUF_FLAG_DONE),
                       ESP_ERR_INVALID_SIZE, cleanup, TAG,
                       "no valid camera frame after %d dequeues", kMaxFrameDequeues);
 
-    ESP_GOTO_ON_ERROR(uart_write_pgm_image(buffers[frame.index],
-                                           frame.bytesused,
-                                           format.fmt.pix.pixelformat,
-                                           format.fmt.pix.width,
-                                           format.fmt.pix.height),
-                      cleanup, TAG, "write UART PGM frame");
-    ESP_LOGI(TAG, "UART frame output complete: %lu bytes",
+    {
+        uint8_t *copy = static_cast<uint8_t *>(heap_caps_malloc(frame.bytesused,
+                                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!copy) {
+            copy = static_cast<uint8_t *>(heap_caps_malloc(frame.bytesused, MALLOC_CAP_8BIT));
+        }
+        ESP_GOTO_ON_FALSE(copy, ESP_ERR_NO_MEM, cleanup, TAG,
+                          "no memory for frame copy: %lu bytes",
+                          static_cast<unsigned long>(frame.bytesused));
+        memcpy(copy, buffers[frame.index], frame.bytesused);
+        *out_data = copy;
+        *out_len = frame.bytesused;
+        *out_width = format.fmt.pix.width;
+        *out_height = format.fmt.pix.height;
+        *out_pixelformat = format.fmt.pix.pixelformat;
+    }
+    ESP_LOGI(TAG, "DVP frame copied: %lu bytes",
              static_cast<unsigned long>(frame.bytesused));
 
     ESP_GOTO_ON_ERROR(checked_ioctl(fd, VIDIOC_QBUF, &frame, "VIDIOC_QBUF return"),
                       cleanup, TAG, "return buffer");
     frame = {};
-    force_spi3_cs_active_high_input();
 
 cleanup:
     if (streaming) {
@@ -581,5 +672,13 @@ cleanup:
         }
     }
     close(fd);
+    if (ret != ESP_OK && *out_data) {
+        heap_caps_free(*out_data);
+        *out_data = nullptr;
+        *out_len = 0;
+        *out_width = 0;
+        *out_height = 0;
+        *out_pixelformat = 0;
+    }
     return ret;
 }

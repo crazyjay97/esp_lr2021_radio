@@ -24,64 +24,48 @@
 #define BSP_UART2_RX_GPIO           GPIO_NUM_48
 
 /* ---------- I2C0 (ES8311 codec, TCA9554A GPIO expander, touch panel) ----- */
-#define BSP_I2C0_SCL_GPIO           GPIO_NUM_45
-#define BSP_I2C0_SDA_GPIO           GPIO_NUM_46
+#define BSP_I2C0_SCL_GPIO           GPIO_NUM_18
+#define BSP_I2C0_SDA_GPIO           GPIO_NUM_16
 #define BSP_I2C0_FREQ_HZ            (400 * 1000)
 
 #define BSP_I2C_ADDR_ES8311         0x18   /* Audio codec                     */
-#define BSP_I2C_ADDR_IO_EXPANDER    0x38   /* TCA9554A, confirmed by scan     */
+#define BSP_I2C_ADDR_IO_EXPANDER    0x20   /* TCA9554A base address           */
 /* Touch panel I2C address depends on the controller fitted on the FPC. */
 
 /* ---------- I2S0 (ES8311 codec audio path) ------------------------------- */
-#define BSP_I2S0_MCLK_GPIO          GPIO_NUM_18
+#define BSP_I2S0_MCLK_GPIO          GPIO_NUM_46
 #define BSP_I2S0_BCLK_GPIO          GPIO_NUM_1
 #define BSP_I2S0_LRCK_GPIO          GPIO_NUM_15
-#define BSP_I2S0_DIN_GPIO           GPIO_NUM_16   /* ESP -> codec (SDIN)     */
-#define BSP_I2S0_DOUT_GPIO          GPIO_NUM_14   /* codec -> ESP (SDOUT)    */
+#define BSP_I2S0_DIN_GPIO           GPIO_NUM_14   /* ESP -> codec (SDIN)     */
+#define BSP_I2S0_DOUT_GPIO          GPIO_NUM_45   /* codec -> ESP (SDOUT)    */
 
 /* Audio PA (CST8302A) mute/enable is on the GPIO expander P6 (active high). */
 #define BSP_IO_EXP_PA_MUTE_PIN      6
 
-/* ---------- QSPI LCD (dual-display capable, 0.5 mm 20 pin FPC) ----------- */
-#define BSP_LCD_QSPI_CLK_GPIO       GPIO_NUM_12
-#define BSP_LCD_QSPI_D0_GPIO        GPIO_NUM_13
-#define BSP_LCD_QSPI_D1_GPIO        GPIO_NUM_2
-#define BSP_LCD_QSPI_D2_GPIO        GPIO_NUM_9
-#define BSP_LCD_QSPI_D3_GPIO        GPIO_NUM_4
-#define BSP_LCD_CS1_GPIO            GPIO_NUM_10   /* primary display CS      */
-#define BSP_LCD_CS2_GPIO            GPIO_NUM_8    /* secondary display CS    */
-#define BSP_LCD_TE_GPIO             GPIO_NUM_6    /* tearing effect          */
-#define BSP_LCD_BL_GPIO             GPIO_NUM_7    /* backlight enable        */
+/* ---------- ST7789V3 LCD on V02 20-pin FPC ------------------------------- */
+/* LCD pins share several ESP GPIOs
+ * with the 26-pin DVP camera FPC, so the BSP powers the camera down before
+ * driving the LCD SPI bus. */
+#define BSP_LCD_SPI_SCLK_GPIO       GPIO_NUM_44   /* LCD_CLK, shared with D5 */
+#define BSP_LCD_SPI_MOSI_GPIO       GPIO_NUM_48   /* LCD_D0, shared with D6  */
+#define BSP_LCD_SPI_DC_GPIO         GPIO_NUM_43   /* LCD_D1, used as D/C     */
+#define BSP_LCD_SPI_CS_GPIO         GPIO_NUM_47   /* LCD_CS1, shared with D7 */
+#define BSP_LCD_TE_GPIO             GPIO_NUM_4    /* LCD_TE, shared with D3  */
+#define BSP_LCD_TOUCH_INT_GPIO      GPIO_NUM_12
 
-/* LCD reset is on the GPIO expander P3 (active low). */
 #define BSP_IO_EXP_LCD_RST_PIN      3
-
-/* ST7789T3 4-wire SPI panel on SCH_Schematic1_LCD转接板.pdf.
- *
- * The adapter reuses CON6 nets differently from the original LCD naming:
- *   LCD_TE/GPIO6  -> panel RST
- *   LCD_LED/GPIO7 -> panel D/C
- *   TP_RST/GPIO3  -> backlight LED control
- */
-#define BSP_LCD_SPI_SCLK_GPIO       BSP_LCD_QSPI_CLK_GPIO
-#define BSP_LCD_SPI_MOSI_GPIO       BSP_LCD_QSPI_D0_GPIO
-#define BSP_LCD_SPI_DC_GPIO         BSP_LCD_BL_GPIO
-#define BSP_LCD_SPI_CS_GPIO         BSP_LCD_CS1_GPIO
-#define BSP_LCD_ST7789_RST_GPIO     BSP_LCD_TE_GPIO
-#define BSP_LCD_ST7789_BL_GPIO      BSP_TP_RST_GPIO
-#define BSP_LCD_TOUCH_INT_GPIO      BSP_LCD_QSPI_D1_GPIO
-#define BSP_LCD_TOUCH_RST_GPIO      BSP_LCD_CS2_GPIO
+#define BSP_IO_EXP_TP_RST_PIN       4
+#define BSP_IO_EXP_LCD_BL_PIN       5
 
 #define BSP_I2C_ADDR_TOUCH_CST816   0x15
 #define BSP_I2C_ADDR_TOUCH_CST816_ALT 0x2A
+#define BSP_I2C_ADDR_TOUCH_FT6206   0x38
 
 /* ---------- Capacitive touch panel (shares I2C0) ------------------------- */
-#define BSP_TP_INT_GPIO             GPIO_NUM_11
-#define BSP_TP_RST_GPIO             GPIO_NUM_3
+#define BSP_TP_INT_GPIO             BSP_LCD_TOUCH_INT_GPIO
 
-/* ---------- SP0A39 SPI camera on CON6 ------------------------------------ */
-/* 1-bit sensor data path using VSYNC as SPI CS and PCLK as SPI DCLK.
- * PWDN is active high, controlled via IO expander P7. */
+/* ---------- SP0A39 DVP camera on V02 26-pin FPC -------------------------- */
+/* PWDN is active high, controlled via IO expander P7. */
 #define BSP_SP0A39_VSYNC_GPIO       GPIO_NUM_7
 #define BSP_SP0A39_HSYNC_GPIO       GPIO_NUM_6
 #define BSP_SP0A39_MCLK_GPIO        GPIO_NUM_3
@@ -90,6 +74,11 @@
 #define BSP_SP0A39_D1_GPIO          GPIO_NUM_9
 #define BSP_SP0A39_D2_GPIO          GPIO_NUM_13
 #define BSP_SP0A39_D3_GPIO          GPIO_NUM_4
+#define BSP_SP0A39_D4_GPIO          GPIO_NUM_43
+#define BSP_SP0A39_D5_GPIO          GPIO_NUM_44
+#define BSP_SP0A39_D6_GPIO          GPIO_NUM_48
+#define BSP_SP0A39_D7_GPIO          GPIO_NUM_47
+#define BSP_SP0A39_RESET_GPIO       GPIO_NUM_10
 #define BSP_SP0A39_PWDN_IOEXP_PIN   7
 #define BSP_I2C_ADDR_SP0A39         0x21
 

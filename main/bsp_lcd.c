@@ -2,8 +2,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -29,9 +31,16 @@ static esp_lcd_panel_io_handle_t s_lcd_io;
 static esp_lcd_panel_handle_t s_lcd_panel;
 static bool s_lcd_bus_ready;
 static bool s_lvgl_started;
+static bool s_lcd_suspended;
 static i2c_master_dev_handle_t s_touch;
 static uint8_t s_touch_addr;
 static lv_disp_drv_t *s_lvgl_disp_drv;
+static SemaphoreHandle_t s_lvgl_lock;
+static lv_obj_t *s_camera_status_label;
+static lv_obj_t *s_camera_canvas;
+static lv_color_t *s_camera_canvas_buf;
+static bsp_lcd_capture_cb_t s_capture_cb;
+static void *s_capture_user;
 
 typedef struct {
     uint8_t cmd;
@@ -104,18 +113,15 @@ static esp_err_t lcd_send_vendor_init(void)
 
 static esp_err_t lcd_reset_gpio(void)
 {
-    gpio_config_t reset = {
-        .pin_bit_mask = 1ULL << BSP_LCD_ST7789_RST_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&reset), TAG, "reset gpio");
-
-    gpio_set_level(BSP_LCD_ST7789_RST_GPIO, 0);
+    esp_err_t err = bsp_ioexp_set_pin(BSP_IO_EXP_LCD_RST_PIN, false);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "lcd reset via IO expander unavailable: %s",
+                 esp_err_to_name(err));
+        return ESP_OK;
+    }
     vTaskDelay(pdMS_TO_TICKS(20));
-    gpio_set_level(BSP_LCD_ST7789_RST_GPIO, 1);
+    ESP_RETURN_ON_ERROR(bsp_ioexp_set_pin(BSP_IO_EXP_LCD_RST_PIN, true),
+                        TAG, "lcd reset high");
     vTaskDelay(pdMS_TO_TICKS(120));
     return ESP_OK;
 }
@@ -129,6 +135,10 @@ static void lvgl_tick_cb(void *arg)
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
                           lv_color_t *color_map)
 {
+    if (s_lcd_suspended || !s_lcd_panel) {
+        lv_disp_flush_ready(drv);
+        return;
+    }
     esp_err_t err = esp_lcd_panel_draw_bitmap(s_lcd_panel, area->x1, area->y1,
                                               area->x2 + 1, area->y2 + 1,
                                               color_map);
@@ -153,15 +163,6 @@ static bool lcd_color_trans_done_cb(esp_lcd_panel_io_handle_t panel_io,
 
 static esp_err_t touch_reset(void)
 {
-    gpio_config_t rst = {
-        .pin_bit_mask = 1ULL << BSP_LCD_TOUCH_RST_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&rst), TAG, "touch rst gpio");
-
     gpio_config_t intr = {
         .pin_bit_mask = 1ULL << BSP_LCD_TOUCH_INT_GPIO,
         .mode = GPIO_MODE_INPUT,
@@ -171,10 +172,16 @@ static esp_err_t touch_reset(void)
     };
     ESP_RETURN_ON_ERROR(gpio_config(&intr), TAG, "touch int gpio");
 
-    gpio_set_level(BSP_LCD_TOUCH_RST_GPIO, 0);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    gpio_set_level(BSP_LCD_TOUCH_RST_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(80));
+    esp_err_t err = bsp_ioexp_set_pin(BSP_IO_EXP_TP_RST_PIN, false);
+    if (err == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        ESP_RETURN_ON_ERROR(bsp_ioexp_set_pin(BSP_IO_EXP_TP_RST_PIN, true),
+                            TAG, "touch reset high");
+        vTaskDelay(pdMS_TO_TICKS(80));
+    } else {
+        ESP_LOGW(TAG, "touch reset via IO expander unavailable: %s",
+                 esp_err_to_name(err));
+    }
     return ESP_OK;
 }
 
@@ -195,6 +202,7 @@ static esp_err_t touch_attach(void)
     }
 
     static const uint8_t candidates[] = {
+        BSP_I2C_ADDR_TOUCH_FT6206,
         BSP_I2C_ADDR_TOUCH_CST816,
         BSP_I2C_ADDR_TOUCH_CST816_ALT,
     };
@@ -215,7 +223,7 @@ static esp_err_t touch_attach(void)
         ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus, &dev_cfg, &s_touch),
                             TAG, "touch add");
         s_touch_addr = addr;
-        ESP_LOGI(TAG, "touch controller selected at 0x%02X (CST816-compatible)",
+        ESP_LOGI(TAG, "touch controller selected at 0x%02X (FT6206/CST816-compatible)",
                  s_touch_addr);
         return ESP_OK;
     }
@@ -305,11 +313,70 @@ static void lvgl_create_demo_ui(void)
     lv_obj_align(status, LV_ALIGN_BOTTOM_MID, 0, -18);
 }
 
+static void camera_btn_event_cb(lv_event_t *event)
+{
+    (void)event;
+    if (s_capture_cb) {
+        s_capture_cb(s_capture_user);
+    }
+}
+
+static esp_err_t lvgl_create_camera_ui(void)
+{
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_clean(scr);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x101820), 0);
+
+    s_camera_status_label = lv_label_create(scr);
+    lv_label_set_text(s_camera_status_label, s_touch ? "Touch capture to take a photo" : "Touch not found");
+    lv_obj_set_style_text_color(s_camera_status_label, lv_color_hex(0xd9e6f2), 0);
+    lv_obj_set_width(s_camera_status_label, APP_LCD_H_RES - 16);
+    lv_label_set_long_mode(s_camera_status_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_camera_status_label, LV_ALIGN_TOP_MID, 0, 10);
+
+    const size_t canvas_pixels = APP_LCD_H_RES * APP_LCD_PHOTO_PREVIEW_H;
+    if (!s_camera_canvas_buf) {
+        s_camera_canvas_buf = heap_caps_malloc(canvas_pixels * sizeof(lv_color_t),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_camera_canvas_buf) {
+            s_camera_canvas_buf = heap_caps_malloc(canvas_pixels * sizeof(lv_color_t),
+                                                   MALLOC_CAP_8BIT);
+        }
+        ESP_RETURN_ON_FALSE(s_camera_canvas_buf, ESP_ERR_NO_MEM, TAG,
+                            "camera canvas alloc");
+    }
+    for (size_t i = 0; i < canvas_pixels; ++i) {
+        s_camera_canvas_buf[i] = lv_color_hex(0x18232d);
+    }
+
+    s_camera_canvas = lv_canvas_create(scr);
+    lv_canvas_set_buffer(s_camera_canvas, s_camera_canvas_buf,
+                         APP_LCD_H_RES, APP_LCD_PHOTO_PREVIEW_H,
+                         LV_IMG_CF_TRUE_COLOR);
+    lv_obj_align(s_camera_canvas, LV_ALIGN_TOP_MID, 0, 36);
+
+    lv_obj_t *btn = lv_btn_create(scr);
+    lv_obj_set_size(btn, 156, 42);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_add_event_cb(btn, camera_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *btn_label = lv_label_create(btn);
+    lv_label_set_text(btn_label, "Capture");
+    lv_obj_center(btn_label);
+
+    return ESP_OK;
+}
+
 static void lvgl_task(void *arg)
 {
     (void)arg;
     while (true) {
+        if (s_lvgl_lock) {
+            xSemaphoreTakeRecursive(s_lvgl_lock, portMAX_DELAY);
+        }
         lv_timer_handler();
+        if (s_lvgl_lock) {
+            xSemaphoreGiveRecursive(s_lvgl_lock);
+        }
         vTaskDelay(pdMS_TO_TICKS(APP_LCD_LVGL_TASK_DELAY_MS));
     }
 }
@@ -320,15 +387,12 @@ esp_err_t bsp_lcd_init(void)
         return ESP_OK;
     }
 
-    gpio_config_t backlight = {
-        .pin_bit_mask = 1ULL << BSP_LCD_ST7789_BL_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&backlight), TAG, "backlight gpio");
-    gpio_set_level(BSP_LCD_ST7789_BL_GPIO, 0);
+    ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c");
+    esp_err_t bl_err = bsp_ioexp_set_pin(BSP_IO_EXP_LCD_BL_PIN, false);
+    if (bl_err != ESP_OK) {
+        ESP_LOGW(TAG, "backlight off via IO expander unavailable: %s",
+                 esp_err_to_name(bl_err));
+    }
 
     if (!s_lcd_bus_ready) {
         spi_bus_config_t bus_cfg = {
@@ -368,7 +432,6 @@ esp_err_t bsp_lcd_init(void)
                         TAG, "st7789 panel");
 
     ESP_RETURN_ON_ERROR(lcd_reset_gpio(), TAG, "lcd hw reset");
-    gpio_set_level(BSP_LCD_ST7789_BL_GPIO, 1);
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_lcd_panel), TAG, "lcd sw reset");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_lcd_panel), TAG, "lcd init");
     vTaskDelay(pdMS_TO_TICKS(380));
@@ -377,11 +440,54 @@ esp_err_t bsp_lcd_init(void)
                                               APP_LCD_Y_GAP),
                         TAG, "lcd gap");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_lcd_panel, true), TAG, "lcd on");
+    bl_err = bsp_ioexp_set_pin(BSP_IO_EXP_LCD_BL_PIN, true);
+    if (bl_err != ESP_OK) {
+        ESP_LOGW(TAG, "backlight on via IO expander unavailable: %s",
+                 esp_err_to_name(bl_err));
+    }
 
-    ESP_LOGI(TAG, "ST7789T3 LCD ready: %ux%u, SPI3 sclk=%d mosi=%d dc=%d cs=%d bl=%d rst=%d",
+    ESP_LOGI(TAG, "ST7789V3 LCD ready: %ux%u, SPI3 sclk=%d mosi=%d dc=%d cs=%d bl=P%d rst=P%d",
              APP_LCD_H_RES, APP_LCD_V_RES, BSP_LCD_SPI_SCLK_GPIO,
              BSP_LCD_SPI_MOSI_GPIO, BSP_LCD_SPI_DC_GPIO, BSP_LCD_SPI_CS_GPIO,
-             BSP_LCD_ST7789_BL_GPIO, BSP_LCD_ST7789_RST_GPIO);
+             BSP_IO_EXP_LCD_BL_PIN, BSP_IO_EXP_LCD_RST_PIN);
+    return ESP_OK;
+}
+
+esp_err_t bsp_lcd_release_for_camera(void)
+{
+    s_lcd_suspended = true;
+    vTaskDelay(pdMS_TO_TICKS(40));
+
+    if (s_lcd_panel) {
+        esp_lcd_panel_disp_on_off(s_lcd_panel, false);
+        esp_lcd_panel_del(s_lcd_panel);
+        s_lcd_panel = NULL;
+    }
+    if (s_lcd_io) {
+        esp_lcd_panel_io_del(s_lcd_io);
+        s_lcd_io = NULL;
+    }
+    if (s_lcd_bus_ready) {
+        esp_err_t err = spi_bus_free(BSP_LCD_SPI_HOST);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "spi bus free failed: %s", esp_err_to_name(err));
+        } else {
+            s_lcd_bus_ready = false;
+        }
+    }
+    bsp_ioexp_set_pin(BSP_IO_EXP_LCD_BL_PIN, false);
+    return ESP_OK;
+}
+
+esp_err_t bsp_lcd_reinit_after_camera(void)
+{
+    ESP_RETURN_ON_ERROR(bsp_lcd_init(), TAG, "lcd reinit");
+    s_lcd_suspended = false;
+    if (s_lvgl_lock) {
+        xSemaphoreTakeRecursive(s_lvgl_lock, portMAX_DELAY);
+        lv_obj_invalidate(lv_scr_act());
+        xSemaphoreGiveRecursive(s_lvgl_lock);
+    }
     return ESP_OK;
 }
 
@@ -434,6 +540,11 @@ esp_err_t bsp_lcd_start_lvgl_demo(void)
     }
     if (!s_lcd_panel) {
         ESP_RETURN_ON_ERROR(bsp_lcd_init(), TAG, "lcd init");
+    }
+
+    if (!s_lvgl_lock) {
+        s_lvgl_lock = xSemaphoreCreateRecursiveMutex();
+        ESP_RETURN_ON_FALSE(s_lvgl_lock, ESP_ERR_NO_MEM, TAG, "lvgl lock");
     }
 
     lv_init();
@@ -496,5 +607,129 @@ esp_err_t bsp_lcd_start_lvgl_demo(void)
 
     s_lvgl_started = true;
     ESP_LOGI(TAG, "LVGL demo started%s", s_touch ? " with touch" : "");
+    return ESP_OK;
+}
+
+esp_err_t bsp_lcd_start_camera_ui(bsp_lcd_capture_cb_t cb, void *user)
+{
+    if (s_lvgl_started) {
+        s_capture_cb = cb;
+        s_capture_user = user;
+        if (s_lvgl_lock) {
+            xSemaphoreTakeRecursive(s_lvgl_lock, portMAX_DELAY);
+            esp_err_t err = lvgl_create_camera_ui();
+            xSemaphoreGiveRecursive(s_lvgl_lock);
+            return err;
+        }
+        return ESP_OK;
+    }
+    if (!s_lcd_panel) {
+        ESP_RETURN_ON_ERROR(bsp_lcd_init(), TAG, "lcd init");
+    }
+
+    if (!s_lvgl_lock) {
+        s_lvgl_lock = xSemaphoreCreateRecursiveMutex();
+        ESP_RETURN_ON_FALSE(s_lvgl_lock, ESP_ERR_NO_MEM, TAG, "lvgl lock");
+    }
+
+    lv_init();
+
+    const size_t pixels = APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS;
+    lv_color_t *buf1 = heap_caps_malloc(pixels * sizeof(lv_color_t),
+                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    lv_color_t *buf2 = heap_caps_malloc(pixels * sizeof(lv_color_t),
+                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (!buf1 || !buf2) {
+        heap_caps_free(buf1);
+        heap_caps_free(buf2);
+        return ESP_ERR_NO_MEM;
+    }
+
+    static lv_disp_draw_buf_t draw_buf;
+    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, pixels);
+
+    static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.hor_res = APP_LCD_H_RES;
+    disp_drv.ver_res = APP_LCD_V_RES;
+    disp_drv.flush_cb = lvgl_flush_cb;
+    disp_drv.draw_buf = &draw_buf;
+    s_lvgl_disp_drv = &disp_drv;
+    lv_disp_drv_register(&disp_drv);
+
+    esp_err_t touch_err = touch_attach();
+    if (touch_err == ESP_OK) {
+        static lv_indev_drv_t indev_drv;
+        lv_indev_drv_init(&indev_drv);
+        indev_drv.type = LV_INDEV_TYPE_POINTER;
+        indev_drv.read_cb = lvgl_touch_read_cb;
+        lv_indev_drv_register(&indev_drv);
+    }
+
+    s_capture_cb = cb;
+    s_capture_user = user;
+    ESP_RETURN_ON_ERROR(lvgl_create_camera_ui(), TAG, "camera ui");
+
+    const esp_timer_create_args_t tick_args = {
+        .callback = lvgl_tick_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "lvgl_tick",
+        .skip_unhandled_events = true,
+    };
+    esp_timer_handle_t tick_timer = NULL;
+    ESP_RETURN_ON_ERROR(esp_timer_create(&tick_args, &tick_timer), TAG,
+                        "lvgl tick create");
+    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(tick_timer,
+                                                 APP_LCD_LVGL_TICK_MS * 1000U),
+                        TAG, "lvgl tick start");
+
+    BaseType_t ok = xTaskCreatePinnedToCore(lvgl_task, "lvgl",
+                                            APP_LCD_LVGL_TASK_STACK_BYTES, NULL,
+                                            APP_LCD_LVGL_TASK_PRIORITY, NULL,
+                                            APP_LCD_LVGL_TASK_CORE);
+    if (ok != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_lvgl_started = true;
+    ESP_LOGI(TAG, "camera LVGL UI started%s", s_touch ? " with touch" : "");
+    return ESP_OK;
+}
+
+esp_err_t bsp_lcd_set_camera_status(const char *text)
+{
+    if (!s_lvgl_started || !s_camera_status_label || !text) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTakeRecursive(s_lvgl_lock, portMAX_DELAY);
+    lv_label_set_text(s_camera_status_label, text);
+    lv_obj_invalidate(s_camera_status_label);
+    xSemaphoreGiveRecursive(s_lvgl_lock);
+    return ESP_OK;
+}
+
+esp_err_t bsp_lcd_show_gray_photo(const uint8_t *gray,
+                                  uint32_t width,
+                                  uint32_t height)
+{
+    ESP_RETURN_ON_FALSE(gray && width && height, ESP_ERR_INVALID_ARG, TAG,
+                        "invalid gray frame");
+    ESP_RETURN_ON_FALSE(s_lvgl_started && s_camera_canvas && s_camera_canvas_buf,
+                        ESP_ERR_INVALID_STATE, TAG, "camera canvas not ready");
+
+    xSemaphoreTakeRecursive(s_lvgl_lock, portMAX_DELAY);
+    for (uint32_t y = 0; y < APP_LCD_PHOTO_PREVIEW_H; ++y) {
+        uint32_t src_y = (y * height) / APP_LCD_PHOTO_PREVIEW_H;
+        const uint8_t *src = gray + src_y * width;
+        lv_color_t *dst = s_camera_canvas_buf + y * APP_LCD_H_RES;
+        for (uint32_t x = 0; x < APP_LCD_H_RES; ++x) {
+            uint32_t src_x = (x * width) / APP_LCD_H_RES;
+            uint8_t v = src[src_x];
+            dst[x] = lv_color_make(v, v, v);
+        }
+    }
+    lv_obj_invalidate(s_camera_canvas);
+    xSemaphoreGiveRecursive(s_lvgl_lock);
     return ESP_OK;
 }

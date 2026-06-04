@@ -37,10 +37,19 @@ esp_err_t bsp_con6_detect(bsp_con6_peripheral_t *out_peripheral);
  * P6 = PA enable. */
 esp_err_t bsp_ioexp_set_pin(uint8_t pin, bool level);
 
-/* ---------- LCD (ST7789T3 on CON6 4-wire SPI) --------------------------- */
+/* ---------- LCD (ST7789V3 on V02 20-pin FPC) ---------------------------- */
+typedef void (*bsp_lcd_capture_cb_t)(void *user);
+
 esp_err_t bsp_lcd_init(void);
+esp_err_t bsp_lcd_release_for_camera(void);
+esp_err_t bsp_lcd_reinit_after_camera(void);
 esp_err_t bsp_lcd_show_test_pattern(void);
 esp_err_t bsp_lcd_start_lvgl_demo(void);
+esp_err_t bsp_lcd_start_camera_ui(bsp_lcd_capture_cb_t cb, void *user);
+esp_err_t bsp_lcd_set_camera_status(const char *text);
+esp_err_t bsp_lcd_show_gray_photo(const uint8_t *gray,
+                                  uint32_t width,
+                                  uint32_t height);
 
 /* ---------- RGB LED ----------------------------------------------------- */
 esp_err_t bsp_led_init(void);
