@@ -1,10 +1,10 @@
 /*
  * Buttons on the L-LRMAM36-FANN4-DK01:
  *   BOOT   : GPIO0, active low (strap pin, also used for download)
- *   USER1  : K3 on KEY_ADC (GPIO5)  ~1.11 V
- *   VOL-   : K4 on KEY_ADC          ~2.41 V
- *   PTT    : K5 on KEY_ADC          ~1.65 V
- *   VOL+   : K6 on KEY_ADC          ~0.82 V
+ *   PTT    : K6 on KEY_ADC (GPIO5)  ~0.82 V
+ *   USER1  : K5 on KEY_ADC          ~1.65 V
+ *   VOL+   : K4 on KEY_ADC          ~2.41 V
+ *   VOL-   : K3 on KEY_ADC          ~1.11 V
  *
  * The ADC ladder is a 10 k pull-up on VDD_3V3 and a button-specific series
  * resistor to GND, so when no button is pressed the line sits near 3.3 V.
@@ -45,10 +45,10 @@ typedef struct {
 } adc_btn_t;
 
 static const adc_btn_t s_adc_btns[] = {
-    { BSP_BTN_VOL_UP, 820  },   /* K6 */
-    { BSP_BTN_USER1,  1110 },   /* K3 */
-    { BSP_BTN_PTT,    1650 },   /* K5 */
-    { BSP_BTN_VOL_DN, 2410 },   /* K4 */
+    { BSP_BTN_PTT,    820  },   /* K6: hold to send FLRC voice */
+    { BSP_BTN_VOL_DN, 1110 },   /* K3 */
+    { BSP_BTN_USER1,  1650 },   /* K5: hold to record, release to play */
+    { BSP_BTN_VOL_UP, 2410 },   /* K4 */
 };
 
 /* A pressed button must be within this window of its target voltage. */

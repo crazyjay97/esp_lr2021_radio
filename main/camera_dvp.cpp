@@ -24,7 +24,8 @@ namespace {
 constexpr const char *TAG = "camera_dvp";
 constexpr TickType_t kPwdnSettleTicks = pdMS_TO_TICKS(100);
 constexpr TickType_t kResetSettleTicks = pdMS_TO_TICKS(120);
-constexpr uint32_t kFrameBytes = APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT * 2;
+constexpr uint32_t kFourccGrey = 0x59455247; // 'GREY'
+constexpr uint32_t kFrameBytes = APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT;
 
 struct dvp_cb_ctx {
     uint8_t *buffer;
@@ -115,6 +116,35 @@ esp_err_t sensor_read_id()
     ESP_RETURN_ON_ERROR(sensor_read_reg(0x01, &id_l), TAG, "read id_l");
     ESP_LOGI(TAG, "SP0A39 chip ID: 0x%02X%02X", id_h, id_l);
     return ESP_OK;
+}
+
+void log_gpio_diagnostics()
+{
+    int vsync_changes = 0;
+    int hsync_changes = 0;
+    int pclk_changes = 0;
+    int last_vsync = gpio_get_level(BSP_SP0A39_VSYNC_GPIO);
+    int last_hsync = gpio_get_level(BSP_SP0A39_HSYNC_GPIO);
+    int last_pclk = gpio_get_level(BSP_SP0A39_PCLK_GPIO);
+    for (int i = 0; i < 100000; i++) {
+        int vsync = gpio_get_level(BSP_SP0A39_VSYNC_GPIO);
+        int hsync = gpio_get_level(BSP_SP0A39_HSYNC_GPIO);
+        int pclk = gpio_get_level(BSP_SP0A39_PCLK_GPIO);
+        if (vsync != last_vsync) {
+            vsync_changes++;
+            last_vsync = vsync;
+        }
+        if (hsync != last_hsync) {
+            hsync_changes++;
+            last_hsync = hsync;
+        }
+        if (pclk != last_pclk) {
+            pclk_changes++;
+            last_pclk = pclk;
+        }
+    }
+    ESP_LOGI(TAG, "GPIO diagnostics: VSYNC changes=%d HSYNC changes=%d PCLK changes=%d HSYNC level=%d",
+             vsync_changes, hsync_changes, pclk_changes, gpio_get_level(BSP_SP0A39_HSYNC_GPIO));
 }
 
 } // namespace
@@ -234,6 +264,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     vTaskDelay(pdMS_TO_TICKS(100));
 
     ESP_RETURN_ON_ERROR(sensor_i2c_attach(), TAG, "i2c attach");
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     esp_err_t ret = sensor_read_id();
     if (ret != ESP_OK) { power_down(); return ret; }
@@ -264,7 +295,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     dvp_cfg.ctlr_id = 0;
     dvp_cfg.clk_src = CAM_CLK_SRC_DEFAULT;
     dvp_cfg.h_res = APP_CAMERA_SENSOR_WIDTH;
-    dvp_cfg.v_res = APP_CAMERA_SENSOR_HEIGHT * 2;
+    dvp_cfg.v_res = APP_CAMERA_SENSOR_HEIGHT;
     dvp_cfg.input_data_color_type = CAM_CTLR_COLOR_RAW8;
     dvp_cfg.pin = &pins;
     dvp_cfg.xclk_freq = APP_SP0A39_MCLK_HZ;
@@ -324,6 +355,8 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     ret = esp_cam_ctlr_start(cam_handle);
     if (ret != ESP_OK) goto cleanup;
 
+    log_gpio_diagnostics();
+
     if (xSemaphoreTake(ctx.done_sem, pdMS_TO_TICKS(5000)) == pdTRUE && ctx.received > 0) {
         ESP_LOGI(TAG, "captured frame: %u bytes (skipped %d)",
                  (unsigned)ctx.received, ctx.frame_count - 1);
@@ -331,9 +364,10 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
         *out_len = ctx.received;
         *out_width = APP_CAMERA_SENSOR_WIDTH;
         *out_height = APP_CAMERA_SENSOR_HEIGHT;
-        *out_pixelformat = 0x56595559; // 'YUYV'
+        *out_pixelformat = kFourccGrey;
         frame_buf = nullptr;
     } else {
+        log_gpio_diagnostics();
         ESP_LOGE(TAG, "capture timeout or no data, frames=%d", ctx.frame_count);
         ret = ESP_ERR_TIMEOUT;
     }

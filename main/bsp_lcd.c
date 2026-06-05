@@ -782,27 +782,57 @@ static inline uint8_t yuv_clamp(int v)
     return (uint8_t)v;
 }
 
-esp_err_t bsp_lcd_show_yuv422_photo(const uint8_t *yuyv,
-                                    uint32_t width,
-                                    uint32_t height)
+static bool yuv422_get_pair(const uint8_t *p,
+                            uint32_t pixelformat,
+                            uint8_t *y0,
+                            uint8_t *u,
+                            uint8_t *y1,
+                            uint8_t *v)
 {
-    ESP_RETURN_ON_FALSE(yuyv && width && height, ESP_ERR_INVALID_ARG, TAG,
+    switch (pixelformat) {
+    case 0x56595559: // 'YUYV'
+        *y0 = p[0]; *u = p[1]; *y1 = p[2]; *v = p[3];
+        return true;
+    case 0x59565955: // 'UYVY'
+        *u = p[0]; *y0 = p[1]; *v = p[2]; *y1 = p[3];
+        return true;
+    case 0x55595659: // 'YVYU'
+        *y0 = p[0]; *v = p[1]; *y1 = p[2]; *u = p[3];
+        return true;
+    case 0x59555956: // 'VYUY'
+        *v = p[0]; *y0 = p[1]; *u = p[2]; *y1 = p[3];
+        return true;
+    default:
+        return false;
+    }
+}
+
+esp_err_t bsp_lcd_show_yuv422_photo(const uint8_t *yuv422,
+                                    uint32_t width,
+                                    uint32_t height,
+                                    uint32_t pixelformat)
+{
+    ESP_RETURN_ON_FALSE(yuv422 && width && height, ESP_ERR_INVALID_ARG, TAG,
                         "invalid yuv frame");
+    ESP_RETURN_ON_FALSE(pixelformat == 0x56595559 || pixelformat == 0x59565955 ||
+                        pixelformat == 0x55595659 || pixelformat == 0x59555956,
+                        ESP_ERR_INVALID_ARG, TAG, "unsupported yuv fourcc");
     ESP_RETURN_ON_FALSE(s_lvgl_started && s_camera_canvas && s_camera_canvas_buf,
                         ESP_ERR_INVALID_STATE, TAG, "camera canvas not ready");
 
     xSemaphoreTakeRecursive(s_lvgl_lock, portMAX_DELAY);
     for (uint32_t y = 0; y < APP_LCD_PHOTO_PREVIEW_H; ++y) {
         uint32_t src_y = (y * height) / APP_LCD_PHOTO_PREVIEW_H;
-        const uint8_t *row = yuyv + src_y * width * 2;
+        const uint8_t *row = yuv422 + src_y * width * 2;
         lv_color_t *dst = s_camera_canvas_buf + y * APP_LCD_H_RES;
         for (uint32_t x = 0; x < APP_LCD_H_RES; ++x) {
             uint32_t src_x = (x * width) / APP_LCD_H_RES;
             uint32_t pair = src_x & ~1u;
-            uint8_t y0 = row[pair * 2];
-            uint8_t u  = row[pair * 2 + 1];
-            uint8_t y1 = row[pair * 2 + 2];
-            uint8_t v  = row[pair * 2 + 3];
+            uint8_t y0 = 0;
+            uint8_t u = 0;
+            uint8_t y1 = 0;
+            uint8_t v = 0;
+            yuv422_get_pair(row + pair * 2, pixelformat, &y0, &u, &y1, &v);
             uint8_t lum = (src_x & 1) ? y1 : y0;
             int c = lum - 16;
             int d = u - 128;

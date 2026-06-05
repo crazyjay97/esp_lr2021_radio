@@ -4,6 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#ifndef APP_CAMERA_COLOR_ENABLE
+#define APP_CAMERA_COLOR_ENABLE 0
+#endif
+
 static const uint8_t s_sp0a39_regs[][2] = {
     {0xfd, 0x00},
     {0x1d, 0x25},
@@ -354,7 +358,7 @@ static const uint8_t s_sp0a39_regs[][2] = {
     {0x9e, 0x55},
     {0x9f, 0x55},
 
-    // y-out en
+    // DVP output enable. Register 0x1c selects the final output mode.
     {0xfd, 0x00},
     {0x31, 0x01},
     {0x30, 0x11},
@@ -366,6 +370,6 @@ static const uint8_t s_sp0a39_regs[][2] = {
     {0x26, 0x80},
     {0x27, 0x80},
     {0xfd, 0x00},
-    {0x1c, 0x20},
+    {0x1c, APP_CAMERA_COLOR_ENABLE ? 0x20 : 0x00},
     {0xfd, 0x00},
 };

@@ -9,6 +9,12 @@
 
 /* ----- Audio capture/playback ------------------------------------------------ */
 
+#define APP_AUDIO_FEATURES_ENABLE       1
+#define APP_RADIO_FEATURES_ENABLE       1
+#define APP_RADIO_HW_INIT_ENABLE        1
+#define APP_RADIO_AUTO_RX_ENABLE        1
+#define APP_RADIO_TASKS_ENABLE          1
+
 /* ES8311/I2S sample rate used by both the microphone and speaker paths. */
 #define APP_AUDIO_SAMPLE_RATE_HZ        16000U
 
@@ -108,7 +114,7 @@
 
 /* ----- PTT behavior ---------------------------------------------------------- */
 
-/* Button used as push-to-talk. K5 is the ADC-ladder key near 1.65 V. */
+/* Button used as push-to-talk. K6 is the ADC-ladder key near 0.82 V. */
 #define APP_PTT_BUTTON                  BSP_BTN_PTT
 
 /* Receiver-side jitter buffer target before starting speaker playback. */
@@ -184,7 +190,7 @@
 
 /* ----- Camera/LCD bring-up -------------------------------------------------- */
 
-#define APP_CAMERA_LCD_BRINGUP          1
+#define APP_CAMERA_LCD_BRINGUP          0
 
 #define APP_CAMERA_UART_ENABLE          0
 
@@ -194,7 +200,8 @@
 
 #define APP_CAMERA_UART_BAUD            2000000
 
-/* SP0A39 DVP grayscale mode with 24 MHz input clock. */
+/* SP0A39 DVP mode with 24 MHz input clock. */
+#define APP_CAMERA_COLOR_ENABLE         0
 #define APP_SP0A39_MCLK_HZ              24000000U
 #define APP_SP0A39_I2C_ADDR             0x21U
 
@@ -205,10 +212,10 @@
 /* LCD_CAM DVP PCLK sampling edge. 0 = rising, 1 = falling. */
 #define APP_CAMERA_DVP_PCLK_INVERT      0
 
-/* VGA 640x480 grayscale from DVP. */
+/* VGA 640x480 from DVP. */
 #define APP_CAMERA_SENSOR_WIDTH         640U
 #define APP_CAMERA_SENSOR_HEIGHT        480U
-#define APP_CAMERA_FRAME_BYTES          (APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT)
+#define APP_CAMERA_FRAME_BYTES          (APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT * (APP_CAMERA_COLOR_ENABLE ? 2U : 1U))
 
 /* DMA buffer configuration for DVP capture. */
 #define APP_CAMERA_DVP_DMA_WINDOW_BYTES (16U * 1024U)

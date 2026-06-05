@@ -63,6 +63,8 @@ static const char *TAG = "bsp_audio";
 static i2c_master_dev_handle_t s_codec;
 static i2s_chan_handle_t       s_tx, s_rx;
 static bool                    s_audio_ready;
+static bool                    s_i2s_enabled;
+static uint32_t                s_sample_rate_hz;
 
 /* ----------------------------------------------------------------------- */
 
@@ -202,6 +204,10 @@ static esp_err_t es8311_program_regs(void)
 
 static esp_err_t i2s_init(uint32_t sample_rate_hz)
 {
+    if (s_tx != NULL || s_rx != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_tx, &s_rx), TAG, "chan");
 
@@ -231,7 +237,49 @@ static esp_err_t i2s_init(uint32_t sample_rate_hz)
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_rx, &std_cfg), TAG, "std rx");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx), TAG, "en tx");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_rx), TAG, "en rx");
+    s_i2s_enabled = true;
     return ESP_OK;
+}
+
+static esp_err_t i2s_deinit(void)
+{
+    esp_err_t ret = ESP_OK;
+
+    if (s_i2s_enabled) {
+        esp_err_t err_rx = i2s_channel_disable(s_rx);
+        esp_err_t err_tx = i2s_channel_disable(s_tx);
+        if (err_rx != ESP_OK) {
+            ESP_LOGW(TAG, "I2S RX disable failed: %s", esp_err_to_name(err_rx));
+            ret = err_rx;
+        }
+        if (err_tx != ESP_OK) {
+            ESP_LOGW(TAG, "I2S TX disable failed: %s", esp_err_to_name(err_tx));
+            if (ret == ESP_OK) ret = err_tx;
+        }
+        s_i2s_enabled = false;
+    }
+
+    if (s_rx != NULL) {
+        esp_err_t err = i2s_del_channel(s_rx);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "I2S RX delete failed: %s", esp_err_to_name(err));
+            if (ret == ESP_OK) ret = err;
+        } else {
+            s_rx = NULL;
+        }
+    }
+
+    if (s_tx != NULL) {
+        esp_err_t err = i2s_del_channel(s_tx);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "I2S TX delete failed: %s", esp_err_to_name(err));
+            if (ret == ESP_OK) ret = err;
+        } else {
+            s_tx = NULL;
+        }
+    }
+
+    return ret;
 }
 
 esp_err_t bsp_audio_init(uint32_t sample_rate_hz)
@@ -239,6 +287,7 @@ esp_err_t bsp_audio_init(uint32_t sample_rate_hz)
     if (s_audio_ready) return ESP_OK;
 
     ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c");
+    s_sample_rate_hz = sample_rate_hz;
 
     /* Register ES8311 on the shared I2C bus. */
     i2c_device_config_t dev_cfg = {
@@ -283,6 +332,30 @@ esp_err_t bsp_audio_pa_enable(bool on)
     return bsp_ioexp_set_pin(BSP_IO_EXP_PA_MUTE_PIN, on);
 }
 
+esp_err_t bsp_audio_suspend(void)
+{
+    if (!s_audio_ready || (s_tx == NULL && s_rx == NULL)) return ESP_OK;
+
+    (void)bsp_audio_pa_enable(false);
+    esp_err_t err = i2s_deinit();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "I2S released for camera capture");
+    }
+    return err;
+}
+
+esp_err_t bsp_audio_resume(void)
+{
+    if (!s_audio_ready || s_i2s_enabled) return ESP_OK;
+    if (s_tx != NULL || s_rx != NULL) return ESP_ERR_INVALID_STATE;
+
+    esp_err_t err = i2s_init(s_sample_rate_hz);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "I2S rebuilt after camera capture");
+    }
+    return err;
+}
+
 esp_err_t bsp_audio_set_volume(uint8_t percent)
 {
     if (percent > 100) percent = 100;
@@ -303,11 +376,13 @@ esp_err_t bsp_audio_set_mic_gain_db(uint8_t gain_db)
 esp_err_t bsp_audio_write(const void *buf, size_t bytes, size_t *out_written)
 {
     if (!s_audio_ready) return ESP_ERR_INVALID_STATE;
+    if (!s_i2s_enabled) return ESP_ERR_INVALID_STATE;
     return i2s_channel_write(s_tx, buf, bytes, out_written, portMAX_DELAY);
 }
 
 esp_err_t bsp_audio_read(void *buf, size_t bytes, size_t *out_read)
 {
     if (!s_audio_ready) return ESP_ERR_INVALID_STATE;
+    if (!s_i2s_enabled) return ESP_ERR_INVALID_STATE;
     return i2s_channel_read(s_rx, buf, bytes, out_read, portMAX_DELAY);
 }

@@ -76,6 +76,11 @@ esp_err_t RadioPing::init()
         return ESP_ERR_NO_MEM;
     }
 
+#if !APP_RADIO_HW_INIT_ENABLE
+    ESP_LOGW(TAG, "LR2021 hardware init disabled for camera isolation");
+    return ESP_OK;
+#endif
+
     smtc_modem_hal_protect_api_call();
     ral_status_t status = ral_reset(&radio_.ral);
     if (status == RAL_STATUS_OK) status = ral_init(&radio_.ral);
@@ -97,7 +102,11 @@ esp_err_t RadioPing::init()
 
     ESP_LOGI(TAG, "LR2021 direct RAL initialized: FLRC rf=%lu Hz br=%lu bps bw=%lu Hz",
              APP_FLRC_FREQUENCY_HZ, APP_FLRC_BITRATE_BPS, APP_FLRC_BANDWIDTH_HZ);
+#if APP_RADIO_AUTO_RX_ENABLE
     schedule_rx();
+#else
+    ESP_LOGW(TAG, "LR2021 auto RX disabled for camera isolation");
+#endif
     return ESP_OK;
 }
 
@@ -129,6 +138,7 @@ esp_err_t RadioPing::start()
 void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
 {
     if (id != APP_PTT_BUTTON) return;
+    if (suspended_) return;
 
     ptt_active_ = pressed;
     ESP_LOGI(TAG, "PTT %s -> FLRC voice %s", pressed ? "down" : "up",
@@ -168,6 +178,45 @@ void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
     }
 }
 
+void RadioPing::suspend()
+{
+    suspended_ = true;
+    ptt_active_ = false;
+    tx_burst_active_ = false;
+    tx_flush_pending_ = false;
+    irq_pending_ = false;
+
+    if (tx_queue_ != nullptr) {
+        xQueueReset(tx_queue_);
+    }
+    if (voice_queue_ != nullptr) {
+        xQueueReset(voice_queue_);
+    }
+
+    set_playback_pa(false);
+    playback_active_ = false;
+    have_expected_play_seq_ = false;
+
+    smtc_modem_hal_protect_api_call();
+    (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+    (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+    smtc_modem_hal_unprotect_api_call();
+
+    mode_ = Mode::idle;
+    ESP_LOGI(TAG, "radio suspended");
+}
+
+void RadioPing::resume()
+{
+    smtc_modem_hal_protect_api_call();
+    (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+    smtc_modem_hal_unprotect_api_call();
+
+    mode_ = Mode::idle;
+    suspended_ = false;
+    ESP_LOGI(TAG, "radio resumed");
+}
+
 void RadioPing::task_trampoline(void *arg)
 {
     static_cast<RadioPing *>(arg)->task();
@@ -186,8 +235,10 @@ void RadioPing::play_task_trampoline(void *arg)
 void RadioPing::task()
 {
     while (true) {
-        poll_once();
-        update_playback_timeout();
+        if (!suspended_) {
+            poll_once();
+            update_playback_timeout();
+        }
         vTaskDelay(ms_to_ticks_min_1(APP_RADIO_TASK_POLL_MS));
     }
 }
@@ -195,7 +246,7 @@ void RadioPing::task()
 void RadioPing::tx_task()
 {
     while (true) {
-        if (!ptt_active_) {
+        if (suspended_ || !ptt_active_) {
             vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
             continue;
         }
@@ -209,6 +260,10 @@ void RadioPing::play_task()
 
     while (true) {
         if (xQueueReceive(voice_queue_, &packet, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        if (suspended_) {
             continue;
         }
 

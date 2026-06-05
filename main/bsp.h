@@ -50,9 +50,10 @@ esp_err_t bsp_lcd_set_camera_status(const char *text);
 esp_err_t bsp_lcd_show_gray_photo(const uint8_t *gray,
                                   uint32_t width,
                                   uint32_t height);
-esp_err_t bsp_lcd_show_yuv422_photo(const uint8_t *yuyv,
+esp_err_t bsp_lcd_show_yuv422_photo(const uint8_t *yuv422,
                                     uint32_t width,
-                                    uint32_t height);
+                                    uint32_t height,
+                                    uint32_t pixelformat);
 
 /* ---------- RGB LED ----------------------------------------------------- */
 esp_err_t bsp_led_init(void);
@@ -61,6 +62,8 @@ void      bsp_led_set(bool r, bool g, bool b);
 /* ---------- Audio (ES8311 codec + CST8302A PA + I2S) -------------------- */
 esp_err_t bsp_audio_init(uint32_t sample_rate_hz);
 esp_err_t bsp_audio_pa_enable(bool on);                  /* PA enable via P6 */
+esp_err_t bsp_audio_suspend(void);
+esp_err_t bsp_audio_resume(void);
 esp_err_t bsp_audio_set_volume(uint8_t volume_percent);  /* 0..100 for DAC  */
 esp_err_t bsp_audio_set_mic_gain_db(uint8_t gain_db);    /* 0..42 PGA       */
 esp_err_t bsp_audio_write(const void *buf, size_t bytes, size_t *out_written);
@@ -69,10 +72,10 @@ esp_err_t bsp_audio_read (void       *buf, size_t bytes, size_t *out_read);
 /* ---------- Buttons ----------------------------------------------------- */
 typedef enum {
     BSP_BTN_BOOT = 0,   /* GPIO0 strap button (K2)     */
-    BSP_BTN_USER1,      /* K3 -> ~1.11 V on KEY_ADC    */
-    BSP_BTN_VOL_DN,     /* K4 -> ~2.41 V               */
-    BSP_BTN_PTT,        /* K5 -> ~1.65 V               */
-    BSP_BTN_VOL_UP,     /* K6 -> ~0.82 V               */
+    BSP_BTN_USER1,      /* K5 -> ~1.65 V on KEY_ADC    */
+    BSP_BTN_VOL_DN,     /* K3 -> ~1.11 V               */
+    BSP_BTN_PTT,        /* K6 -> ~0.82 V               */
+    BSP_BTN_VOL_UP,     /* K4 -> ~2.41 V               */
     BSP_BTN_COUNT,
 } bsp_btn_id_t;
 

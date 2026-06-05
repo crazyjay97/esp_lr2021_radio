@@ -36,8 +36,8 @@
 #define BSP_I2S0_MCLK_GPIO          GPIO_NUM_46
 #define BSP_I2S0_BCLK_GPIO          GPIO_NUM_1
 #define BSP_I2S0_LRCK_GPIO          GPIO_NUM_15
-#define BSP_I2S0_DIN_GPIO           GPIO_NUM_14   /* ESP -> codec (SDIN)     */
-#define BSP_I2S0_DOUT_GPIO          GPIO_NUM_45   /* codec -> ESP (SDOUT)    */
+#define BSP_I2S0_DIN_GPIO           GPIO_NUM_45   /* ESP -> codec (SDIN)     */
+#define BSP_I2S0_DOUT_GPIO          GPIO_NUM_14   /* codec -> ESP (SDOUT)    */
 
 /* Audio PA (CST8302A) mute/enable is on the GPIO expander P6 (active high). */
 #define BSP_IO_EXP_PA_MUTE_PIN      6
@@ -92,10 +92,10 @@
  * K1 -> CHIP_PU (reset, hardwired)
  * K2 -> GPIO0 / BOOT (strap button)
  * K3..K6 share a resistor-divider ADC ladder on GPIO5:
- *     K4 (27 k)  -> ~2.41 V  "VOL-"
- *     K5 (10 k)  -> ~1.65 V  "PTT"
- *     K6 (3.3 k) -> ~0.82 V  "VOL+"
- *     K3 (5.1 k) -> ~1.11 V  "USER1"
+ *     K6 (3.3 k) -> ~0.82 V  "PTT"
+ *     K5 (10 k)  -> ~1.65 V  "USER1/local record"
+ *     K4 (27 k)  -> ~2.41 V  "VOL+"
+ *     K3 (5.1 k) -> ~1.11 V  "VOL-"
  * Read via ADC1 channel on GPIO5.
  */
 #define BSP_KEY_ADC_GPIO            GPIO_NUM_5

@@ -17,6 +17,8 @@ public:
     esp_err_t init();
     esp_err_t start();
     void handle_button(bsp_btn_id_t id, bool pressed);
+    void suspend();
+    void resume();
 
 private:
     enum class Mode {
@@ -72,6 +74,7 @@ private:
     QueueHandle_t tx_queue_ = nullptr;
     Mode mode_ = Mode::idle;
     volatile bool ptt_active_ = false;
+    volatile bool suspended_ = false;
     bool tx_burst_active_ = false;
     bool tx_flush_pending_ = false;
     volatile bool irq_pending_ = false;
