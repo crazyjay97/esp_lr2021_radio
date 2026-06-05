@@ -50,6 +50,9 @@ esp_err_t bsp_lcd_set_camera_status(const char *text);
 esp_err_t bsp_lcd_show_gray_photo(const uint8_t *gray,
                                   uint32_t width,
                                   uint32_t height);
+esp_err_t bsp_lcd_show_yuv422_photo(const uint8_t *yuyv,
+                                    uint32_t width,
+                                    uint32_t height);
 
 /* ---------- RGB LED ----------------------------------------------------- */
 esp_err_t bsp_led_init(void);

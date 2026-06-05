@@ -24,7 +24,7 @@ namespace {
 constexpr const char *TAG = "camera_dvp";
 constexpr TickType_t kPwdnSettleTicks = pdMS_TO_TICKS(100);
 constexpr TickType_t kResetSettleTicks = pdMS_TO_TICKS(120);
-constexpr uint32_t kFrameBytes = APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT;
+constexpr uint32_t kFrameBytes = APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT * 2;
 
 struct dvp_cb_ctx {
     uint8_t *buffer;
@@ -234,13 +234,6 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     vTaskDelay(pdMS_TO_TICKS(100));
 
     ESP_RETURN_ON_ERROR(sensor_i2c_attach(), TAG, "i2c attach");
-    i2c_master_bus_handle_t bus = bsp_i2c_bus();
-    ESP_LOGI(TAG, "I2C bus scan after PWDN release:");
-    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
-        if (i2c_master_probe(bus, addr, 50) == ESP_OK) {
-            ESP_LOGI(TAG, "  found device at 0x%02X", addr);
-        }
-    }
 
     esp_err_t ret = sensor_read_id();
     if (ret != ESP_OK) { power_down(); return ret; }
@@ -271,7 +264,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     dvp_cfg.ctlr_id = 0;
     dvp_cfg.clk_src = CAM_CLK_SRC_DEFAULT;
     dvp_cfg.h_res = APP_CAMERA_SENSOR_WIDTH;
-    dvp_cfg.v_res = APP_CAMERA_SENSOR_HEIGHT;
+    dvp_cfg.v_res = APP_CAMERA_SENSOR_HEIGHT * 2;
     dvp_cfg.input_data_color_type = CAM_CTLR_COLOR_RAW8;
     dvp_cfg.pin = &pins;
     dvp_cfg.xclk_freq = APP_SP0A39_MCLK_HZ;
@@ -331,22 +324,6 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     ret = esp_cam_ctlr_start(cam_handle);
     if (ret != ESP_OK) goto cleanup;
 
-    // Debug: sample VSYNC/HSYNC/PCLK levels to check if sensor is outputting
-    {
-        int vsync_changes = 0, pclk_changes = 0;
-        int last_vsync = gpio_get_level(BSP_SP0A39_VSYNC_GPIO);
-        int last_pclk = gpio_get_level(BSP_SP0A39_PCLK_GPIO);
-        for (int i = 0; i < 100000; i++) {
-            int v = gpio_get_level(BSP_SP0A39_VSYNC_GPIO);
-            int p = gpio_get_level(BSP_SP0A39_PCLK_GPIO);
-            if (v != last_vsync) { vsync_changes++; last_vsync = v; }
-            if (p != last_pclk) { pclk_changes++; last_pclk = p; }
-        }
-        int hsync_level = gpio_get_level(BSP_SP0A39_HSYNC_GPIO);
-        ESP_LOGI(TAG, "GPIO diagnostics: VSYNC changes=%d, PCLK changes=%d, HSYNC level=%d",
-                 vsync_changes, pclk_changes, hsync_level);
-    }
-
     if (xSemaphoreTake(ctx.done_sem, pdMS_TO_TICKS(5000)) == pdTRUE && ctx.received > 0) {
         ESP_LOGI(TAG, "captured frame: %u bytes (skipped %d)",
                  (unsigned)ctx.received, ctx.frame_count - 1);
@@ -354,7 +331,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
         *out_len = ctx.received;
         *out_width = APP_CAMERA_SENSOR_WIDTH;
         *out_height = APP_CAMERA_SENSOR_HEIGHT;
-        *out_pixelformat = 0x59455247;
+        *out_pixelformat = 0x56595559; // 'YUYV'
         frame_buf = nullptr;
     } else {
         ESP_LOGE(TAG, "capture timeout or no data, frames=%d", ctx.frame_count);

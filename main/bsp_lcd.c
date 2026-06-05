@@ -774,3 +774,46 @@ esp_err_t bsp_lcd_show_gray_photo(const uint8_t *gray,
     xSemaphoreGiveRecursive(s_lvgl_lock);
     return ESP_OK;
 }
+
+static inline uint8_t yuv_clamp(int v)
+{
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return (uint8_t)v;
+}
+
+esp_err_t bsp_lcd_show_yuv422_photo(const uint8_t *yuyv,
+                                    uint32_t width,
+                                    uint32_t height)
+{
+    ESP_RETURN_ON_FALSE(yuyv && width && height, ESP_ERR_INVALID_ARG, TAG,
+                        "invalid yuv frame");
+    ESP_RETURN_ON_FALSE(s_lvgl_started && s_camera_canvas && s_camera_canvas_buf,
+                        ESP_ERR_INVALID_STATE, TAG, "camera canvas not ready");
+
+    xSemaphoreTakeRecursive(s_lvgl_lock, portMAX_DELAY);
+    for (uint32_t y = 0; y < APP_LCD_PHOTO_PREVIEW_H; ++y) {
+        uint32_t src_y = (y * height) / APP_LCD_PHOTO_PREVIEW_H;
+        const uint8_t *row = yuyv + src_y * width * 2;
+        lv_color_t *dst = s_camera_canvas_buf + y * APP_LCD_H_RES;
+        for (uint32_t x = 0; x < APP_LCD_H_RES; ++x) {
+            uint32_t src_x = (x * width) / APP_LCD_H_RES;
+            uint32_t pair = src_x & ~1u;
+            uint8_t y0 = row[pair * 2];
+            uint8_t u  = row[pair * 2 + 1];
+            uint8_t y1 = row[pair * 2 + 2];
+            uint8_t v  = row[pair * 2 + 3];
+            uint8_t lum = (src_x & 1) ? y1 : y0;
+            int c = lum - 16;
+            int d = u - 128;
+            int e = v - 128;
+            uint8_t r = yuv_clamp((298 * c + 409 * e + 128) >> 8);
+            uint8_t g = yuv_clamp((298 * c - 100 * d - 208 * e + 128) >> 8);
+            uint8_t b = yuv_clamp((298 * c + 516 * d + 128) >> 8);
+            dst[x] = lv_color_make(r, g, b);
+        }
+    }
+    lv_obj_invalidate(s_camera_canvas);
+    xSemaphoreGiveRecursive(s_lvgl_lock);
+    return ESP_OK;
+}

@@ -50,7 +50,13 @@ void camera_capture_task(void *arg)
         ESP_LOGE(TAG, "lcd reinit after camera: %s", esp_err_to_name(lcd_e));
     }
 
-    if (e == ESP_OK && pixfmt == 0x59455247) { // 'GREY'
+    if (e == ESP_OK && pixfmt == 0x56595559) { // 'YUYV'
+        if (bsp_lcd_show_yuv422_photo(frame, width, height) == ESP_OK) {
+            bsp_lcd_set_camera_status("Captured. Touch capture to retake");
+        } else {
+            bsp_lcd_set_camera_status("Display photo failed");
+        }
+    } else if (e == ESP_OK && pixfmt == 0x59455247) { // 'GREY'
         if (bsp_lcd_show_gray_photo(frame, width, height) == ESP_OK) {
             bsp_lcd_set_camera_status("Captured. Touch capture to retake");
         } else {
