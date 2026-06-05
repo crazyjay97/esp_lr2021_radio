@@ -47,6 +47,7 @@ Expected scan on the tested board:
 ```text
 device ACK @ 0x18
 device ACK @ 0x38
+device ACK @ 0x39
 ```
 
 ### I2C Devices
@@ -54,8 +55,8 @@ device ACK @ 0x38
 | Device | Address | Notes |
 | --- | --- | --- |
 | ES8311 | 0x18 | Confirmed by scan |
-| FT6206 touch | 0x38 | Confirmed by user; current scan sees 0x38 |
-| TCA9554A IO expander | 0x20..0x27 | User confirmed the expander is still TCA9554A; expected base address is currently `0x20`, but boot scan does not ACK any TCA9554A address yet |
+| FT6206 touch | 0x38 | User confirmed the chip is FT6206 |
+| TCA9554A IO expander | 0x39 | User changed A0 and confirmed the expander address moved to `0x39`; TCA9554A valid range is `0x38..0x3F` |
 | Touch old candidates | 0x15 or 0x2A | CST816-compatible candidates from earlier code, not present on this board |
 | SP0A39 SCCB | 0x21 | May not appear in initial scan because camera is kept in PWDN while LCD owns shared lines |
 
@@ -73,26 +74,28 @@ Adjusted to avoid conflict with V02 I2C:
 
 ### ST7789V3 LCD
 
-The current implementation treats the LCD as 4-wire SPI through `esp_lcd_new_panel_st7789`.
+User re-checked the LCD FPC pin map and confirmed the panel has a separate
+`LCD_DC` line. The firmware drives ST7789V3 as ordinary 4-wire SPI; only
+`MOSI/CLK/CS/DC/RST/BL` are required for basic display. TE is not used.
 
 | LCD signal | GPIO / IO expander |
 | --- | --- |
-| LCD_CLK | GPIO44 |
-| LCD_D0 / MOSI | GPIO48 |
-| LCD_D1 / D-C in current firmware | GPIO43 |
-| LCD_CS1 | GPIO47 |
-| LCD_TE | GPIO4 |
+| LCD_CLK | GPIO12 |
+| LCD_MOSI | GPIO2 |
+| LCD_DC | GPIO13 |
+| LCD_CS | GPIO10 |
+| LCD_TE | NC for firmware bring-up |
 | LCD_RST | IO expander P3 |
 | LCD_LED / backlight | IO expander P5 |
-| TP_INT | GPIO12 |
+| TP_INT | GPIO11 |
 | TP_RST | IO expander P4 |
 
 Important uncertainty:
 
-- V02 schematic labels the connector as `QSPI dual LCD + Touch panel`.
-- There is no explicit D/C label in the PDF.
-- Current firmware assumes `LCD_D1/GPIO43` can act as ST7789 SPI D/C.
-- If the panel is actually QSPI-style ST7789V3 instead of 4-wire SPI, LCD init will need a different IO mode.
+- Earlier firmware used the wrong LCD pin group and then briefly tried 3-line 9-bit serial.
+- Corrected firmware uses `LCD_DC=GPIO13`, `LCD_MOSI=GPIO2`, `LCD_CLK=GPIO12`, and `LCD_CS=GPIO10`.
+- `LCD_D2/GPIO9`, `LCD_D3/GPIO4`, `LCD_CS2/GPIO8`, and `LCD_TE/GPIO6` are not needed for the ordinary SPI bring-up path.
+- Resolution is set to the previously verified screen default: `240x320`, with `x_gap=0`, `y_gap=0`.
 
 ### SP0A39 DVP Camera
 
@@ -119,11 +122,9 @@ LCD and camera share several ESP GPIOs:
 
 | GPIO | LCD use | Camera use |
 | --- | --- | --- |
-| GPIO4 | LCD_TE | D3 |
-| GPIO43 | LCD_D1 / D-C currently | D4 |
-| GPIO44 | LCD_CLK | D5 |
-| GPIO48 | LCD_D0 / MOSI | D6 |
-| GPIO47 | LCD_CS1 | D7 |
+| GPIO2 | LCD_MOSI | D0 |
+| GPIO10 | LCD_CS | Camera_RST |
+| GPIO13 | LCD_DC | D2 |
 
 Current workaround:
 
@@ -152,29 +153,47 @@ Fix:
 - `BSP_I2C0_SCL_GPIO = GPIO18`
 - `BSP_I2C0_SDA_GPIO = GPIO16`
 
-### FT6206 touch at 0x38 vs TCA9554A uncertainty
+### FT6206 touch at 0x38 and TCA9554A at 0x39
 
 Observed log after I2C pin fix:
 
 ```text
 device ACK @ 0x18
 device ACK @ 0x38
+device ACK @ 0x39
 ```
 
 User confirmed:
 
 - Touch IC is FT6206.
-- FT6206 normally uses `0x38`.
+- FT6206 address is `0x38`.
+- TCA9554A A0 was changed and the IO expander address is now `0x39`.
 
 Implication:
 
-- The scanned `0x38` is likely the FT6206 touch controller, not the IO expander.
-- Treating `0x38` as TCA9554A and writing P3/P4/P5/P7 can corrupt touch-controller registers.
-- Firmware was changed to probe FT6206 at `0x38` and to stop assuming the IO expander is at `0x38`.
-- IO expander remains configured as TCA9554A address `0x20`.
-- Firmware now scans only the TCA9554A valid address range `0x20..0x27` when attaching the IO expander.
-- Current boot scan does not ACK any address in `0x20..0x27`, so check TCA9554A address straps, power, reset/enable if present, soldering, or whether it is on a different I2C segment.
+- The scanned `0x38` is the FT6206 touch controller.
+- The scanned `0x39` is the TCA9554A IO expander.
+- Firmware probes FT6206 at `0x38`.
+- Firmware attaches TCA9554A at `0x39`.
+- If fallback scanning is needed, firmware scans TCA9554A valid range `0x38..0x3F` but skips the FT6206 touch address `0x38`.
 - LCD reset/backlight and touch reset through IO expander are now warning-only during bring-up so LCD/touch can still be tested.
+
+Latest observed failure:
+
+```text
+I bsp_i2c: skip 0x38 while scanning TCA9554A: FT6206 touch address
+E bsp_i2c: no TCA9554A ACK in 0x38..0x3F after skipping FT6206 touch address
+```
+
+Implication:
+
+- Firmware is no longer treating FT6206 `0x38` as the IO expander.
+- Configured TCA9554A address `0x39` is not ACKing.
+- Re-check TCA9554A A0/A1/A2 strap levels. For TCA9554A, expected address is `0x38 + A2:A1:A0`.
+- User confirmed ES8311, FT6206, and TCA9554A are on the same I2C bus in the schematic, so do not treat this as a different-I2C-segment issue.
+- Re-check TCA9554A VCC/GND, A0/A1/A2 strap levels, and soldering around its SDA/SCL pins.
+- If the full boot scan still only shows `0x18` and `0x38`, the TCA9554A itself is not visible on the shared bus yet.
+- I2C speed can be a factor if pull-ups, trace capacitance, or soldering margin are weak. Firmware was temporarily lowered from 400 kHz to 100 kHz for bring-up. If `0x39` appears only at 100 kHz, inspect pull-up value, waveform rise time, and bus capacitance.
 
 ### App printed ready even after init failed
 
@@ -208,13 +227,14 @@ Generated build/lr2021_radio.bin
 
 1. Reflash after IO expander address fix.
 2. Confirm boot log:
-   - I2C scan sees `0x18` and `0x38`.
+   - I2C scan sees `0x18`, `0x38`, and `0x39`.
    - `0x38` touch attach succeeds as FT6206-compatible.
-   - TCA9554A attach logs either `TCA9554A attached at 0x20` or reports no ACK in `0x20..0x27`.
+   - TCA9554A attach logs `TCA9554A attached at 0x39`.
 3. Confirm LCD:
    - backlight turns on,
    - ST7789V3 init does not fail,
-   - LVGL UI appears.
+   - LCD test color bars appear for about 800 ms,
+   - LVGL UI appears after the color bars.
 4. Confirm touch:
    - touch attach logs show `0x38` selected as FT6206-compatible,
    - tapping `Capture` triggers capture task.
@@ -224,9 +244,12 @@ Generated build/lr2021_radio.bin
    - one GREY frame is captured.
 6. If LCD remains blank:
    - current symptom from 2026-06-04: LCD backlight is on, but LVGL content is not visible,
-   - re-check whether ST7789V3 module is 4-wire SPI or QSPI,
-   - verify whether `LCD_D1/GPIO43` is a valid D/C line,
-   - verify whether LCD reset/backlight really go through TCA9554A P3/P5 and why `0x20..0x27` is not ACKing.
+   - firmware now draws a hardware color-bar test pattern before LVGL, using 10 MHz SPI for bring-up,
+   - if color bars are visible but LVGL is not, debug LVGL flush/tick/buffer path,
+   - if color bars are also invisible, debug LCD interface/reset/init first,
+   - current firmware uses ST7789V3 4-wire SPI with `LCD_DC=GPIO13`,
+   - verify whether the panel module expects `LCD_CS` or `LCD_CS2`,
+   - verify whether LCD reset/backlight really go through TCA9554A P3/P5.
 7. If capture fails:
    - inspect SP0A39 SCCB ACK after PWDN low and reset,
    - verify VSYNC/HSYNC/PCLK polarity,

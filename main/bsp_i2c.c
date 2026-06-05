@@ -136,19 +136,25 @@ static esp_err_t ioexp_attach(void)
     uint8_t addr = BSP_I2C_ADDR_IO_EXPANDER;
     esp_err_t probe = i2c_master_probe(s_bus, addr, 50);
     if (probe != ESP_OK) {
-        ESP_LOGW(TAG, "TCA9554A configured address 0x%02X did not ACK; scanning 0x20..0x27",
+        ESP_LOGW(TAG, "TCA9554A configured address 0x%02X did not ACK; scanning 0x38..0x3F",
                  addr);
         bool found = false;
-        for (uint8_t candidate = 0x20; candidate <= 0x27; ++candidate) {
+        for (uint8_t candidate = 0x38; candidate <= 0x3F; ++candidate) {
+            if (candidate == BSP_I2C_ADDR_TOUCH_FT6206) {
+                ESP_LOGI(TAG, "skip 0x%02X while scanning TCA9554A: FT6206 touch address",
+                         candidate);
+                continue;
+            }
             if (i2c_master_probe(s_bus, candidate, 50) == ESP_OK) {
                 addr = candidate;
                 found = true;
                 ESP_LOGI(TAG, "TCA9554A candidate ACK @ 0x%02X", addr);
                 break;
             }
+            ESP_LOGI(TAG, "TCA9554A candidate 0x%02X not present", candidate);
         }
         if (!found) {
-            ESP_LOGE(TAG, "no TCA9554A ACK in 0x20..0x27; 0x38 is FT6206 touch, not the IO expander");
+            ESP_LOGE(TAG, "no TCA9554A ACK in 0x38..0x3F after skipping FT6206 touch address");
             return ESP_ERR_NOT_FOUND;
         }
     }
@@ -229,7 +235,11 @@ esp_err_t bsp_ioexp_set_pin(uint8_t pin, bool level)
         if (err == ESP_OK) s_ioexp_cfg = new_cfg;
     }
 
-    if (pin == BSP_IO_EXP_PA_MUTE_PIN || pin == BSP_SP0A39_PWDN_IOEXP_PIN) {
+    if (pin == BSP_IO_EXP_LCD_RST_PIN ||
+        pin == BSP_IO_EXP_LCD_BL_PIN ||
+        pin == BSP_IO_EXP_TP_RST_PIN ||
+        pin == BSP_IO_EXP_PA_MUTE_PIN ||
+        pin == BSP_SP0A39_PWDN_IOEXP_PIN) {
         uint8_t input = 0, output = 0, cfg = 0;
         esp_err_t r0 = ioexp_read(TCA9554_REG_INPUT, &input);
         esp_err_t r1 = ioexp_read(TCA9554_REG_OUTPUT, &output);

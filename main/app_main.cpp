@@ -6,7 +6,6 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#include "linux/videodev2.h"
 
 #include "app_config.h"
 #include "bsp.h"
@@ -51,7 +50,7 @@ void camera_capture_task(void *arg)
         ESP_LOGE(TAG, "lcd reinit after camera: %s", esp_err_to_name(lcd_e));
     }
 
-    if (e == ESP_OK && pixfmt == V4L2_PIX_FMT_GREY) {
+    if (e == ESP_OK && pixfmt == 0x59455247) { // 'GREY'
         if (bsp_lcd_show_gray_photo(frame, width, height) == ESP_OK) {
             bsp_lcd_set_camera_status("Captured. Touch capture to retake");
         } else {
@@ -127,7 +126,13 @@ extern "C" void app_main(void)
     if ((e = bsp_lcd_init()) != ESP_OK) {
         ESP_LOGE(TAG, "lcd init: %s", esp_err_to_name(e));
         return;
-    } else if ((e = bsp_lcd_start_camera_ui(on_lcd_capture, nullptr)) != ESP_OK) {
+    }
+    if ((e = bsp_lcd_show_test_pattern()) != ESP_OK) {
+        ESP_LOGE(TAG, "lcd test pattern: %s", esp_err_to_name(e));
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(800));
+    if ((e = bsp_lcd_start_camera_ui(on_lcd_capture, nullptr)) != ESP_OK) {
         ESP_LOGE(TAG, "camera ui start: %s", esp_err_to_name(e));
         return;
     }

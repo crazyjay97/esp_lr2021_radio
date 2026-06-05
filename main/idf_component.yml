@@ -6,7 +6,3 @@ dependencies:
   idf: ^5.0
   lvgl/lvgl: ^8.4.0
   espressif/esp_new_jpeg: "^0.6.0"
-  espressif/esp_cam_sensor: "2.1.0"
-  espressif/esp_video: "2.1.0"
-  esp_sccb_intf:
-    version: ">=0.0.5"

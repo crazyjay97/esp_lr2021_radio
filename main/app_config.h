@@ -224,10 +224,10 @@
 /* ----- ST7789V3 LCD --------------------------------------------------------- */
 
 #define APP_LCD_H_RES                   240U
-#define APP_LCD_V_RES                   280U
+#define APP_LCD_V_RES                   320U
 #define APP_LCD_X_GAP                   0
-#define APP_LCD_Y_GAP                   20
-#define APP_LCD_SPI_PCLK_HZ             (20U * 1000U * 1000U)
+#define APP_LCD_Y_GAP                   0
+#define APP_LCD_SPI_PCLK_HZ             (10U * 1000U * 1000U)
 #define APP_LCD_SPI_QUEUE_DEPTH         10U
 #define APP_LCD_TEST_PATTERN_ROWS       20U
 #define APP_LCD_LVGL_BUFFER_ROWS        40U

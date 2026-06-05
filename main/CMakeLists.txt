@@ -2,7 +2,7 @@ idf_component_register(SRCS
                            "app_main.cpp"
                            "audio_diagnostics.cpp"
                            "audio_processor.cpp"
-                           "camera_uart.cpp"
+                           "camera_dvp.cpp"
                            "opus_codec.cpp"
                            "radio_ping.cpp"
                            "bsp_con6.c"
@@ -23,6 +23,4 @@ idf_component_register(SRCS
                            esp_lcd
                            esp_timer
                            esp_adc
-                           esp_cam_sensor
-                           esp_video
                            lvgl)

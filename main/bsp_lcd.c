@@ -30,6 +30,7 @@ static const char *TAG = "bsp_lcd";
 static esp_lcd_panel_io_handle_t s_lcd_io;
 static esp_lcd_panel_handle_t s_lcd_panel;
 static bool s_lcd_bus_ready;
+static bool s_lcd_ready;
 static bool s_lvgl_started;
 static bool s_lcd_suspended;
 static i2c_master_dev_handle_t s_touch;
@@ -49,9 +50,14 @@ typedef struct {
     uint16_t delay_ms;
 } lcd_init_cmd_t;
 
-static esp_err_t lcd_tx(uint8_t cmd, const uint8_t *data, size_t len)
+static esp_err_t lcd_tx_cmd(uint8_t cmd, const uint8_t *data, size_t len)
 {
-    return esp_lcd_panel_io_tx_param(s_lcd_io, cmd, data, len);
+    ESP_RETURN_ON_FALSE(s_lcd_io, ESP_ERR_INVALID_STATE, TAG, "lcd io not ready");
+    esp_err_t ret = esp_lcd_panel_io_tx_param(s_lcd_io, cmd, data, len);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "lcd_tx_cmd(0x%02X) FAILED: %s", cmd, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 static esp_err_t touch_read_reg(uint8_t reg, uint8_t *data, size_t len)
@@ -67,7 +73,7 @@ static esp_err_t lcd_send_vendor_init(void)
     static const uint8_t madctl[] = {0x08};
     static const uint8_t colmod[] = {0x05};
     static const uint8_t porch[] = {0x0c, 0x0c, 0x00, 0x33, 0x33};
-    static const uint8_t gate[] = {0x00};
+    static const uint8_t gate[] = {0x35};
     static const uint8_t vcom[] = {0x36};
     static const uint8_t vdv_vrh_en[] = {0x01};
     static const uint8_t vrh[] = {0x13};
@@ -102,12 +108,18 @@ static esp_err_t lcd_send_vendor_init(void)
     };
 
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
-        ESP_RETURN_ON_ERROR(lcd_tx(cmds[i].cmd, cmds[i].data, cmds[i].len),
+        ESP_RETURN_ON_ERROR(lcd_tx_cmd(cmds[i].cmd, cmds[i].data, cmds[i].len),
                             TAG, "lcd cmd 0x%02x", cmds[i].cmd);
         if (cmds[i].delay_ms) {
             vTaskDelay(pdMS_TO_TICKS(cmds[i].delay_ms));
         }
     }
+
+    ESP_RETURN_ON_ERROR(lcd_tx_cmd(LCD_CMD_SLPOUT, NULL, 0), TAG, "SLPOUT");
+    vTaskDelay(pdMS_TO_TICKS(120));
+    ESP_RETURN_ON_ERROR(lcd_tx_cmd(LCD_CMD_DISPON, NULL, 0), TAG, "DISPON");
+    vTaskDelay(pdMS_TO_TICKS(20));
+
     return ESP_OK;
 }
 
@@ -132,33 +144,40 @@ static void lvgl_tick_cb(void *arg)
     lv_tick_inc(APP_LCD_LVGL_TICK_MS);
 }
 
+static esp_err_t lcd_draw_rgb565_bitmap(uint32_t x0, uint32_t y0,
+                                        uint32_t x1, uint32_t y1,
+                                        const uint16_t *pixels)
+{
+    ESP_RETURN_ON_FALSE(s_lcd_ready && pixels, ESP_ERR_INVALID_STATE, TAG,
+                        "lcd not ready");
+    ESP_RETURN_ON_FALSE(x1 > x0 && y1 > y0 &&
+                        x1 <= APP_LCD_H_RES && y1 <= APP_LCD_V_RES,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid draw area");
+
+    return esp_lcd_panel_draw_bitmap(s_lcd_panel, x0, y0, x1, y1, pixels);
+}
+
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
                           lv_color_t *color_map)
 {
-    if (s_lcd_suspended || !s_lcd_panel) {
+    if (s_lcd_suspended || !s_lcd_ready) {
         lv_disp_flush_ready(drv);
         return;
     }
-    esp_err_t err = esp_lcd_panel_draw_bitmap(s_lcd_panel, area->x1, area->y1,
-                                              area->x2 + 1, area->y2 + 1,
-                                              color_map);
+    uint32_t pixel_count = (area->x2 - area->x1 + 1) * (area->y2 - area->y1 + 1);
+    uint16_t *px = (uint16_t *)color_map;
+    for (uint32_t i = 0; i < pixel_count; i++) {
+        px[i] = (px[i] >> 8) | (px[i] << 8);
+    }
+    esp_err_t err = lcd_draw_rgb565_bitmap(area->x1, area->y1,
+                                           area->x2 + 1, area->y2 + 1,
+                                           (const uint16_t *)color_map);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "lvgl flush failed: %s", esp_err_to_name(err));
         lv_disp_flush_ready(drv);
+        return;
     }
-}
-
-static bool lcd_color_trans_done_cb(esp_lcd_panel_io_handle_t panel_io,
-                                    esp_lcd_panel_io_event_data_t *edata,
-                                    void *user_ctx)
-{
-    (void)panel_io;
-    (void)edata;
-    (void)user_ctx;
-    if (s_lvgl_disp_drv) {
-        lv_disp_flush_ready(s_lvgl_disp_drv);
-    }
-    return false;
+    lv_disp_flush_ready(drv);
 }
 
 static esp_err_t touch_reset(void)
@@ -383,7 +402,7 @@ static void lvgl_task(void *arg)
 
 esp_err_t bsp_lcd_init(void)
 {
-    if (s_lcd_panel) {
+    if (s_lcd_ready) {
         return ESP_OK;
     }
 
@@ -406,6 +425,8 @@ esp_err_t bsp_lcd_init(void)
         ESP_RETURN_ON_ERROR(spi_bus_initialize(BSP_LCD_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO),
                             TAG, "spi bus");
         s_lcd_bus_ready = true;
+        ESP_LOGI(TAG, "SPI3 bus initialized: SCLK=%d MOSI=%d",
+                 BSP_LCD_SPI_SCLK_GPIO, BSP_LCD_SPI_MOSI_GPIO);
     }
 
     esp_lcd_panel_io_spi_config_t io_cfg = {
@@ -414,7 +435,6 @@ esp_err_t bsp_lcd_init(void)
         .spi_mode = 0,
         .pclk_hz = APP_LCD_SPI_PCLK_HZ,
         .trans_queue_depth = APP_LCD_SPI_QUEUE_DEPTH,
-        .on_color_trans_done = lcd_color_trans_done_cb,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
     };
@@ -425,31 +445,48 @@ esp_err_t bsp_lcd_init(void)
     esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = -1,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
-        .data_endian = LCD_RGB_DATA_ENDIAN_LITTLE,
         .bits_per_pixel = 16,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(s_lcd_io, &panel_cfg, &s_lcd_panel),
                         TAG, "st7789 panel");
 
-    ESP_RETURN_ON_ERROR(lcd_reset_gpio(), TAG, "lcd hw reset");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_lcd_panel), TAG, "lcd sw reset");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_lcd_panel), TAG, "lcd init");
-    vTaskDelay(pdMS_TO_TICKS(380));
-    ESP_RETURN_ON_ERROR(lcd_send_vendor_init(), TAG, "lcd vendor init");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_set_gap(s_lcd_panel, APP_LCD_X_GAP,
-                                              APP_LCD_Y_GAP),
-                        TAG, "lcd gap");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_lcd_panel, true), TAG, "lcd on");
+    esp_err_t ret;
+    ret = lcd_reset_gpio();
+    ESP_LOGI(TAG, "lcd_reset_gpio: %s", esp_err_to_name(ret));
+    ESP_RETURN_ON_ERROR(ret, TAG, "lcd hw reset");
+
+    ret = esp_lcd_panel_reset(s_lcd_panel);
+    ESP_LOGI(TAG, "esp_lcd_panel_reset: %s", esp_err_to_name(ret));
+    ESP_RETURN_ON_ERROR(ret, TAG, "lcd sw reset");
+
+    ret = esp_lcd_panel_init(s_lcd_panel);
+    ESP_LOGI(TAG, "esp_lcd_panel_init: %s", esp_err_to_name(ret));
+    ESP_RETURN_ON_ERROR(ret, TAG, "lcd init");
+
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    ret = esp_lcd_panel_set_gap(s_lcd_panel, APP_LCD_X_GAP, APP_LCD_Y_GAP);
+    ESP_LOGI(TAG, "esp_lcd_panel_set_gap: %s", esp_err_to_name(ret));
+    ESP_RETURN_ON_ERROR(ret, TAG, "lcd gap");
+
+    ret = esp_lcd_panel_invert_color(s_lcd_panel, true);
+    ESP_LOGI(TAG, "esp_lcd_panel_invert_color: %s", esp_err_to_name(ret));
+    ESP_RETURN_ON_ERROR(ret, TAG, "lcd invert");
+
+    ret = esp_lcd_panel_disp_on_off(s_lcd_panel, true);
+    ESP_LOGI(TAG, "esp_lcd_panel_disp_on_off: %s", esp_err_to_name(ret));
+    ESP_RETURN_ON_ERROR(ret, TAG, "lcd on");
     bl_err = bsp_ioexp_set_pin(BSP_IO_EXP_LCD_BL_PIN, true);
     if (bl_err != ESP_OK) {
         ESP_LOGW(TAG, "backlight on via IO expander unavailable: %s",
                  esp_err_to_name(bl_err));
     }
 
-    ESP_LOGI(TAG, "ST7789V3 LCD ready: %ux%u, SPI3 sclk=%d mosi=%d dc=%d cs=%d bl=P%d rst=P%d",
+    s_lcd_ready = true;
+    ESP_LOGI(TAG, "ST7789V3 LCD ready: %ux%u, SPI3 sclk=%d mosi=%d dc=%d cs=%d te=%d bl=P%d rst=P%d",
              APP_LCD_H_RES, APP_LCD_V_RES, BSP_LCD_SPI_SCLK_GPIO,
              BSP_LCD_SPI_MOSI_GPIO, BSP_LCD_SPI_DC_GPIO, BSP_LCD_SPI_CS_GPIO,
-             BSP_IO_EXP_LCD_BL_PIN, BSP_IO_EXP_LCD_RST_PIN);
+             BSP_LCD_TE_GPIO, BSP_IO_EXP_LCD_BL_PIN, BSP_IO_EXP_LCD_RST_PIN);
     return ESP_OK;
 }
 
@@ -462,10 +499,12 @@ esp_err_t bsp_lcd_release_for_camera(void)
         esp_lcd_panel_disp_on_off(s_lcd_panel, false);
         esp_lcd_panel_del(s_lcd_panel);
         s_lcd_panel = NULL;
+        s_lcd_ready = false;
     }
     if (s_lcd_io) {
         esp_lcd_panel_io_del(s_lcd_io);
         s_lcd_io = NULL;
+        s_lcd_ready = false;
     }
     if (s_lcd_bus_ready) {
         esp_err_t err = spi_bus_free(BSP_LCD_SPI_HOST);
@@ -493,7 +532,7 @@ esp_err_t bsp_lcd_reinit_after_camera(void)
 
 esp_err_t bsp_lcd_show_test_pattern(void)
 {
-    if (!s_lcd_panel) {
+    if (!s_lcd_ready) {
         ESP_RETURN_ON_ERROR(bsp_lcd_init(), TAG, "lcd init");
     }
 
@@ -506,7 +545,7 @@ esp_err_t bsp_lcd_show_test_pattern(void)
     }
 
     static const uint16_t colors[] = {
-        0xf800, 0x07e0, 0x001f, 0xffe0, 0x07ff, 0xf81f, 0xffff, 0x0000,
+        0x00f8, 0xe007, 0x1f00, 0xe0ff, 0xff07, 0x1ff8, 0xffff, 0x0000,
     };
     for (uint32_t y = 0; y < APP_LCD_V_RES; y += rows) {
         uint32_t draw_rows = APP_LCD_V_RES - y;
@@ -519,9 +558,11 @@ esp_err_t bsp_lcd_show_test_pattern(void)
                 line[row * APP_LCD_H_RES + x] = colors[band];
             }
         }
-        esp_err_t err = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, y,
-                                                  APP_LCD_H_RES, y + draw_rows,
-                                                  line);
+        esp_err_t err = lcd_draw_rgb565_bitmap(0, y, APP_LCD_H_RES,
+                                               y + draw_rows, line);
+        if (y == 0) {
+            ESP_LOGI(TAG, "first draw_bitmap (y=0..%lu): %s", (unsigned long)draw_rows, esp_err_to_name(err));
+        }
         if (err != ESP_OK) {
             heap_caps_free(line);
             ESP_RETURN_ON_ERROR(err, TAG, "draw test");
@@ -538,7 +579,7 @@ esp_err_t bsp_lcd_start_lvgl_demo(void)
     if (s_lvgl_started) {
         return ESP_OK;
     }
-    if (!s_lcd_panel) {
+    if (!s_lcd_ready) {
         ESP_RETURN_ON_ERROR(bsp_lcd_init(), TAG, "lcd init");
     }
 
@@ -623,7 +664,7 @@ esp_err_t bsp_lcd_start_camera_ui(bsp_lcd_capture_cb_t cb, void *user)
         }
         return ESP_OK;
     }
-    if (!s_lcd_panel) {
+    if (!s_lcd_ready) {
         ESP_RETURN_ON_ERROR(bsp_lcd_init(), TAG, "lcd init");
     }
 

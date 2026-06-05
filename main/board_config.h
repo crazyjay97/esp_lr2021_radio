@@ -26,10 +26,10 @@
 /* ---------- I2C0 (ES8311 codec, TCA9554A GPIO expander, touch panel) ----- */
 #define BSP_I2C0_SCL_GPIO           GPIO_NUM_18
 #define BSP_I2C0_SDA_GPIO           GPIO_NUM_16
-#define BSP_I2C0_FREQ_HZ            (400 * 1000)
+#define BSP_I2C0_FREQ_HZ            (100 * 1000)   /* bring-up: slower bus improves margin */
 
 #define BSP_I2C_ADDR_ES8311         0x18   /* Audio codec                     */
-#define BSP_I2C_ADDR_IO_EXPANDER    0x20   /* TCA9554A base address           */
+#define BSP_I2C_ADDR_IO_EXPANDER    0x39   /* TCA9554A, A0 changed            */
 /* Touch panel I2C address depends on the controller fitted on the FPC. */
 
 /* ---------- I2S0 (ES8311 codec audio path) ------------------------------- */
@@ -43,14 +43,14 @@
 #define BSP_IO_EXP_PA_MUTE_PIN      6
 
 /* ---------- ST7789V3 LCD on V02 20-pin FPC ------------------------------- */
-/* LCD pins share several ESP GPIOs
- * with the 26-pin DVP camera FPC, so the BSP powers the camera down before
- * driving the LCD SPI bus. */
-#define BSP_LCD_SPI_SCLK_GPIO       GPIO_NUM_44   /* LCD_CLK, shared with D5 */
-#define BSP_LCD_SPI_MOSI_GPIO       GPIO_NUM_48   /* LCD_D0, shared with D6  */
-#define BSP_LCD_SPI_DC_GPIO         GPIO_NUM_43   /* LCD_D1, used as D/C     */
-#define BSP_LCD_SPI_CS_GPIO         GPIO_NUM_47   /* LCD_CS1, shared with D7 */
-#define BSP_LCD_TE_GPIO             GPIO_NUM_4    /* LCD_TE, shared with D3  */
+/* 4-wire SPI is enough for basic display. Some LCD FPC pins share GPIOs with
+ * the 26-pin DVP camera FPC, so the BSP powers the camera down before driving
+ * the LCD SPI bus. */
+#define BSP_LCD_SPI_SCLK_GPIO       GPIO_NUM_44   /* LCD_CLK                 */
+#define BSP_LCD_SPI_MOSI_GPIO       GPIO_NUM_43   /* LCD_MOSI                */
+#define BSP_LCD_SPI_DC_GPIO         GPIO_NUM_48   /* LCD_DC                  */
+#define BSP_LCD_SPI_CS_GPIO         GPIO_NUM_47   /* LCD_CS                  */
+#define BSP_LCD_TE_GPIO             GPIO_NUM_NC   /* TE is not used for bring-up */
 #define BSP_LCD_TOUCH_INT_GPIO      GPIO_NUM_12
 
 #define BSP_IO_EXP_LCD_RST_PIN      3

@@ -1,0 +1,373 @@
+#include "camera_uart.hpp"
+
+#include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "app_config.h"
+#include "board_config.h"
+#include "driver/gpio.h"
+#include "driver/i2c_master.h"
+#include "driver/ledc.h"
+#include "esp_cam_ctlr.h"
+#include "esp_cam_ctlr_dvp.h"
+#include "esp_check.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "bsp.h"
+
+#include "sp0a39_regs.h"
+
+namespace {
+
+constexpr const char *TAG = "camera_dvp";
+constexpr TickType_t kPwdnSettleTicks = pdMS_TO_TICKS(100);
+constexpr TickType_t kResetSettleTicks = pdMS_TO_TICKS(120);
+constexpr uint32_t kFrameBytes = APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT;
+
+struct dvp_cb_ctx {
+    uint8_t *buffer;
+    size_t buflen;
+    size_t received;
+    int frame_count;
+    SemaphoreHandle_t done_sem;
+};
+
+static bool IRAM_ATTR on_get_new_trans(esp_cam_ctlr_handle_t handle,
+                                       esp_cam_ctlr_trans_t *trans, void *user_data)
+{
+    dvp_cb_ctx *ctx = static_cast<dvp_cb_ctx *>(user_data);
+    trans->buffer = ctx->buffer;
+    trans->buflen = ctx->buflen;
+    return false;
+}
+
+static bool IRAM_ATTR on_trans_finished(esp_cam_ctlr_handle_t handle,
+                                        esp_cam_ctlr_trans_t *trans, void *user_data)
+{
+    dvp_cb_ctx *ctx = static_cast<dvp_cb_ctx *>(user_data);
+    ctx->frame_count++;
+    if (ctx->frame_count >= 2) {
+        ctx->received = trans->received_size;
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xSemaphoreGiveFromISR(ctx->done_sem, &xHigherPriorityTaskWoken);
+        return xHigherPriorityTaskWoken == pdTRUE;
+    }
+    return false;
+}
+
+i2c_master_dev_handle_t s_sensor_dev = nullptr;
+
+esp_err_t sensor_i2c_attach()
+{
+    if (s_sensor_dev) return ESP_OK;
+    i2c_master_bus_handle_t bus = bsp_i2c_bus();
+    if (!bus) return ESP_ERR_INVALID_STATE;
+
+    i2c_device_config_t cfg = {};
+    cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    cfg.device_address = APP_SP0A39_I2C_ADDR;
+    cfg.scl_speed_hz = BSP_I2C0_FREQ_HZ;
+    return i2c_master_bus_add_device(bus, &cfg, &s_sensor_dev);
+}
+
+void sensor_i2c_detach()
+{
+    if (s_sensor_dev) {
+        i2c_master_bus_rm_device(s_sensor_dev);
+        s_sensor_dev = nullptr;
+    }
+}
+
+esp_err_t sensor_write_reg(uint8_t reg, uint8_t val)
+{
+    uint8_t buf[2] = {reg, val};
+    return i2c_master_transmit(s_sensor_dev, buf, 2, 50);
+}
+
+esp_err_t sensor_read_reg(uint8_t reg, uint8_t *val)
+{
+    return i2c_master_transmit_receive(s_sensor_dev, &reg, 1, val, 1, 50);
+}
+
+esp_err_t sensor_write_regs()
+{
+    const size_t count = sizeof(s_sp0a39_regs) / sizeof(s_sp0a39_regs[0]);
+    for (size_t i = 0; i < count; i++) {
+        esp_err_t ret = sensor_write_reg(s_sp0a39_regs[i][0], s_sp0a39_regs[i][1]);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "reg write failed at [%u] 0x%02x=0x%02x: %s",
+                     (unsigned)i, s_sp0a39_regs[i][0], s_sp0a39_regs[i][1],
+                     esp_err_to_name(ret));
+            return ret;
+        }
+    }
+    ESP_LOGI(TAG, "SP0A39 register init done (%u regs)", (unsigned)count);
+    return ESP_OK;
+}
+
+esp_err_t sensor_read_id()
+{
+    ESP_RETURN_ON_ERROR(sensor_write_reg(0xfd, 0x00), TAG, "page select");
+    uint8_t id_h = 0, id_l = 0;
+    ESP_RETURN_ON_ERROR(sensor_read_reg(0x00, &id_h), TAG, "read id_h");
+    ESP_RETURN_ON_ERROR(sensor_read_reg(0x01, &id_l), TAG, "read id_l");
+    ESP_LOGI(TAG, "SP0A39 chip ID: 0x%02X%02X", id_h, id_l);
+    return ESP_OK;
+}
+
+} // namespace
+
+esp_err_t CameraUartStreamer::init()
+{
+    if (initialized_) return ESP_OK;
+    ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c init");
+
+    // Start MCLK output immediately — SP0A39 needs clock to respond to I2C
+    ledc_timer_config_t ledc_timer = {};
+    ledc_timer.speed_mode = LEDC_LOW_SPEED_MODE;
+    ledc_timer.timer_num = LEDC_TIMER_1;
+    ledc_timer.duty_resolution = LEDC_TIMER_1_BIT;
+    ledc_timer.freq_hz = APP_SP0A39_MCLK_HZ;
+    ledc_timer.clk_cfg = LEDC_AUTO_CLK;
+    ESP_RETURN_ON_ERROR(ledc_timer_config(&ledc_timer), TAG, "ledc timer");
+
+    ledc_channel_config_t ledc_ch = {};
+    ledc_ch.speed_mode = LEDC_LOW_SPEED_MODE;
+    ledc_ch.channel = LEDC_CHANNEL_1;
+    ledc_ch.timer_sel = LEDC_TIMER_1;
+    ledc_ch.intr_type = LEDC_INTR_DISABLE;
+    ledc_ch.gpio_num = BSP_SP0A39_MCLK_GPIO;
+    ledc_ch.duty = 1;
+    ledc_ch.hpoint = 0;
+    ESP_RETURN_ON_ERROR(ledc_channel_config(&ledc_ch), TAG, "ledc channel");
+    ESP_LOGI(TAG, "MCLK running on GPIO%d at %lu Hz", BSP_SP0A39_MCLK_GPIO, APP_SP0A39_MCLK_HZ);
+
+    set_pwdn(true);
+    initialized_ = true;
+    return ESP_OK;
+}
+
+esp_err_t CameraUartStreamer::start()
+{
+    ESP_RETURN_ON_ERROR(init(), TAG, "init");
+    return ESP_OK;
+}
+
+esp_err_t CameraUartStreamer::set_pwdn(bool asserted)
+{
+    return bsp_ioexp_set_pin(BSP_SP0A39_PWDN_IOEXP_PIN, asserted);
+}
+
+esp_err_t CameraUartStreamer::reset_sensor()
+{
+    gpio_config_t reset = {};
+    reset.pin_bit_mask = 1ULL << BSP_SP0A39_RESET_GPIO;
+    reset.mode = GPIO_MODE_OUTPUT;
+    reset.pull_up_en = GPIO_PULLUP_DISABLE;
+    reset.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    reset.intr_type = GPIO_INTR_DISABLE;
+    ESP_RETURN_ON_ERROR(gpio_config(&reset), TAG, "camera reset gpio");
+    gpio_set_level(BSP_SP0A39_RESET_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level(BSP_SP0A39_RESET_GPIO, 1);
+    vTaskDelay(kResetSettleTicks);
+    return ESP_OK;
+}
+
+esp_err_t CameraUartStreamer::configure_camera_pins()
+{
+    uint64_t mask = 0;
+    mask |= 1ULL << BSP_SP0A39_PCLK_GPIO;
+    mask |= 1ULL << BSP_SP0A39_VSYNC_GPIO;
+    mask |= 1ULL << BSP_SP0A39_HSYNC_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D0_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D1_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D2_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D3_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D4_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D5_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D6_GPIO;
+    mask |= 1ULL << BSP_SP0A39_D7_GPIO;
+    gpio_config_t input_conf = {};
+    input_conf.pin_bit_mask = mask;
+    input_conf.mode = GPIO_MODE_INPUT;
+    input_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    input_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    input_conf.intr_type = GPIO_INTR_DISABLE;
+    ESP_RETURN_ON_ERROR(gpio_config(&input_conf), TAG, "gpio input config");
+    ESP_LOGI(TAG, "camera DVP pins configured as inputs");
+    return ESP_OK;
+}
+
+esp_err_t CameraUartStreamer::power_down()
+{
+    set_pwdn(true);
+    gpio_reset_pin(BSP_SP0A39_RESET_GPIO);
+    sensor_i2c_detach();
+    return ESP_OK;
+}
+
+esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
+                                            size_t *out_len,
+                                            uint32_t *out_width,
+                                            uint32_t *out_height,
+                                            uint32_t *out_pixelformat)
+{
+    ESP_RETURN_ON_FALSE(out_data && out_len && out_width && out_height && out_pixelformat,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid args");
+    *out_data = nullptr;
+    *out_len = 0;
+    *out_width = 0;
+    *out_height = 0;
+    *out_pixelformat = 0;
+
+    ESP_RETURN_ON_ERROR(init(), TAG, "init");
+    ESP_RETURN_ON_ERROR(configure_camera_pins(), TAG, "camera pins");
+
+    // Release PWDN with MCLK already running from init()
+    ESP_LOGI(TAG, "releasing SP0A39 PWDN: P%d low", BSP_SP0A39_PWDN_IOEXP_PIN);
+    set_pwdn(false);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    ESP_RETURN_ON_ERROR(reset_sensor(), TAG, "reset");
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    ESP_RETURN_ON_ERROR(sensor_i2c_attach(), TAG, "i2c attach");
+    i2c_master_bus_handle_t bus = bsp_i2c_bus();
+    ESP_LOGI(TAG, "I2C bus scan after PWDN release:");
+    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+        if (i2c_master_probe(bus, addr, 50) == ESP_OK) {
+            ESP_LOGI(TAG, "  found device at 0x%02X", addr);
+        }
+    }
+
+    esp_err_t ret = sensor_read_id();
+    if (ret != ESP_OK) { power_down(); return ret; }
+    ret = sensor_write_regs();
+    if (ret != ESP_OK) { power_down(); return ret; }
+
+    // Release LEDC from GPIO3, then immediately create DVP (restores XCLK)
+    ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+    ledc_timer_pause(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1);
+    gpio_reset_pin(BSP_SP0A39_MCLK_GPIO);
+
+    esp_cam_ctlr_dvp_pin_config_t pins = {};
+    pins.data_width = CAM_CTLR_DATA_WIDTH_8;
+    pins.data_io[0] = BSP_SP0A39_D0_GPIO;
+    pins.data_io[1] = BSP_SP0A39_D1_GPIO;
+    pins.data_io[2] = BSP_SP0A39_D2_GPIO;
+    pins.data_io[3] = BSP_SP0A39_D3_GPIO;
+    pins.data_io[4] = BSP_SP0A39_D4_GPIO;
+    pins.data_io[5] = BSP_SP0A39_D5_GPIO;
+    pins.data_io[6] = BSP_SP0A39_D6_GPIO;
+    pins.data_io[7] = BSP_SP0A39_D7_GPIO;
+    pins.vsync_io = BSP_SP0A39_VSYNC_GPIO;
+    pins.de_io = BSP_SP0A39_HSYNC_GPIO;
+    pins.pclk_io = BSP_SP0A39_PCLK_GPIO;
+    pins.xclk_io = BSP_SP0A39_MCLK_GPIO;
+
+    esp_cam_ctlr_dvp_config_t dvp_cfg = {};
+    dvp_cfg.ctlr_id = 0;
+    dvp_cfg.clk_src = CAM_CLK_SRC_DEFAULT;
+    dvp_cfg.h_res = APP_CAMERA_SENSOR_WIDTH;
+    dvp_cfg.v_res = APP_CAMERA_SENSOR_HEIGHT;
+    dvp_cfg.input_data_color_type = CAM_CTLR_COLOR_RAW8;
+    dvp_cfg.pin = &pins;
+    dvp_cfg.xclk_freq = APP_SP0A39_MCLK_HZ;
+    dvp_cfg.dma_burst_size = 64;
+    dvp_cfg.bk_buffer_dis = 1;
+
+    esp_cam_ctlr_handle_t cam_handle = nullptr;
+    ret = esp_cam_new_dvp_ctlr(&dvp_cfg, &cam_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_cam_new_dvp_ctlr failed: %s", esp_err_to_name(ret));
+        power_down();
+        return ret;
+    }
+
+    // DVP now outputs XCLK on GPIO3 — wait for sensor to stabilize
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    uint8_t *frame_buf = static_cast<uint8_t *>(
+        heap_caps_malloc(kFrameBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA));
+    if (!frame_buf) {
+        ESP_LOGE(TAG, "frame buffer alloc failed");
+        esp_cam_ctlr_del(cam_handle);
+        power_down();
+        return ESP_ERR_NO_MEM;
+    }
+
+    dvp_cb_ctx ctx = {};
+    ctx.buffer = frame_buf;
+    ctx.buflen = kFrameBytes;
+    ctx.received = 0;
+    ctx.frame_count = 0;
+    ctx.done_sem = xSemaphoreCreateBinary();
+
+    esp_cam_ctlr_evt_cbs_t cbs = {};
+    cbs.on_get_new_trans = on_get_new_trans;
+    cbs.on_trans_finished = on_trans_finished;
+    ret = esp_cam_ctlr_register_event_callbacks(cam_handle, &cbs, &ctx);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register cbs failed: %s", esp_err_to_name(ret));
+        vSemaphoreDelete(ctx.done_sem);
+        heap_caps_free(frame_buf);
+        esp_cam_ctlr_del(cam_handle);
+        power_down();
+        return ret;
+    }
+
+    ret = esp_cam_ctlr_enable(cam_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_cam_ctlr_enable failed: %s", esp_err_to_name(ret));
+        vSemaphoreDelete(ctx.done_sem);
+        heap_caps_free(frame_buf);
+        esp_cam_ctlr_del(cam_handle);
+        power_down();
+        return ret;
+    }
+
+    ret = esp_cam_ctlr_start(cam_handle);
+    if (ret != ESP_OK) goto cleanup;
+
+    // Debug: sample VSYNC/HSYNC/PCLK levels to check if sensor is outputting
+    {
+        int vsync_changes = 0, pclk_changes = 0;
+        int last_vsync = gpio_get_level(BSP_SP0A39_VSYNC_GPIO);
+        int last_pclk = gpio_get_level(BSP_SP0A39_PCLK_GPIO);
+        for (int i = 0; i < 100000; i++) {
+            int v = gpio_get_level(BSP_SP0A39_VSYNC_GPIO);
+            int p = gpio_get_level(BSP_SP0A39_PCLK_GPIO);
+            if (v != last_vsync) { vsync_changes++; last_vsync = v; }
+            if (p != last_pclk) { pclk_changes++; last_pclk = p; }
+        }
+        int hsync_level = gpio_get_level(BSP_SP0A39_HSYNC_GPIO);
+        ESP_LOGI(TAG, "GPIO diagnostics: VSYNC changes=%d, PCLK changes=%d, HSYNC level=%d",
+                 vsync_changes, pclk_changes, hsync_level);
+    }
+
+    if (xSemaphoreTake(ctx.done_sem, pdMS_TO_TICKS(5000)) == pdTRUE && ctx.received > 0) {
+        ESP_LOGI(TAG, "captured frame: %u bytes (skipped %d)",
+                 (unsigned)ctx.received, ctx.frame_count - 1);
+        *out_data = frame_buf;
+        *out_len = ctx.received;
+        *out_width = APP_CAMERA_SENSOR_WIDTH;
+        *out_height = APP_CAMERA_SENSOR_HEIGHT;
+        *out_pixelformat = 0x59455247;
+        frame_buf = nullptr;
+    } else {
+        ESP_LOGE(TAG, "capture timeout or no data, frames=%d", ctx.frame_count);
+        ret = ESP_ERR_TIMEOUT;
+    }
+
+    esp_cam_ctlr_stop(cam_handle);
+    esp_cam_ctlr_disable(cam_handle);
+
+cleanup:
+    vSemaphoreDelete(ctx.done_sem);
+    if (frame_buf) heap_caps_free(frame_buf);
+    esp_cam_ctlr_del(cam_handle);
+    power_down();
+    return ret;
+}
