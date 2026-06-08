@@ -25,13 +25,30 @@ constexpr const char *TAG = "camera_dvp";
 constexpr TickType_t kPwdnSettleTicks = pdMS_TO_TICKS(100);
 constexpr TickType_t kResetSettleTicks = pdMS_TO_TICKS(120);
 constexpr uint32_t kFourccGrey = 0x59455247; // 'GREY'
-constexpr uint32_t kFrameBytes = APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT;
+constexpr uint32_t kFourccUyvy = 0x59565955; // 'UYVY'
+constexpr uint32_t kFourccYuyv = 0x56595559; // 'YUYV'
+constexpr uint32_t kFourccVyuy = 0x59555956; // 'VYUY'
+constexpr uint32_t kFrameBytes = APP_CAMERA_FRAME_BYTES;
+constexpr size_t kCaptureDmaBufferCount = 4;
+
+#if APP_CAMERA_COLOR_ENABLE
+constexpr uint32_t kDvpCaptureWidth = APP_CAMERA_SENSOR_WIDTH;
+constexpr cam_ctlr_color_t kDvpInputColor = CAM_CTLR_COLOR_YUV422;
+constexpr uint32_t kOutputPixelformat = kFourccUyvy;
+#else
+constexpr uint32_t kDvpCaptureWidth = APP_CAMERA_SENSOR_WIDTH;
+constexpr cam_ctlr_color_t kDvpInputColor = CAM_CTLR_COLOR_GRAY8;
+constexpr uint32_t kOutputPixelformat = kFourccGrey;
+#endif
 
 struct dvp_cb_ctx {
-    uint8_t *buffer;
+    uint8_t *buffers[kCaptureDmaBufferCount];
     size_t buflen;
     size_t received;
     int frame_count;
+    size_t next_buffer;
+    size_t last_received;
+    uint8_t *captured_buffer;
     SemaphoreHandle_t done_sem;
 };
 
@@ -39,9 +56,13 @@ static bool IRAM_ATTR on_get_new_trans(esp_cam_ctlr_handle_t handle,
                                        esp_cam_ctlr_trans_t *trans, void *user_data)
 {
     dvp_cb_ctx *ctx = static_cast<dvp_cb_ctx *>(user_data);
-    trans->buffer = ctx->buffer;
+    if (ctx->captured_buffer && ctx->buffers[ctx->next_buffer] == ctx->captured_buffer) {
+        ctx->next_buffer = (ctx->next_buffer + 1) % kCaptureDmaBufferCount;
+    }
+    trans->buffer = ctx->buffers[ctx->next_buffer];
     trans->buflen = ctx->buflen;
-    return false;
+    ctx->next_buffer = (ctx->next_buffer + 1) % kCaptureDmaBufferCount;
+    return trans->buffer != nullptr;
 }
 
 static bool IRAM_ATTR on_trans_finished(esp_cam_ctlr_handle_t handle,
@@ -49,8 +70,10 @@ static bool IRAM_ATTR on_trans_finished(esp_cam_ctlr_handle_t handle,
 {
     dvp_cb_ctx *ctx = static_cast<dvp_cb_ctx *>(user_data);
     ctx->frame_count++;
+    ctx->last_received = trans->received_size;
     if (ctx->frame_count >= 2) {
         ctx->received = trans->received_size;
+        ctx->captured_buffer = static_cast<uint8_t *>(trans->buffer);
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         xSemaphoreGiveFromISR(ctx->done_sem, &xHigherPriorityTaskWoken);
         return xHigherPriorityTaskWoken == pdTRUE;
@@ -118,6 +141,31 @@ esp_err_t sensor_read_id()
     return ESP_OK;
 }
 
+void log_sensor_output_regs()
+{
+    uint8_t p0_1c = 0;
+    uint8_t p0_30 = 0;
+    uint8_t p0_31 = 0;
+    uint8_t p1_32 = 0;
+    uint8_t p1_34 = 0;
+    uint8_t p1_35 = 0;
+    uint8_t p1_36 = 0;
+    if (sensor_write_reg(0xfd, 0x00) == ESP_OK) {
+        sensor_read_reg(0x1c, &p0_1c);
+        sensor_read_reg(0x30, &p0_30);
+        sensor_read_reg(0x31, &p0_31);
+    }
+    if (sensor_write_reg(0xfd, 0x01) == ESP_OK) {
+        sensor_read_reg(0x32, &p1_32);
+        sensor_read_reg(0x34, &p1_34);
+        sensor_read_reg(0x35, &p1_35);
+        sensor_read_reg(0x36, &p1_36);
+    }
+    sensor_write_reg(0xfd, 0x00);
+    ESP_LOGI(TAG, "SP0A39 output regs: P0:1c=0x%02x P0:30=0x%02x P0:31=0x%02x P1:32=0x%02x P1:34=0x%02x P1:35=0x%02x P1:36=0x%02x",
+             p0_1c, p0_30, p0_31, p1_32, p1_34, p1_35, p1_36);
+}
+
 void log_gpio_diagnostics()
 {
     int vsync_changes = 0;
@@ -154,7 +202,7 @@ esp_err_t CameraUartStreamer::init()
     if (initialized_) return ESP_OK;
     ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c init");
 
-    // Start MCLK output immediately — SP0A39 needs clock to respond to I2C
+    // Start MCLK output immediately - SP0A39 needs clock to respond to I2C
     ledc_timer_config_t ledc_timer = {};
     ledc_timer.speed_mode = LEDC_LOW_SPEED_MODE;
     ledc_timer.timer_num = LEDC_TIMER_1;
@@ -270,6 +318,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     if (ret != ESP_OK) { power_down(); return ret; }
     ret = sensor_write_regs();
     if (ret != ESP_OK) { power_down(); return ret; }
+    log_sensor_output_regs();
 
     // Release LEDC from GPIO3, then immediately create DVP (restores XCLK)
     ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
@@ -294,13 +343,20 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     esp_cam_ctlr_dvp_config_t dvp_cfg = {};
     dvp_cfg.ctlr_id = 0;
     dvp_cfg.clk_src = CAM_CLK_SRC_DEFAULT;
-    dvp_cfg.h_res = APP_CAMERA_SENSOR_WIDTH;
+    dvp_cfg.h_res = kDvpCaptureWidth;
     dvp_cfg.v_res = APP_CAMERA_SENSOR_HEIGHT;
-    dvp_cfg.input_data_color_type = CAM_CTLR_COLOR_RAW8;
+    dvp_cfg.input_data_color_type = kDvpInputColor;
     dvp_cfg.pin = &pins;
     dvp_cfg.xclk_freq = APP_SP0A39_MCLK_HZ;
     dvp_cfg.dma_burst_size = 64;
     dvp_cfg.bk_buffer_dis = 1;
+    ESP_LOGI(TAG, "DVP capture format: %s, capture=%lux%lu, logical=%ux%u, buffer=%lu bytes",
+             APP_CAMERA_COLOR_ENABLE ? "YUV422 UYVY" : "GRAY8",
+             (unsigned long)kDvpCaptureWidth,
+             (unsigned long)APP_CAMERA_SENSOR_HEIGHT,
+             APP_CAMERA_SENSOR_WIDTH,
+             APP_CAMERA_SENSOR_HEIGHT,
+             (unsigned long)kFrameBytes);
 
     esp_cam_ctlr_handle_t cam_handle = nullptr;
     ret = esp_cam_new_dvp_ctlr(&dvp_cfg, &cam_handle);
@@ -310,24 +366,47 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
         return ret;
     }
 
-    // DVP now outputs XCLK on GPIO3 — wait for sensor to stabilize
+    // DVP now outputs XCLK on GPIO3 - wait for sensor to stabilize
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    uint8_t *frame_buf = static_cast<uint8_t *>(
-        heap_caps_malloc(kFrameBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA));
-    if (!frame_buf) {
-        ESP_LOGE(TAG, "frame buffer alloc failed");
+    uint8_t *frame_bufs[kCaptureDmaBufferCount] = {};
+    for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
+        frame_bufs[i] = static_cast<uint8_t *>(
+            esp_cam_ctlr_alloc_buffer(cam_handle, kFrameBytes,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA));
+        if (!frame_bufs[i]) {
+            ESP_LOGE(TAG, "frame buffer alloc failed: %u x %lu bytes",
+                     (unsigned)kCaptureDmaBufferCount, (unsigned long)kFrameBytes);
+            for (size_t j = 0; j < kCaptureDmaBufferCount; ++j) {
+                if (frame_bufs[j]) heap_caps_free(frame_bufs[j]);
+            }
+            esp_cam_ctlr_del(cam_handle);
+            power_down();
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    uint8_t *stable_frame = nullptr;
+
+    dvp_cb_ctx ctx = {};
+    for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
+        ctx.buffers[i] = frame_bufs[i];
+    }
+    ctx.buflen = kFrameBytes;
+    ctx.received = 0;
+    ctx.frame_count = 0;
+    ctx.next_buffer = 0;
+    ctx.last_received = 0;
+    ctx.captured_buffer = nullptr;
+    ctx.done_sem = xSemaphoreCreateBinary();
+    if (!ctx.done_sem) {
+        ESP_LOGE(TAG, "capture semaphore alloc failed");
+        for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
+            heap_caps_free(frame_bufs[i]);
+        }
         esp_cam_ctlr_del(cam_handle);
         power_down();
         return ESP_ERR_NO_MEM;
     }
-
-    dvp_cb_ctx ctx = {};
-    ctx.buffer = frame_buf;
-    ctx.buflen = kFrameBytes;
-    ctx.received = 0;
-    ctx.frame_count = 0;
-    ctx.done_sem = xSemaphoreCreateBinary();
 
     esp_cam_ctlr_evt_cbs_t cbs = {};
     cbs.on_get_new_trans = on_get_new_trans;
@@ -336,7 +415,9 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "register cbs failed: %s", esp_err_to_name(ret));
         vSemaphoreDelete(ctx.done_sem);
-        heap_caps_free(frame_buf);
+        for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
+            heap_caps_free(frame_bufs[i]);
+        }
         esp_cam_ctlr_del(cam_handle);
         power_down();
         return ret;
@@ -346,38 +427,67 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_cam_ctlr_enable failed: %s", esp_err_to_name(ret));
         vSemaphoreDelete(ctx.done_sem);
-        heap_caps_free(frame_buf);
+        for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
+            heap_caps_free(frame_bufs[i]);
+        }
         esp_cam_ctlr_del(cam_handle);
         power_down();
         return ret;
     }
 
+    bool got_frame = false;
+    bool cam_running = false;
     ret = esp_cam_ctlr_start(cam_handle);
     if (ret != ESP_OK) goto cleanup;
+    cam_running = true;
 
     log_gpio_diagnostics();
 
-    if (xSemaphoreTake(ctx.done_sem, pdMS_TO_TICKS(5000)) == pdTRUE && ctx.received > 0) {
-        ESP_LOGI(TAG, "captured frame: %u bytes (skipped %d)",
-                 (unsigned)ctx.received, ctx.frame_count - 1);
-        *out_data = frame_buf;
-        *out_len = ctx.received;
-        *out_width = APP_CAMERA_SENSOR_WIDTH;
-        *out_height = APP_CAMERA_SENSOR_HEIGHT;
-        *out_pixelformat = kFourccGrey;
-        frame_buf = nullptr;
-    } else {
-        log_gpio_diagnostics();
-        ESP_LOGE(TAG, "capture timeout or no data, frames=%d", ctx.frame_count);
-        ret = ESP_ERR_TIMEOUT;
-    }
-
+    got_frame = xSemaphoreTake(ctx.done_sem, pdMS_TO_TICKS(5000)) == pdTRUE;
     esp_cam_ctlr_stop(cam_handle);
     esp_cam_ctlr_disable(cam_handle);
+    cam_running = false;
+
+    if (got_frame && ctx.received >= kFrameBytes) {
+        ESP_LOGI(TAG, "captured frame: %u bytes (skipped %d), copying stable PSRAM frame",
+                 (unsigned)ctx.received, ctx.frame_count - 1);
+        stable_frame = static_cast<uint8_t *>(
+            heap_caps_malloc(kFrameBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!stable_frame) {
+            stable_frame = static_cast<uint8_t *>(
+                heap_caps_malloc(kFrameBytes, MALLOC_CAP_8BIT));
+        }
+        if (stable_frame) {
+            memcpy(stable_frame, ctx.captured_buffer, kFrameBytes);
+            *out_data = stable_frame;
+            *out_len = kFrameBytes;
+            *out_width = APP_CAMERA_SENSOR_WIDTH;
+            *out_height = APP_CAMERA_SENSOR_HEIGHT;
+            *out_pixelformat = kOutputPixelformat;
+            stable_frame = nullptr;
+        } else {
+            ESP_LOGE(TAG, "stable frame alloc failed: %lu bytes",
+                     (unsigned long)kFrameBytes);
+            ret = ESP_ERR_NO_MEM;
+        }
+    } else {
+        log_gpio_diagnostics();
+        ESP_LOGE(TAG, "capture failed: got=%d frames=%d last=%u received=%u expected=%u",
+                 got_frame ? 1 : 0, ctx.frame_count, (unsigned)ctx.last_received,
+                 (unsigned)ctx.received, (unsigned)kFrameBytes);
+        ret = got_frame ? ESP_ERR_INVALID_SIZE : ESP_ERR_TIMEOUT;
+    }
 
 cleanup:
+    if (cam_running) {
+        esp_cam_ctlr_stop(cam_handle);
+        esp_cam_ctlr_disable(cam_handle);
+    }
     vSemaphoreDelete(ctx.done_sem);
-    if (frame_buf) heap_caps_free(frame_buf);
+    if (stable_frame) heap_caps_free(stable_frame);
+    for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
+        if (frame_bufs[i]) heap_caps_free(frame_bufs[i]);
+    }
     esp_cam_ctlr_del(cam_handle);
     power_down();
     return ret;

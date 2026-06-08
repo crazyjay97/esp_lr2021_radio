@@ -349,7 +349,9 @@ static esp_err_t lvgl_create_camera_ui(void)
     s_camera_status_label = lv_label_create(scr);
     lv_label_set_text(s_camera_status_label, s_touch ? "Touch capture to take a photo" : "Touch not found");
     lv_obj_set_style_text_color(s_camera_status_label, lv_color_hex(0xd9e6f2), 0);
-    lv_obj_set_width(s_camera_status_label, APP_LCD_H_RES - 16);
+    lv_obj_set_style_bg_color(s_camera_status_label, lv_color_hex(0x101820), 0);
+    lv_obj_set_style_bg_opa(s_camera_status_label, LV_OPA_COVER, 0);
+    lv_obj_set_size(s_camera_status_label, APP_LCD_H_RES - 16, 20);
     lv_label_set_long_mode(s_camera_status_label, LV_LABEL_LONG_DOT);
     lv_obj_align(s_camera_status_label, LV_ALIGN_TOP_MID, 0, 10);
 
@@ -746,6 +748,21 @@ esp_err_t bsp_lcd_set_camera_status(const char *text)
     xSemaphoreTakeRecursive(s_lvgl_lock, portMAX_DELAY);
     lv_label_set_text(s_camera_status_label, text);
     lv_obj_invalidate(s_camera_status_label);
+    xSemaphoreGiveRecursive(s_lvgl_lock);
+    return ESP_OK;
+}
+
+esp_err_t bsp_lcd_clear_camera_photo(void)
+{
+    ESP_RETURN_ON_FALSE(s_lvgl_started && s_camera_canvas && s_camera_canvas_buf,
+                        ESP_ERR_INVALID_STATE, TAG, "camera canvas not ready");
+
+    xSemaphoreTakeRecursive(s_lvgl_lock, portMAX_DELAY);
+    const size_t canvas_pixels = APP_LCD_H_RES * APP_LCD_PHOTO_PREVIEW_H;
+    for (size_t i = 0; i < canvas_pixels; ++i) {
+        s_camera_canvas_buf[i] = lv_color_hex(0x18232d);
+    }
+    lv_obj_invalidate(s_camera_canvas);
     xSemaphoreGiveRecursive(s_lvgl_lock);
     return ESP_OK;
 }

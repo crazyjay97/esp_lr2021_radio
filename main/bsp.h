@@ -47,6 +47,7 @@ esp_err_t bsp_lcd_show_test_pattern(void);
 esp_err_t bsp_lcd_start_lvgl_demo(void);
 esp_err_t bsp_lcd_start_camera_ui(bsp_lcd_capture_cb_t cb, void *user);
 esp_err_t bsp_lcd_set_camera_status(const char *text);
+esp_err_t bsp_lcd_clear_camera_photo(void);
 esp_err_t bsp_lcd_show_gray_photo(const uint8_t *gray,
                                   uint32_t width,
                                   uint32_t height);

@@ -10,6 +10,8 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
+#include <stdio.h>
+
 #include "app_config.h"
 #include "bsp.h"
 
@@ -33,6 +35,22 @@ bool g_radio_active = false;
 const char *mode_name(AppMode mode)
 {
     return mode == AppMode::radio ? "radio" : "camera";
+}
+
+const char *short_error_name(esp_err_t err)
+{
+    switch (err) {
+    case ESP_ERR_NO_MEM:
+        return "NO_MEM";
+    case ESP_ERR_TIMEOUT:
+        return "TIMEOUT";
+    case ESP_ERR_INVALID_SIZE:
+        return "BAD_SIZE";
+    case ESP_ERR_NOT_SUPPORTED:
+        return "NOT_SUP";
+    default:
+        return nullptr;
+    }
 }
 
 void init_nvs()
@@ -123,9 +141,9 @@ void camera_capture_task(void *arg)
         return;
     }
 
-    e = g_camera_uart.capture_frame(&frame, &len, &width, &height, &pixfmt);
+    esp_err_t capture_e = g_camera_uart.capture_frame(&frame, &len, &width, &height, &pixfmt);
     ESP_LOGI(TAG, "capture result=%s frame=%p len=%u %lux%lu fourcc=0x%08lx",
-             esp_err_to_name(e), frame, static_cast<unsigned>(len),
+             esp_err_to_name(capture_e), frame, static_cast<unsigned>(len),
              static_cast<unsigned long>(width),
              static_cast<unsigned long>(height),
              static_cast<unsigned long>(pixfmt));
@@ -145,23 +163,35 @@ void camera_capture_task(void *arg)
 #endif
 #endif
 
-    if (e == ESP_OK && (pixfmt == 0x56595559 || pixfmt == 0x59565955 ||
-                        pixfmt == 0x55595659 || pixfmt == 0x59555956)) {
+    if (capture_e == ESP_OK && (pixfmt == 0x56595559 || pixfmt == 0x59565955 ||
+                                pixfmt == 0x55595659 || pixfmt == 0x59555956)) {
         if (bsp_lcd_show_yuv422_photo(frame, width, height, pixfmt) == ESP_OK) {
             bsp_lcd_set_camera_status("Captured. Touch capture to retake");
         } else {
             bsp_lcd_set_camera_status("Display photo failed");
         }
-    } else if (e == ESP_OK && pixfmt == 0x59455247) { // 'GREY'
+    } else if (capture_e == ESP_OK && pixfmt == 0x59455247) { // 'GREY'
         if (bsp_lcd_show_gray_photo(frame, width, height) == ESP_OK) {
             bsp_lcd_set_camera_status("Captured. Touch capture to retake");
         } else {
             bsp_lcd_set_camera_status("Display photo failed");
         }
-    } else if (e == ESP_OK) {
-        bsp_lcd_set_camera_status("Unsupported camera pixel format");
+    } else if (capture_e == ESP_OK) {
+        char status[64];
+        snprintf(status, sizeof(status), "Unsupported pixel 0x%08lx",
+                 static_cast<unsigned long>(pixfmt));
+        bsp_lcd_set_camera_status(status);
     } else {
-        bsp_lcd_set_camera_status("Capture failed");
+        bsp_lcd_clear_camera_photo();
+        char status[64];
+        const char *short_name = short_error_name(capture_e);
+        if (short_name) {
+            snprintf(status, sizeof(status), "Fail:%s", short_name);
+        } else {
+            snprintf(status, sizeof(status), "Fail:0x%lx",
+                     static_cast<unsigned long>(capture_e));
+        }
+        bsp_lcd_set_camera_status(status);
     }
 
     heap_caps_free(frame);

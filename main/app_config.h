@@ -201,7 +201,7 @@
 #define APP_CAMERA_UART_BAUD            2000000
 
 /* SP0A39 DVP mode with 24 MHz input clock. */
-#define APP_CAMERA_COLOR_ENABLE         0
+#define APP_CAMERA_COLOR_ENABLE         1
 #define APP_SP0A39_MCLK_HZ              24000000U
 #define APP_SP0A39_I2C_ADDR             0x21U
 
