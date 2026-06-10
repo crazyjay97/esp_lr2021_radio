@@ -228,6 +228,11 @@
 #define APP_CAMERA_TASK_STACK_BYTES     12288U
 #define APP_CAMERA_TASK_CORE            1
 
+/* ----- EPD test ------------------------------------------------------------- */
+
+/* Set to 1 to run a minimal EPD bring-up test on boot (skips all other init). */
+#define APP_EPD_TEST                    1
+
 /* ----- ST7789V3 LCD --------------------------------------------------------- */
 
 #define APP_LCD_H_RES                   240U

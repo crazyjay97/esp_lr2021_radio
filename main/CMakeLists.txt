@@ -10,6 +10,7 @@ idf_component_register(SRCS
                            "bsp_lcd.c"
                            "bsp_audio.c"
                            "bsp_button.c"
+                           "epd_gysd154.c"
                        INCLUDE_DIRS "."
                        REQUIRES
                            lierda-iot__esp_lora_driver

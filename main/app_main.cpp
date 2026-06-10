@@ -15,6 +15,10 @@
 #include "app_config.h"
 #include "bsp.h"
 
+extern "C" {
+#include "epd_gysd154.h"
+}
+
 namespace {
 constexpr const char *TAG = "app";
 constexpr const char *kNvsNs = "app";
@@ -273,6 +277,21 @@ extern "C" void app_main(void)
 
     printf("PSRAM free: %d\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     printf("PSRAM total: %d\n", heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+
+#if APP_EPD_TEST
+    ESP_LOGI(TAG, "EPD test mode");
+    ESP_ERROR_CHECK(bsp_i2c_init());
+    if ((e = epd_init()) != ESP_OK) {
+        ESP_LOGE(TAG, "epd_init: %s", esp_err_to_name(e));
+        return;
+    }
+    epd_clear(EPD_WHITE);
+    epd_print_text(10, 10, "EPD TEST OK", EPD_BLACK, EPD_WHITE);
+    epd_print_text(10, 24, "Hello LR2021", EPD_RED, EPD_WHITE);
+    epd_refresh();
+    ESP_LOGI(TAG, "EPD refresh done");
+    return;
+#endif
 
 #if APP_CAMERA_LCD_BRINGUP
     bsp_i2c_scan();
