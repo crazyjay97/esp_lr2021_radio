@@ -34,7 +34,7 @@ constexpr size_t kCaptureDmaBufferCount = 4;
 #if APP_CAMERA_COLOR_ENABLE
 constexpr uint32_t kDvpCaptureWidth = APP_CAMERA_SENSOR_WIDTH;
 constexpr cam_ctlr_color_t kDvpInputColor = CAM_CTLR_COLOR_YUV422;
-constexpr uint32_t kOutputPixelformat = kFourccUyvy;
+constexpr uint32_t kOutputPixelformat = kFourccVyuy;
 #else
 constexpr uint32_t kDvpCaptureWidth = APP_CAMERA_SENSOR_WIDTH;
 constexpr cam_ctlr_color_t kDvpInputColor = CAM_CTLR_COLOR_GRAY8;
@@ -351,7 +351,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     dvp_cfg.dma_burst_size = 64;
     dvp_cfg.bk_buffer_dis = 1;
     ESP_LOGI(TAG, "DVP capture format: %s, capture=%lux%lu, logical=%ux%u, buffer=%lu bytes",
-             APP_CAMERA_COLOR_ENABLE ? "YUV422 UYVY" : "GRAY8",
+             APP_CAMERA_COLOR_ENABLE ? "YUV422 VYUY" : "GRAY8",
              (unsigned long)kDvpCaptureWidth,
              (unsigned long)APP_CAMERA_SENSOR_HEIGHT,
              APP_CAMERA_SENSOR_WIDTH,
