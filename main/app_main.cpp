@@ -1,16 +1,21 @@
 #include "audio_diagnostics.hpp"
 #include "camera_uart.hpp"
+#include "image_transfer.hpp"
 #include "radio_ping.hpp"
+#include "ui_gateway.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "esp_jpeg_common.h"
 
 #include <stdio.h>
+#include <new>
 
 #include "app_config.h"
 #include "bsp.h"
@@ -31,6 +36,12 @@ RadioPing g_radio;
 volatile bool g_capture_busy = false;
 AppMode g_app_mode = AppMode::camera;
 bool g_radio_active = false;
+
+// K6 short/long press state
+int64_t g_ptt_press_time_us = 0;
+bool g_ptt_held_long = false;
+esp_timer_handle_t g_ptt_timer = nullptr;
+constexpr int64_t kShortPressMaxUs = 300000; // 300ms
 
 const char *mode_name(AppMode mode)
 {
@@ -98,6 +109,189 @@ void switch_mode_and_restart()
     save_app_mode(next);
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
+}
+
+// PTT long-press timer callback
+void ptt_long_press_cb(void *arg)
+{
+    (void)arg;
+    g_ptt_held_long = true;
+    // In camera mode, long K6 activates voice PTT
+    // In radio mode, long K6 triggers mode switch (handled in on_button release)
+#if APP_RADIO_FEATURES_ENABLE && APP_RADIO_TASKS_ENABLE
+    if (g_app_mode == AppMode::camera && g_radio_active) {
+        g_radio.handle_button(APP_PTT_BUTTON, true);
+    }
+#endif
+}
+
+// Image capture task: runs on device A (camera mode) when ImageCmd received
+struct ImageCaptureCtx {
+    uint16_t session_id;
+};
+
+void image_capture_task(void *arg)
+{
+    auto *ctx = static_cast<ImageCaptureCtx *>(arg);
+    uint16_t session_id = ctx->session_id;
+    delete ctx;
+
+    uint8_t *frame = nullptr;
+    size_t len = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t pixfmt = 0;
+
+    bsp_lcd_set_camera_status("Remote capture...");
+
+#if APP_AUDIO_FEATURES_ENABLE
+    esp_err_t audio_e = bsp_audio_suspend();
+    if (audio_e != ESP_OK) {
+        ESP_LOGW(TAG, "audio suspend for image capture: %s", esp_err_to_name(audio_e));
+    }
+#endif
+
+    esp_err_t e = bsp_lcd_release_for_camera();
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "release lcd for image capture: %s", esp_err_to_name(e));
+        bsp_lcd_reinit_after_camera();
+        bsp_lcd_set_camera_status("LCD release failed");
+#if APP_AUDIO_FEATURES_ENABLE
+        bsp_audio_resume();
+#endif
+        g_capture_busy = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    esp_err_t capture_e = g_camera_uart.capture_frame(&frame, &len, &width, &height, &pixfmt);
+    ESP_LOGI(TAG, "image capture: %s %lux%lu fourcc=0x%08lx len=%u",
+             esp_err_to_name(capture_e),
+             static_cast<unsigned long>(width),
+             static_cast<unsigned long>(height),
+             static_cast<unsigned long>(pixfmt),
+             static_cast<unsigned>(len));
+
+    esp_err_t lcd_e = bsp_lcd_reinit_after_camera();
+    if (lcd_e != ESP_OK) {
+        ESP_LOGE(TAG, "lcd reinit after image capture: %s", esp_err_to_name(lcd_e));
+    }
+#if APP_AUDIO_FEATURES_ENABLE
+    bsp_audio_resume();
+#endif
+
+    if (capture_e != ESP_OK || !frame) {
+        bsp_lcd_set_camera_status("Capture failed");
+        g_capture_busy = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    // JPEG encode
+    uint8_t *jpeg = nullptr;
+    size_t jpeg_len = 0;
+    e = g_radio.image_xfer().encode_frame(frame, len, width, height, pixfmt, &jpeg, &jpeg_len);
+    heap_caps_free(frame);
+
+    if (e != ESP_OK || !jpeg) {
+        bsp_lcd_set_camera_status("JPEG encode failed");
+        g_capture_busy = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    char status[48];
+    uint16_t total_frags = static_cast<uint16_t>(
+        (jpeg_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) / APP_IMAGE_FRAGMENT_DATA_SIZE);
+    snprintf(status, sizeof(status), "Sending %u pkts...", total_frags);
+    bsp_lcd_set_camera_status(status);
+
+    // Send via radio (blocks until done or timeout)
+    g_radio.send_image(jpeg, jpeg_len, session_id);
+
+    // Wait for image_tx_task to finish transmitting before freeing jpeg
+    uint32_t wait_start = xTaskGetTickCount();
+    while (xTaskGetTickCount() - wait_start < pdMS_TO_TICKS(30000)) {
+        if (!g_radio.image_tx_busy()) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    heap_caps_free(jpeg);
+    bsp_lcd_set_camera_status("Image sent");
+    g_capture_busy = false;
+    vTaskDelete(nullptr);
+}
+
+// Callback: device A receives ImageCmd from B
+void on_image_capture_request(uint16_t session_id)
+{
+    if (g_app_mode != AppMode::camera) {
+        ESP_LOGW(TAG, "ImageCmd received but not in camera mode");
+        return;
+    }
+    if (g_capture_busy) {
+        ESP_LOGW(TAG, "ImageCmd ignored: capture already busy");
+        return;
+    }
+    g_capture_busy = true;
+
+    auto *ctx = new (std::nothrow) ImageCaptureCtx{ session_id };
+    if (!ctx) {
+        g_capture_busy = false;
+        return;
+    }
+
+    BaseType_t ok = xTaskCreatePinnedToCore(image_capture_task, "img_cap",
+                                            APP_IMAGE_TASK_STACK_BYTES, ctx,
+                                            APP_IMAGE_TASK_PRIORITY, nullptr,
+                                            APP_IMAGE_TASK_CORE);
+    if (ok != pdPASS) {
+        delete ctx;
+        g_capture_busy = false;
+        ESP_LOGE(TAG, "image capture task create failed");
+    }
+}
+
+// Callback: device B receives complete image
+void on_image_rx_complete(ImageTransfer *xfer)
+{
+    ESP_LOGI(TAG, "on_image_rx_complete: xfer=%p complete=%d",
+             xfer, xfer ? xfer->rx_complete() : -1);
+    if (!xfer || !xfer->rx_complete()) return;
+
+    uint8_t *rgb565 = nullptr;
+    uint32_t w = 0, h = 0;
+    esp_err_t e = xfer->decode_to_rgb565(&rgb565, &w, &h);
+    ESP_LOGI(TAG, "decode_to_rgb565: e=%d rgb565=%p w=%lu h=%lu",
+             e, rgb565, (unsigned long)w, (unsigned long)h);
+    if (e == ESP_OK && rgb565) {
+        uint32_t elapsed_ms = 0; // TODO: track from rx_begin
+        uint32_t jpeg_size = 0;
+        // Approximate jpeg_size from fragment count
+        jpeg_size = xfer->rx_total_count() * APP_IMAGE_FRAGMENT_DATA_SIZE;
+
+        ESP_LOGI(TAG, "showing image: mode=%d jpeg_size=%lu",
+                 (int)g_app_mode, (unsigned long)jpeg_size);
+        if (g_app_mode == AppMode::radio) {
+            ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565), w, h,
+                              jpeg_size, elapsed_ms);
+        } else {
+            bsp_lcd_show_rgb565_photo(reinterpret_cast<const uint16_t *>(rgb565), w, h);
+            bsp_lcd_set_camera_status("Photo received");
+        }
+        jpeg_free_align(rgb565);
+    } else {
+        ESP_LOGE(TAG, "decode failed: e=%d", e);
+        if (g_app_mode == AppMode::radio) {
+            ui_gw_rx_failed("Decode failed");
+        } else {
+            bsp_lcd_set_camera_status("Decode failed");
+        }
+    }
+
+    xfer->rx_reset();
 }
 
 void camera_capture_task(void *arg)
@@ -224,10 +418,56 @@ void on_lcd_capture(void *user)
     }
 }
 
+// Radio mode: progress callback for UI update during image RX
+void on_image_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
+{
+    if (g_app_mode == AppMode::radio) {
+        if (received <= 1) {
+            ui_gw_rx_begin(0, total);
+        }
+        ui_gw_rx_progress(received, total, rssi);
+    }
+}
+
+// Gateway UI capture callback — triggers remote photo via radio
+void on_gw_capture(void)
+{
+    ESP_LOGI(TAG, "UI capture: trigger remote photo");
+    g_radio.trigger_image_capture();
+}
+
 void on_button(bsp_btn_id_t id, bool pressed, void *user)
 {
     (void)user;
 
+    // In radio mode, route all keys to the gateway UI
+    if (g_app_mode == AppMode::radio) {
+        // K6 long press (>1.5s) → switch mode (keep as escape hatch)
+        if (id == BSP_BTN_PTT) {
+            if (pressed) {
+                g_ptt_press_time_us = esp_timer_get_time();
+                g_ptt_held_long = false;
+                if (g_ptt_timer) {
+                    esp_timer_start_once(g_ptt_timer, 1500000); // 1.5s for mode switch
+                }
+            } else {
+                if (g_ptt_timer) {
+                    esp_timer_stop(g_ptt_timer);
+                }
+                if (g_ptt_held_long) {
+                    switch_mode_and_restart();
+                } else {
+                    ui_gw_key_event(id, true);
+                }
+                g_ptt_held_long = false;
+            }
+            return;
+        }
+        ui_gw_key_event(id, pressed);
+        return;
+    }
+
+    // Camera mode: keep legacy behavior
     if (id == BSP_BTN_USER1) {
         if (pressed) {
             switch_mode_and_restart();
@@ -235,18 +475,26 @@ void on_button(bsp_btn_id_t id, bool pressed, void *user)
         return;
     }
 
-    if (id == APP_PTT_BUTTON) {
-#if APP_RADIO_FEATURES_ENABLE && APP_RADIO_TASKS_ENABLE
-        if (!g_radio_active) {
-            if (pressed) ESP_LOGW(TAG, "PTT ignored in camera mode");
-            return;
-        }
-        g_radio.handle_button(id, pressed);
-#else
+    if (id == BSP_BTN_PTT) {
         if (pressed) {
-            ESP_LOGW(TAG, "PTT ignored: radio tasks disabled for camera/radio isolation");
-        }
+            g_ptt_press_time_us = esp_timer_get_time();
+            g_ptt_held_long = false;
+            if (g_ptt_timer) {
+                esp_timer_start_once(g_ptt_timer, kShortPressMaxUs);
+            }
+        } else {
+            if (g_ptt_timer) {
+                esp_timer_stop(g_ptt_timer);
+            }
+            if (g_ptt_held_long) {
+#if APP_RADIO_FEATURES_ENABLE && APP_RADIO_TASKS_ENABLE
+                if (g_radio_active) {
+                    g_radio.handle_button(id, false);
+                }
 #endif
+            }
+            g_ptt_held_long = false;
+        }
         return;
     }
 
@@ -326,25 +574,35 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "audio diagnostics init: %s", esp_err_to_name(e));
     }
 #if APP_RADIO_FEATURES_ENABLE
-    if (g_app_mode == AppMode::radio) {
+    {
         bool radio_ok = true;
         if ((e = g_radio.init()) != ESP_OK) {
             ESP_LOGE(TAG, "radio init: %s", esp_err_to_name(e));
             radio_ok = false;
         }
-#if APP_RADIO_TASKS_ENABLE
         if (radio_ok) {
+            // Register image transfer callbacks on both modes
+            g_radio.set_image_capture_cb(on_image_capture_request);
+            g_radio.set_image_rx_complete_cb(on_image_rx_complete);
+            g_radio.set_image_rx_progress_cb(on_image_rx_progress);
+        }
+        if (g_app_mode == AppMode::radio && radio_ok) {
+#if APP_RADIO_TASKS_ENABLE
             if ((e = g_radio.start()) != ESP_OK) {
                 ESP_LOGE(TAG, "radio task start: %s", esp_err_to_name(e));
             } else {
                 g_radio_active = true;
             }
-        }
 #else
-        ESP_LOGW(TAG, "radio initialized but tasks/RX disabled for camera isolation");
+            ESP_LOGW(TAG, "radio initialized but tasks/RX disabled for camera isolation");
 #endif
-    } else {
-        ESP_LOGW(TAG, "camera mode: radio is not initialized");
+        } else if (g_app_mode == AppMode::camera && radio_ok) {
+            // Camera mode: start all radio tasks (voice tasks idle, image TX active)
+            if ((e = g_radio.start()) != ESP_OK) {
+                ESP_LOGE(TAG, "radio task start (camera mode): %s", esp_err_to_name(e));
+            }
+            ESP_LOGI(TAG, "camera mode: radio initialized for image transfer");
+        }
     }
 #else
     ESP_LOGW(TAG, "radio feature disabled for camera/audio isolation");
@@ -360,6 +618,12 @@ extern "C" void app_main(void)
 #endif
     if ((e = bsp_lcd_init()) != ESP_OK) {
         ESP_LOGE(TAG, "lcd init: %s", esp_err_to_name(e));
+    } else if (g_app_mode == AppMode::radio) {
+        if ((e = bsp_lcd_start_gateway_ui()) != ESP_OK) {
+            ESP_LOGE(TAG, "gateway ui start: %s", esp_err_to_name(e));
+        } else {
+            ui_gw_set_capture_cb(on_gw_capture);
+        }
     } else if ((e = bsp_lcd_start_camera_ui(on_lcd_capture, nullptr)) != ESP_OK) {
         ESP_LOGE(TAG, "camera ui start: %s", esp_err_to_name(e));
     }
@@ -367,6 +631,16 @@ extern "C" void app_main(void)
     if ((e = bsp_button_init(on_button, nullptr)) != ESP_OK) {
         ESP_LOGE(TAG, "btn init: %s", esp_err_to_name(e));
     }
+
+    // Create PTT long-press timer for K6 short/long press detection
+    const esp_timer_create_args_t ptt_timer_args = {
+        .callback = ptt_long_press_cb,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "ptt_long",
+        .skip_unhandled_events = true,
+    };
+    esp_timer_create(&ptt_timer_args, &g_ptt_timer);
 
     g_audio.play_startup_chime();
 

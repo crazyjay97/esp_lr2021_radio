@@ -6,6 +6,8 @@
 
 #include "esp_err.h"
 #include "driver/i2c_master.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "board_config.h"
 
@@ -46,6 +48,8 @@ esp_err_t bsp_lcd_reinit_after_camera(void);
 esp_err_t bsp_lcd_show_test_pattern(void);
 esp_err_t bsp_lcd_start_lvgl_demo(void);
 esp_err_t bsp_lcd_start_camera_ui(bsp_lcd_capture_cb_t cb, void *user);
+esp_err_t bsp_lcd_start_gateway_ui(void);
+SemaphoreHandle_t bsp_lcd_get_lvgl_lock(void);
 esp_err_t bsp_lcd_set_camera_status(const char *text);
 esp_err_t bsp_lcd_clear_camera_photo(void);
 esp_err_t bsp_lcd_show_gray_photo(const uint8_t *gray,
@@ -55,6 +59,9 @@ esp_err_t bsp_lcd_show_yuv422_photo(const uint8_t *yuv422,
                                     uint32_t width,
                                     uint32_t height,
                                     uint32_t pixelformat);
+esp_err_t bsp_lcd_show_rgb565_photo(const uint16_t *rgb565,
+                                    uint32_t width,
+                                    uint32_t height);
 
 /* ---------- RGB LED ----------------------------------------------------- */
 esp_err_t bsp_led_init(void);

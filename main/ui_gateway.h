@@ -1,0 +1,35 @@
+#pragma once
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "esp_err.h"
+#include "bsp.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    UI_PAGE_IMAGE = 0,
+    UI_PAGE_RX,
+    UI_PAGE_LINK,
+    UI_PAGE_CONFIG,
+    UI_PAGE_COUNT
+} ui_page_t;
+
+typedef void (*ui_gw_capture_cb_t)(void);
+
+esp_err_t ui_gw_init(void);
+void ui_gw_key_event(bsp_btn_id_t key, bool pressed);
+
+void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags);
+void ui_gw_rx_progress(uint16_t received, uint16_t total, int16_t rssi);
+void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
+                       uint32_t jpeg_size, uint32_t elapsed_ms);
+void ui_gw_rx_failed(const char *reason);
+
+void ui_gw_set_capture_cb(ui_gw_capture_cb_t cb);
+
+#ifdef __cplusplus
+}
+#endif

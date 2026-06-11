@@ -740,6 +740,87 @@ esp_err_t bsp_lcd_start_camera_ui(bsp_lcd_capture_cb_t cb, void *user)
     return ESP_OK;
 }
 
+esp_err_t bsp_lcd_start_gateway_ui(void)
+{
+    if (s_lvgl_started) {
+        extern esp_err_t ui_gw_init(void);
+        if (s_lvgl_lock) {
+            xSemaphoreTakeRecursive(s_lvgl_lock, portMAX_DELAY);
+            esp_err_t err = ui_gw_init();
+            xSemaphoreGiveRecursive(s_lvgl_lock);
+            return err;
+        }
+        return ui_gw_init();
+    }
+    if (!s_lcd_ready) {
+        ESP_RETURN_ON_ERROR(bsp_lcd_init(), TAG, "lcd init");
+    }
+
+    if (!s_lvgl_lock) {
+        s_lvgl_lock = xSemaphoreCreateRecursiveMutex();
+        ESP_RETURN_ON_FALSE(s_lvgl_lock, ESP_ERR_NO_MEM, TAG, "lvgl lock");
+    }
+
+    lv_init();
+
+    const size_t pixels = APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS;
+    lv_color_t *buf1 = heap_caps_malloc(pixels * sizeof(lv_color_t),
+                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    lv_color_t *buf2 = heap_caps_malloc(pixels * sizeof(lv_color_t),
+                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (!buf1 || !buf2) {
+        heap_caps_free(buf1);
+        heap_caps_free(buf2);
+        return ESP_ERR_NO_MEM;
+    }
+
+    static lv_disp_draw_buf_t draw_buf_gw;
+    lv_disp_draw_buf_init(&draw_buf_gw, buf1, buf2, pixels);
+
+    static lv_disp_drv_t disp_drv_gw;
+    lv_disp_drv_init(&disp_drv_gw);
+    disp_drv_gw.hor_res = APP_LCD_H_RES;
+    disp_drv_gw.ver_res = APP_LCD_V_RES;
+    disp_drv_gw.flush_cb = lvgl_flush_cb;
+    disp_drv_gw.draw_buf = &draw_buf_gw;
+    s_lvgl_disp_drv = &disp_drv_gw;
+    lv_disp_drv_register(&disp_drv_gw);
+
+    extern esp_err_t ui_gw_init(void);
+    ESP_RETURN_ON_ERROR(ui_gw_init(), TAG, "gateway ui");
+
+    const esp_timer_create_args_t tick_args = {
+        .callback = lvgl_tick_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "lvgl_tick",
+        .skip_unhandled_events = true,
+    };
+    esp_timer_handle_t tick_timer = NULL;
+    ESP_RETURN_ON_ERROR(esp_timer_create(&tick_args, &tick_timer), TAG,
+                        "lvgl tick create");
+    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(tick_timer,
+                                                 APP_LCD_LVGL_TICK_MS * 1000U),
+                        TAG, "lvgl tick start");
+
+    BaseType_t ok = xTaskCreatePinnedToCore(lvgl_task, "lvgl",
+                                            APP_LCD_LVGL_TASK_STACK_BYTES, NULL,
+                                            APP_LCD_LVGL_TASK_PRIORITY, NULL,
+                                            APP_LCD_LVGL_TASK_CORE);
+    if (ok != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_lvgl_started = true;
+    ESP_LOGI(TAG, "Gateway LVGL UI started");
+    return ESP_OK;
+}
+
+SemaphoreHandle_t bsp_lcd_get_lvgl_lock(void)
+{
+    return s_lvgl_lock;
+}
+
 esp_err_t bsp_lcd_set_camera_status(const char *text)
 {
     if (!s_lvgl_started || !s_camera_status_label || !text) {
@@ -822,6 +903,30 @@ static bool yuv422_get_pair(const uint8_t *p,
     default:
         return false;
     }
+}
+
+esp_err_t bsp_lcd_show_rgb565_photo(const uint16_t *rgb565,
+                                    uint32_t width,
+                                    uint32_t height)
+{
+    ESP_RETURN_ON_FALSE(rgb565 && width && height, ESP_ERR_INVALID_ARG, TAG,
+                        "invalid rgb565 frame");
+    ESP_RETURN_ON_FALSE(s_lvgl_started && s_camera_canvas && s_camera_canvas_buf,
+                        ESP_ERR_INVALID_STATE, TAG, "camera canvas not ready");
+
+    xSemaphoreTakeRecursive(s_lvgl_lock, portMAX_DELAY);
+    for (uint32_t y = 0; y < APP_LCD_PHOTO_PREVIEW_H; ++y) {
+        uint32_t src_y = (y * height) / APP_LCD_PHOTO_PREVIEW_H;
+        const uint16_t *src = rgb565 + src_y * width;
+        lv_color_t *dst = s_camera_canvas_buf + y * APP_LCD_H_RES;
+        for (uint32_t x = 0; x < APP_LCD_H_RES; ++x) {
+            uint32_t src_x = (x * width) / APP_LCD_H_RES;
+            dst[x].full = src[src_x];
+        }
+    }
+    lv_obj_invalidate(s_camera_canvas);
+    xSemaphoreGiveRecursive(s_lvgl_lock);
+    return ESP_OK;
 }
 
 esp_err_t bsp_lcd_show_yuv422_photo(const uint8_t *yuv422,

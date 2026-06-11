@@ -1,0 +1,1283 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 LoRa WildCam Open Kit 显示端 UI 设计详细文档</title>
+  <style>
+    :root {
+      --bg: #f5f7f6;
+      --paper: #ffffff;
+      --ink: #1d2926;
+      --muted: #60706a;
+      --line: #dbe3df;
+      --deep: #17241f;
+      --green: #2f7d5b;
+      --blue: #2e6d8f;
+      --amber: #b76a2c;
+      --red: #a94442;
+      --screen-bg: #07130f;
+      --screen-panel: #10231a;
+      --screen-line: #244a36;
+      --screen-accent: #64e47b;
+      --screen-warn: #ffb347;
+      --shadow: 0 14px 36px rgba(29, 41, 38, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+      line-height: 1.62;
+    }
+
+    header {
+      color: #fff;
+      background: linear-gradient(110deg, #17241f, #1f3d35);
+      padding: 44px 28px 56px;
+    }
+
+    .wrap {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    header .wrap {
+      padding: 0;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: #bfe1ca;
+      font-size: 14px;
+      font-weight: 800;
+    }
+
+    h1 {
+      max-width: 900px;
+      margin: 0;
+      font-size: clamp(32px, 5vw, 52px);
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      max-width: 840px;
+      margin: 18px 0 0;
+      color: rgba(255, 255, 255, 0.86);
+      font-size: 18px;
+    }
+
+    main {
+      margin-top: -28px;
+      padding-bottom: 64px;
+    }
+
+    section {
+      margin-top: 24px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .section-head {
+      padding: 22px 26px 16px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfb;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 24px;
+    }
+
+    h3 {
+      margin: 0 0 8px;
+      font-size: 18px;
+    }
+
+    .section-desc,
+    .muted {
+      color: var(--muted);
+    }
+
+    .section-desc {
+      margin: 8px 0 0;
+    }
+
+    .content {
+      padding: 24px 26px 28px;
+    }
+
+    .grid-2,
+    .grid-3,
+    .grid-4 {
+      display: grid;
+      gap: 16px;
+    }
+
+    .grid-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .grid-3 {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .grid-4 {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .card {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    .card.soft-green {
+      background: #e8f3ed;
+    }
+
+    .card.soft-blue {
+      background: #e8f1f6;
+    }
+
+    .card.soft-amber {
+      background: #fff2df;
+    }
+
+    .card p,
+    .card ul {
+      margin: 8px 0 0;
+      color: var(--muted);
+    }
+
+    .card ul {
+      padding-left: 20px;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    table {
+      width: 100%;
+      min-width: 980px;
+      border-collapse: collapse;
+      background: #fff;
+    }
+
+    th,
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }
+
+    th {
+      background: #edf4ef;
+      color: #263a31;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    code {
+      padding: 2px 5px;
+      border-radius: 4px;
+      background: #eef2ef;
+      font-family: Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+    }
+
+    .callout {
+      padding: 16px 18px;
+      border-left: 4px solid var(--green);
+      border-radius: 8px;
+      background: #e8f3ed;
+    }
+
+    .callout p {
+      margin: 0;
+      color: #33463e;
+    }
+
+    .screen-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 18px;
+      align-items: start;
+    }
+
+    .screen-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      overflow: hidden;
+    }
+
+    .screen-card h3 {
+      margin: 0;
+      padding: 12px 14px;
+      background: #fbfcfb;
+      border-bottom: 1px solid var(--line);
+      font-size: 16px;
+    }
+
+    .screen-art {
+      padding: 16px;
+      display: flex;
+      justify-content: center;
+      background: #f8faf8;
+    }
+
+    .phone {
+      width: 240px;
+      height: 320px;
+      border-radius: 14px;
+      background: #1f2623;
+      border: 8px solid #111719;
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.2);
+      overflow: hidden;
+      position: relative;
+      color: #edf5f1;
+      font-family: "Microsoft YaHei", Arial, sans-serif;
+    }
+
+    .lv-screen {
+      height: 100%;
+      background: #eef3ef;
+      color: #18231f;
+      font-size: 11px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .lv-status {
+      height: 22px;
+      padding: 3px 7px;
+      background: #263831;
+      color: #eaf6ef;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      white-space: nowrap;
+      font-size: 10px;
+    }
+
+    .lv-title {
+      height: 30px;
+      padding: 5px 8px;
+      background: #dfe9e2;
+      border-bottom: 1px solid #c3d2ca;
+      color: #17241f;
+      font-size: 14px;
+      font-weight: 800;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .lv-body {
+      padding: 8px;
+    }
+
+    .lv-panel {
+      border: 1px solid #c9d8d0;
+      border-radius: 6px;
+      background: #ffffff;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+      overflow: hidden;
+    }
+
+    .lv-img {
+      height: 162px;
+      margin-bottom: 7px;
+      border: 1px solid #94aa9f;
+      border-radius: 4px;
+      background:
+        linear-gradient(150deg, rgba(47, 125, 91, 0.35), rgba(46, 109, 143, 0.2)),
+        linear-gradient(0deg, #33473e 0 28%, #617468 28% 30%, #8aa698 30% 100%);
+      display: grid;
+      place-items: center;
+      color: #f5fff9;
+      font-weight: 800;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+    }
+
+    .lv-kv {
+      display: flex;
+      justify-content: space-between;
+      gap: 6px;
+      padding: 4px 7px;
+      border-top: 1px solid #e2ebe6;
+    }
+
+    .lv-kv:first-child {
+      border-top: 0;
+    }
+
+    .lv-kv span:first-child {
+      color: #6a7d75;
+    }
+
+    .lv-kv span:last-child {
+      color: #1f312b;
+      text-align: right;
+      font-weight: 700;
+    }
+
+    .lv-bottom {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 28px;
+      padding: 5px 7px;
+      background: #263831;
+      color: #dbe9e1;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 10px;
+    }
+
+    .lv-bar {
+      height: 15px;
+      border-radius: 8px;
+      border: 1px solid #9db5a8;
+      background: #d9e4de;
+      overflow: hidden;
+      margin: 10px 0 8px;
+    }
+
+    .lv-bar div {
+      width: 68%;
+      height: 100%;
+      background: #2f7d5b;
+      border-radius: 8px;
+    }
+
+    .lv-percent {
+      height: 62px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #2f7d5b;
+      font-size: 32px;
+      font-weight: 900;
+    }
+
+    .lv-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      background: #fff;
+    }
+
+    .lv-list li {
+      height: 27px;
+      padding: 5px 8px;
+      border-bottom: 1px solid #e2ebe6;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: #273a33;
+    }
+
+    .lv-list li.active {
+      background: #2f7d5b;
+      color: #fff;
+      font-weight: 800;
+    }
+
+    .lv-list li span:last-child {
+      font-weight: 800;
+    }
+
+    .lv-btnmatrix {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    .lv-btnmatrix div {
+      height: 27px;
+      border-radius: 5px;
+      border: 1px solid #9fb5aa;
+      background: #edf4ef;
+      display: grid;
+      place-items: center;
+      color: #24362f;
+      font-weight: 800;
+    }
+
+    .lv-chip {
+      padding: 2px 6px;
+      border-radius: 999px;
+      background: #2f7d5b;
+      color: #ffffff;
+      font-size: 10px;
+      font-weight: 800;
+    }
+
+    .lv-chip.warn {
+      background: #b76a2c;
+    }
+
+    .lv-note {
+      margin-top: 8px;
+      padding: 7px 8px;
+      border-radius: 6px;
+      background: #e8f1f6;
+      color: #31536a;
+      font-size: 10px;
+      line-height: 1.35;
+    }
+
+    .foot {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 0 24px 44px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 980px) {
+      .grid-2,
+      .grid-3,
+      .grid-4,
+      .screen-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media print {
+      header {
+        padding: 24px;
+      }
+
+      main {
+        margin-top: 0;
+      }
+
+      section {
+        box-shadow: none;
+        break-inside: avoid;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <p class="eyebrow">显示端 UI 设计详细文档</p>
+      <h1>ESP32 LoRa WildCam Open Kit Display Gateway UI</h1>
+      <p class="subtitle">面向 ST7789V3 竖屏显示端，分辨率 240 × 320 像素。本文档定义页面结构、像素布局、字段、交互、状态与验收标准，可直接用于固件 UI 开发。</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section>
+      <div class="section-head">
+        <h2>1. UI 目标与硬件约束</h2>
+        <p class="section-desc">显示端是项目演示的核心窗口，第一目标是让项目组和客户立即看到“图片已回传，链路质量如何”。</p>
+      </div>
+      <div class="content">
+        <div class="grid-4">
+          <div class="card soft-green">
+            <h3>屏幕</h3>
+            <p>ST7789V3，240 × 320 像素，竖屏。建议使用 RGB565 色彩，刷新尽量采用局部刷新。</p>
+          </div>
+          <div class="card soft-green">
+            <h3>输入</h3>
+            <p>主交互按物理侧键设计。若屏幕带触摸，可作为增强，但第一版不依赖触摸。</p>
+          </div>
+          <div class="card soft-blue">
+            <h3>主任务</h3>
+            <p>显示最新图片、接收进度、RSSI/SNR、传输速率、耗时、丢包率、电量和节点状态。</p>
+          </div>
+          <div class="card soft-amber">
+            <h3>开发原则</h3>
+            <p>字段少、对比强、刷新稳定。避免复杂动画和大量中文小字，优先保证户外可读性。</p>
+          </div>
+        </div>
+        <div class="callout" style="margin-top: 16px;">
+          <p><strong>核心结论：</strong>240 × 320 屏幕不能做复杂 App，应设计成“仪表盘式 UI”：一屏看图，一屏看链路，一屏配置，一屏控制。</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>2. 页面信息架构</h2>
+        <p class="section-desc">第一版建议实现 6 个页面，其中 P0 必须完成 4 个页面。</p>
+      </div>
+      <div class="content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>页面</th>
+                <th>用途</th>
+                <th>入口</th>
+                <th>优先级</th>
+                <th>关键字段</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>首页/最新图片页</td>
+                <td>显示最近一次回传图片和核心状态。</td>
+                <td>开机默认页、接收完成后自动跳转。</td>
+                <td>P0</td>
+                <td>图片、触发原因、时间、Node ID、远端电量、RSSI、速率。</td>
+              </tr>
+              <tr>
+                <td>接收进度页</td>
+                <td>图片传输过程中显示进度。</td>
+                <td>收到 <code>IMAGE_START</code> 自动进入。</td>
+                <td>P0</td>
+                <td>包进度、百分比、速率、RSSI/SNR、重传次数、耗时。</td>
+              </tr>
+              <tr>
+                <td>链路详情页</td>
+                <td>给演示和调试使用，展示无线链路指标。</td>
+                <td>侧键切换。</td>
+                <td>P0</td>
+                <td>RSSI、SNR、丢包率、重传率、吞吐、距离估算、FLRC 参数。</td>
+              </tr>
+              <tr>
+                <td>设备状态页</td>
+                <td>查看本机与拍摄端状态。</td>
+                <td>侧键切换。</td>
+                <td>P0</td>
+                <td>本机电量、远端电量、模式、固件版本、在线状态、最后心跳。</td>
+              </tr>
+              <tr>
+                <td>配置页</td>
+                <td>设置拍照周期、图片尺寸、触发方式等参数。</td>
+                <td>长按确认键或菜单入口。</td>
+                <td>P1</td>
+                <td>周期、尺寸、质量、触发源、音频开关、FLRC profile。</td>
+              </tr>
+              <tr>
+                <td>控制页</td>
+                <td>手动下发命令。</td>
+                <td>侧键切换或配置页进入。</td>
+                <td>P1</td>
+                <td>拍照、播放音频、休眠、刷新状态、开启 Wi-Fi AP。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>3. 全局布局规范</h2>
+        <p class="section-desc">所有页面使用同一套区域划分，降低开发复杂度和刷新风险。</p>
+      </div>
+      <div class="content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>区域</th>
+                <th>坐标</th>
+                <th>尺寸</th>
+                <th>内容</th>
+                <th>刷新规则</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>状态栏</td>
+                <td>x=0, y=0</td>
+                <td>240 × 22</td>
+                <td>Node ID、链路图标、本机电量、远端电量、时间/状态。</td>
+                <td>1s 刷新一次；接收中 500ms 刷新。</td>
+              </tr>
+              <tr>
+                <td>标题栏</td>
+                <td>x=0, y=22</td>
+                <td>240 × 28</td>
+                <td>页面标题和小状态标签。</td>
+                <td>切页或状态变化时刷新。</td>
+              </tr>
+              <tr>
+                <td>内容区</td>
+                <td>x=0, y=50</td>
+                <td>240 × 242</td>
+                <td>图片、列表、指标、配置项。</td>
+                <td>按页面局部刷新。</td>
+              </tr>
+              <tr>
+                <td>底部提示栏</td>
+                <td>x=0, y=292</td>
+                <td>240 × 28</td>
+                <td>侧键提示：返回/上/下/确认，或当前操作提示。</td>
+                <td>切页、选中项变化时刷新。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="grid-3" style="margin-top: 16px;">
+          <div class="card">
+            <h3>颜色规范</h3>
+            <ul>
+              <li>屏幕背景：<code>#EEF3EF</code></li>
+              <li>容器面板：<code>#FFFFFF</code></li>
+              <li>状态栏：<code>#263831</code></li>
+              <li>主文字：<code>#18231F</code></li>
+              <li>选中/确认：<code>#2F7D5B</code></li>
+              <li>警告/接收：<code>#B76A2C</code></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>字体规范</h3>
+            <ul>
+              <li>状态栏：10px，高度 22px。</li>
+              <li>标题：14px，加粗，高度 28px。</li>
+              <li>正文字段：11px。</li>
+              <li>关键数值：12px 或 14px。</li>
+              <li>中文尽量不超过 8 字一行。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>图标规范</h3>
+            <ul>
+              <li>尽量使用 1-bit/2-bit 简单图标。</li>
+              <li>电量、链路、接收、告警必须有图标。</li>
+              <li>图标尺寸建议 10×10 或 12×12。</li>
+              <li>错误状态用红色边框和文字，不依赖图标单独表达。</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>4. LVGL 页面示例图</h2>
+        <p class="section-desc">以下按 240 × 320 原始像素比例绘制，示例采用 LVGL 常规控件风格：状态栏、标题栏、容器、列表、进度条和按钮矩阵均可直接映射到 LVGL 对象。</p>
+      </div>
+      <div class="content">
+        <div class="screen-grid">
+          <div class="screen-card">
+            <h3>首页 / 最新图片</h3>
+            <div class="screen-art">
+              <div class="phone">
+                <div class="lv-screen">
+                  <div class="lv-status"><span>N01 FLRC</span><span>GW 82% / CAM 76%</span></div>
+                  <div class="lv-title"><span>最新事件</span><span class="lv-chip">PIR</span></div>
+                  <div class="lv-body">
+                    <div class="lv-img">IMAGE 216×162</div>
+                    <div class="lv-panel">
+                      <div class="lv-kv"><span>时间</span><span>06-10 14:32</span></div>
+                      <div class="lv-kv"><span>图片</span><span>128KB / VGA</span></div>
+                      <div class="lv-kv"><span>链路</span><span>-72dBm / 13.2KB/s</span></div>
+                      <div class="lv-kv"><span>距离</span><span>Field 320m</span></div>
+                    </div>
+                  </div>
+                  <div class="lv-bottom"><span>K6返回</span><span>K5/K4切页</span><span>K3拍照</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="screen-card">
+            <h3>接收进度</h3>
+            <div class="screen-art">
+              <div class="phone">
+                <div class="lv-screen">
+                  <div class="lv-status"><span>N01 RX</span><span>RSSI -70 / SNR 8.5</span></div>
+                  <div class="lv-title"><span>正在接收 #018</span><span class="lv-chip warn">RX</span></div>
+                  <div class="lv-body">
+                    <div class="lv-panel" style="padding: 8px;">
+                      <div class="lv-percent">68%</div>
+                      <div class="lv-bar"><div></div></div>
+                    </div>
+                    <div class="lv-panel" style="margin-top: 8px;">
+                      <div class="lv-kv"><span>分包</span><span>087 / 128</span></div>
+                      <div class="lv-kv"><span>速率</span><span>13.2 KB/s</span></div>
+                      <div class="lv-kv"><span>耗时</span><span>00:06.4</span></div>
+                      <div class="lv-kv"><span>重传</span><span>3 包</span></div>
+                      <div class="lv-kv"><span>SNR</span><span>8.5 dB</span></div>
+                    </div>
+                  </div>
+                  <div class="lv-bottom"><span>K6取消</span><span></span><span>接收中</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="screen-card">
+            <h3>链路详情</h3>
+            <div class="screen-art">
+              <div class="phone">
+                <div class="lv-screen">
+                  <div class="lv-status"><span>N01 LINK</span><span>Online</span></div>
+                  <div class="lv-title"><span>链路指标</span><span class="lv-chip">OK</span></div>
+                  <div class="lv-body">
+                    <div class="lv-panel">
+                      <div class="lv-kv"><span>模式</span><span>FLRC Profile A</span></div>
+                      <div class="lv-kv"><span>RSSI</span><span>-72 dBm</span></div>
+                      <div class="lv-kv"><span>SNR</span><span>8.5 dB</span></div>
+                      <div class="lv-kv"><span>有效速率</span><span>13.2 KB/s</span></div>
+                      <div class="lv-kv"><span>丢包率</span><span>2.3%</span></div>
+                      <div class="lv-kv"><span>重传率</span><span>1.8%</span></div>
+                      <div class="lv-kv"><span>上次耗时</span><span>9.7 s</span></div>
+                      <div class="lv-kv"><span>距离备注</span><span>Field 320m</span></div>
+                    </div>
+                    <div class="lv-note">建议实现为 lv_obj 容器 + 多组 lv_label，列表项高度固定，便于局部刷新。</div>
+                  </div>
+                  <div class="lv-bottom"><span>K6返回</span><span>K5/K4切页</span><span>K3详情</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="screen-card">
+            <h3>配置 / 控制</h3>
+            <div class="screen-art">
+              <div class="phone">
+                <div class="lv-screen">
+                  <div class="lv-status"><span>CFG</span><span>AP Off</span></div>
+                  <div class="lv-title"><span>配置</span><span class="lv-chip">CFG</span></div>
+                  <div class="lv-body" style="padding-bottom: 36px;">
+                    <div class="lv-panel">
+                      <ul class="lv-list">
+                        <li class="active"><span>拍照周期</span><span>5 min</span></li>
+                        <li><span>图片尺寸</span><span>VGA</span></li>
+                        <li><span>图片质量</span><span>Q=35</span></li>
+                        <li><span>触发方式</span><span>PIR+Timer</span></li>
+                        <li><span>声音触发</span><span>Off</span></li>
+                      </ul>
+                    </div>
+                    <div class="lv-btnmatrix">
+                      <div>手动拍照</div>
+                      <div>播放音频</div>
+                      <div>刷新状态</div>
+                      <div>进入休眠</div>
+                    </div>
+                  </div>
+                  <div class="lv-bottom"><span>K6返回</span><span>K5/K4选择</span><span>K3修改</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>5. 各页面详细规格</h2>
+        <p class="section-desc">所有坐标均以屏幕左上角为原点，单位为像素。</p>
+      </div>
+      <div class="content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>页面</th>
+                <th>控件/字段</th>
+                <th>坐标与尺寸</th>
+                <th>显示内容</th>
+                <th>规则</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td rowspan="8">首页/最新图片页</td>
+                <td>状态栏</td>
+                <td>0,0,240,22</td>
+                <td><code>N01 FLRC</code>、链路图标、<code>G:82% C:76%</code></td>
+                <td>G 为 Gateway 电量，C 为 Camera Node 电量。</td>
+              </tr>
+              <tr>
+                <td>标题栏</td>
+                <td>0,22,240,28</td>
+                <td>最新事件 + 触发标签</td>
+                <td>触发标签取值：Timer、PIR、Sound、Manual、Cmd。</td>
+              </tr>
+              <tr>
+                <td>图片框</td>
+                <td>12,58,216,162</td>
+                <td>最新图片</td>
+                <td>4:3 图片等比缩放到 216×162；无图时显示占位符。</td>
+              </tr>
+              <tr>
+                <td>时间</td>
+                <td>8,226,224,16</td>
+                <td>拍摄时间或接收完成时间</td>
+                <td>格式 <code>MM-DD HH:MM</code>。</td>
+              </tr>
+              <tr>
+                <td>图片信息</td>
+                <td>8,242,224,16</td>
+                <td>大小 / 分辨率</td>
+                <td>示例：<code>128KB / VGA</code>。</td>
+              </tr>
+              <tr>
+                <td>链路摘要</td>
+                <td>8,258,224,16</td>
+                <td>RSSI / 速率</td>
+                <td>示例：<code>-72dBm / 13.2KB/s</code>。</td>
+              </tr>
+              <tr>
+                <td>状态摘要</td>
+                <td>8,274,224,16</td>
+                <td>距离备注 / 传输结果</td>
+                <td>若错误，显示红色错误码。</td>
+              </tr>
+              <tr>
+                <td>底部提示栏</td>
+                <td>0,292,240,28</td>
+                <td>按键提示</td>
+                <td>默认：K6 返回，K5/K4 切页，K3 拍照。</td>
+              </tr>
+
+              <tr>
+                <td rowspan="6">接收进度页</td>
+                <td>大百分比</td>
+                <td>0,60,240,54</td>
+                <td><code>68%</code></td>
+                <td>按已收包数/总包数计算。</td>
+              </tr>
+              <tr>
+                <td>进度条</td>
+                <td>16,122,208,12</td>
+                <td>图片接收进度</td>
+                <td>每收到有效包刷新。</td>
+              </tr>
+              <tr>
+                <td>分包</td>
+                <td>8,146,224,16</td>
+                <td><code>087 / 128</code></td>
+                <td>显示已收有效包数，不含重复包。</td>
+              </tr>
+              <tr>
+                <td>速率/耗时</td>
+                <td>8,162,224,32</td>
+                <td>有效速率、已耗时</td>
+                <td>速率每 500ms 计算一次滑动平均。</td>
+              </tr>
+              <tr>
+                <td>重传/丢包</td>
+                <td>8,194,224,32</td>
+                <td>重传包数、缺包数</td>
+                <td>出现重传时用橙色显示。</td>
+              </tr>
+              <tr>
+                <td>取消提示</td>
+                <td>0,292,240,28</td>
+                <td>K6 取消</td>
+                <td>取消仅停止当前接收，不清空上一张图。</td>
+              </tr>
+
+              <tr>
+                <td rowspan="6">配置页</td>
+                <td>列表区域</td>
+                <td>0,50,240,224</td>
+                <td>8 行配置项</td>
+                <td>每行 28px，最多显示 8 行，超出滚动。</td>
+              </tr>
+              <tr>
+                <td>选中行</td>
+                <td>0,y,240,28</td>
+                <td>绿色高亮</td>
+                <td>K5 上移，K4 下移。</td>
+              </tr>
+              <tr>
+                <td>参数修改</td>
+                <td>右侧 92px</td>
+                <td>当前值</td>
+                <td>K3 进入编辑，K5/K4 调整，K3 保存。</td>
+              </tr>
+              <tr>
+                <td>拍照周期</td>
+                <td>列表项</td>
+                <td>Off / 1min / 5min / 30min / 1h</td>
+                <td>保存后下发到 Camera Node。</td>
+              </tr>
+              <tr>
+                <td>图片尺寸</td>
+                <td>列表项</td>
+                <td>QVGA / VGA</td>
+                <td>默认 QVGA，演示可用 VGA。</td>
+              </tr>
+              <tr>
+                <td>Wi-Fi AP</td>
+                <td>列表项</td>
+                <td>Open / Close</td>
+                <td>开启后标题栏显示 AP 状态。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>6. 物理按键与交互</h2>
+        <p class="section-desc">按开发板实拍，显示端按键位于右侧面。UI 不在屏幕正面画虚拟按键，只在底部给侧键提示。</p>
+      </div>
+      <div class="content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>按键</th>
+                <th>短按</th>
+                <th>长按 1.5s</th>
+                <th>接收中行为</th>
+                <th>备注</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>K6 顶部侧键</td>
+                <td>返回上一层 / 返回首页</td>
+                <td>进入/退出菜单</td>
+                <td>取消当前接收</td>
+                <td>优先作为安全退出键。</td>
+              </tr>
+              <tr>
+                <td>K5</td>
+                <td>上一页 / 上一项</td>
+                <td>快速上翻</td>
+                <td>无动作</td>
+                <td>配置列表中向上移动。</td>
+              </tr>
+              <tr>
+                <td>K4</td>
+                <td>下一页 / 下一项</td>
+                <td>快速下翻</td>
+                <td>无动作</td>
+                <td>配置列表中向下移动。</td>
+              </tr>
+              <tr>
+                <td>K3 底部侧键</td>
+                <td>确认 / 执行当前操作</td>
+                <td>手动拍照</td>
+                <td>标记当前接收为重点事件</td>
+                <td>首页长按直接下发拍照命令。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout" style="margin-top: 16px;">
+          <p><strong>触摸屏兼容：</strong>如果屏幕带触摸，点击列表行等同 K3，左右滑动等同 K5/K4 切页；但固件验收以侧键可完整操作为准。</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>7. 状态与错误显示</h2>
+        <p class="section-desc">错误信息必须短、明确、可定位。显示端应尽量保留上一张成功图片，避免黑屏。</p>
+      </div>
+      <div class="content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>状态</th>
+                <th>触发条件</th>
+                <th>显示位置</th>
+                <th>显示内容</th>
+                <th>恢复规则</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>未配对</td>
+                <td>开机后未收到 Camera Node HELLO。</td>
+                <td>首页图片框</td>
+                <td><code>等待节点 N01</code></td>
+                <td>收到 HELLO 后自动进入首页。</td>
+              </tr>
+              <tr>
+                <td>正在接收</td>
+                <td>收到 IMAGE_START。</td>
+                <td>接收进度页</td>
+                <td>百分比、包数、速率。</td>
+                <td>完成后进入首页。</td>
+              </tr>
+              <tr>
+                <td>缺包重传</td>
+                <td>IMAGE_ACK 中存在缺包。</td>
+                <td>接收进度页</td>
+                <td>橙色显示 <code>Retry 03</code>。</td>
+                <td>重传完成后恢复绿色。</td>
+              </tr>
+              <tr>
+                <td>接收失败</td>
+                <td>超时、CRC 错误过多、用户取消。</td>
+                <td>标题栏 + 图片框下方</td>
+                <td>红色 <code>RX FAIL E02</code>。</td>
+                <td>保留上一张图片；10s 后错误提示降级为状态栏图标。</td>
+              </tr>
+              <tr>
+                <td>远端低电</td>
+                <td>Camera Node 电量低于 20%。</td>
+                <td>状态栏</td>
+                <td><code>C:18%</code> 橙色闪烁。</td>
+                <td>电量恢复或更换电池后取消。</td>
+              </tr>
+              <tr>
+                <td>离线</td>
+                <td>超过心跳超时时间未收到 STATUS。</td>
+                <td>状态栏、设备状态页</td>
+                <td><code>OFFLINE</code></td>
+                <td>再次收到 HELLO/STATUS 后恢复。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>8. 数据字段定义</h2>
+        <p class="section-desc">UI 字段与通信协议字段保持一致，避免显示端二次推断。</p>
+      </div>
+      <div class="content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>UI 字段</th>
+                <th>来源包</th>
+                <th>类型</th>
+                <th>显示格式</th>
+                <th>备注</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Node ID</td>
+                <td>HELLO / STATUS / IMAGE_START</td>
+                <td>uint16</td>
+                <td><code>N01</code></td>
+                <td>第一版默认单节点，也按 ID 显示。</td>
+              </tr>
+              <tr>
+                <td>触发原因</td>
+                <td>IMAGE_START / STATUS</td>
+                <td>enum</td>
+                <td>Timer / PIR / Sound / Manual / Cmd</td>
+                <td>首页标题栏标签。</td>
+              </tr>
+              <tr>
+                <td>图片大小</td>
+                <td>IMAGE_START</td>
+                <td>uint32</td>
+                <td><code>128KB</code></td>
+                <td>按 1024 进位。</td>
+              </tr>
+              <tr>
+                <td>图片尺寸</td>
+                <td>IMAGE_START</td>
+                <td>enum</td>
+                <td>QVGA / VGA</td>
+                <td>首页和配置页显示。</td>
+              </tr>
+              <tr>
+                <td>RSSI</td>
+                <td>每包接收结果</td>
+                <td>int16</td>
+                <td><code>-72 dBm</code></td>
+                <td>显示最近 8 包平均值。</td>
+              </tr>
+              <tr>
+                <td>SNR</td>
+                <td>每包接收结果</td>
+                <td>float</td>
+                <td><code>8.5 dB</code></td>
+                <td>如当前模式无 SNR，则显示 LQ。</td>
+              </tr>
+              <tr>
+                <td>有效速率</td>
+                <td>本地计算</td>
+                <td>float</td>
+                <td><code>13.2 KB/s</code></td>
+                <td>图片大小 / 有效传输时间。</td>
+              </tr>
+              <tr>
+                <td>电量</td>
+                <td>STATUS</td>
+                <td>uint8</td>
+                <td><code>C:76%</code></td>
+                <td>C 为拍摄端，G 为显示端。</td>
+              </tr>
+              <tr>
+                <td>固件版本</td>
+                <td>HELLO / STATUS</td>
+                <td>string</td>
+                <td><code>v0.1.0</code></td>
+                <td>设备状态页显示。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>9. 刷新与性能要求</h2>
+        <p class="section-desc">ST7789V3 全屏刷新成本较高，建议尽量局部刷新。</p>
+      </div>
+      <div class="content">
+        <div class="grid-3">
+          <div class="card">
+            <h3>刷新策略</h3>
+            <ul>
+              <li>状态栏：1s 定时刷新。</li>
+              <li>接收进度：每 4 包或 200ms 刷新一次，取更慢者。</li>
+              <li>图片显示：接收完成后一次绘制。</li>
+              <li>配置列表：只刷新旧选中行和新选中行。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>图片绘制</h3>
+            <ul>
+              <li>建议解码/缩放到 216×162 显示。</li>
+              <li>图片区域背景先清黑，再绘制图像。</li>
+              <li>图片边框固定，不随图片尺寸变化。</li>
+              <li>失败时保留上一张成功图片。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>内存约束</h3>
+            <ul>
+              <li>避免全屏双缓冲。</li>
+              <li>优先使用小块 line buffer。</li>
+              <li>UI 文本静态化，减少动态字符串分配。</li>
+              <li>历史图片不在显示端 RAM 中长期缓存。</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>10. 固件落地建议</h2>
+        <p class="section-desc">以下为建议的软件模块划分，便于多人协作。</p>
+      </div>
+      <div class="content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>模块</th>
+                <th>职责</th>
+                <th>关键接口</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>ui_manager</code></td>
+                <td>页面状态机、切页、按键分发。</td>
+                <td><code>ui_show_page()</code>, <code>ui_handle_key()</code></td>
+              </tr>
+              <tr>
+                <td><code>ui_status_bar</code></td>
+                <td>状态栏绘制与定时刷新。</td>
+                <td><code>ui_status_update()</code></td>
+              </tr>
+              <tr>
+                <td><code>ui_image_page</code></td>
+                <td>首页、图片绘制、图片元数据显示。</td>
+                <td><code>ui_image_set()</code>, <code>ui_image_meta_update()</code></td>
+              </tr>
+              <tr>
+                <td><code>ui_rx_page</code></td>
+                <td>接收进度、速率、重传、超时状态。</td>
+                <td><code>ui_rx_begin()</code>, <code>ui_rx_progress()</code>, <code>ui_rx_done()</code></td>
+              </tr>
+              <tr>
+                <td><code>ui_config_page</code></td>
+                <td>配置列表、参数编辑和保存。</td>
+                <td><code>ui_config_load()</code>, <code>ui_config_save()</code></td>
+              </tr>
+              <tr>
+                <td><code>key_driver</code></td>
+                <td>侧键扫描、消抖、长按识别。</td>
+                <td><code>key_event_t</code></td>
+              </tr>
+              <tr>
+                <td><code>display_driver</code></td>
+                <td>ST7789V3 初始化、区域刷新、背光控制。</td>
+                <td><code>lcd_fill_rect()</code>, <code>lcd_draw_bitmap()</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>11. UI 验收标准</h2>
+        <p class="section-desc">第一版验收以“可演示、可调试、可复现”为准。</p>
+      </div>
+      <div class="content">
+        <div class="grid-2">
+          <div class="card soft-green">
+            <h3>P0 验收</h3>
+            <ul>
+              <li>开机后进入首页，未连接时显示等待节点。</li>
+              <li>收到 IMAGE_START 自动进入接收进度页。</li>
+              <li>接收完成后自动回首页并显示图片。</li>
+              <li>首页显示触发原因、图片大小、远端电量、RSSI、速率。</li>
+              <li>链路详情页显示 RSSI/SNR、速率、丢包率、重传次数。</li>
+              <li>侧键可完成切页、返回、手动拍照命令。</li>
+              <li>接收失败时显示错误，但保留上一张成功图片。</li>
+            </ul>
+          </div>
+          <div class="card soft-blue">
+            <h3>P1 验收</h3>
+            <ul>
+              <li>配置页可修改拍照周期、图片尺寸、质量、触发方式。</li>
+              <li>可开启 Wi-Fi AP 配置入口。</li>
+              <li>控制页可下发播放音频、休眠、刷新状态命令。</li>
+              <li>设备状态页显示本机/远端电量、固件版本和最后心跳。</li>
+              <li>触摸屏如接入，触摸操作与侧键操作一致。</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <p>整理日期：2026-06-10。适用项目：ESP32 LoRa WildCam Open Kit Display Gateway。目标屏幕：ST7789V3，240 × 320 像素，竖屏。</p>
+  </footer>
+</body>
+</html>

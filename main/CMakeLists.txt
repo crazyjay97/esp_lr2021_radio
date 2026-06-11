@@ -3,8 +3,10 @@ idf_component_register(SRCS
                            "audio_diagnostics.cpp"
                            "audio_processor.cpp"
                            "camera_dvp.cpp"
+                           "image_transfer.cpp"
                            "opus_codec.cpp"
                            "radio_ping.cpp"
+                           "ui_gateway.c"
                            "bsp_con6.c"
                            "bsp_i2c.c"
                            "bsp_lcd.c"
@@ -24,4 +26,5 @@ idf_component_register(SRCS
                            esp_timer
                            esp_adc
                            nvs_flash
-                           lvgl)
+                           lvgl
+                           espressif__esp_new_jpeg)

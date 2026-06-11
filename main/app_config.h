@@ -59,7 +59,7 @@
 /* ----- FLRC radio link ------------------------------------------------------- */
 
 /* Center frequency. Confirm the exact channel is legal for the deployment area. */
-#define APP_FLRC_FREQUENCY_HZ           868000000UL
+#define APP_FLRC_FREQUENCY_HZ           903000000UL
 
 /* LR2021 FLRC high-rate mode requested for this project. */
 #define APP_FLRC_BITRATE_BPS            2600000UL
@@ -67,11 +67,11 @@
 /* Double-sided FLRC bandwidth paired with 2.6 Mbps in the LR2021 driver. */
 #define APP_FLRC_BANDWIDTH_HZ           2666000UL
 
-/* Initial TX power for 868 MHz bench tests; adjust for range, heat, and regulations. */
-#define APP_FLRC_TX_POWER_DBM           20
+/* TX power for bench tests. 22 dBm saturates nearby receivers; use 10 for close range. */
+#define APP_FLRC_TX_POWER_DBM           10
 
 /* Use FEC during early tests; switch to RAL_FLRC_CR_1_1 only after range tests. */
-#define APP_FLRC_CODING_RATE            RAL_FLRC_CR_1_2
+#define APP_FLRC_CODING_RATE            RAL_FLRC_CR_3_4
 
 /* BT=0.5 keeps spectrum cleaner than no shaping at high FLRC data rates. */
 #define APP_FLRC_PULSE_SHAPE            RAL_FLRC_PULSE_SHAPE_BT_05
@@ -189,6 +189,23 @@
 #define APP_STARTUP_CHIME_AMP           3500
 
 /* ----- Camera/LCD bring-up -------------------------------------------------- */
+
+/* ----- Image transfer over FLRC ------------------------------------------ */
+
+#define APP_IMAGE_JPEG_QUALITY          50
+#define APP_IMAGE_FRAGMENT_DATA_SIZE    (APP_FLRC_MAX_PAYLOAD_BYTES - 16U)
+#define APP_IMAGE_TX_INTER_PACKET_MS    0U
+#define APP_IMAGE_RX_TIMEOUT_MS         3000U
+#define APP_IMAGE_NACK_MAX_RETRIES      30U
+#define APP_IMAGE_NACK_MAX_INDICES      120U
+#define APP_IMAGE_MAX_JPEG_SIZE         (60U * 1024U)
+#define APP_IMAGE_EOT_RETRY_COUNT       5U
+#define APP_IMAGE_EOT_RETRY_INTERVAL_MS 150U
+#define APP_IMAGE_TASK_STACK_BYTES      16384U
+#define APP_IMAGE_TASK_PRIORITY         3
+#define APP_IMAGE_TASK_CORE             1
+
+/* ----- Camera/LCD bring-up (legacy) -------------------------------------- */
 
 #define APP_CAMERA_LCD_BRINGUP          0
 

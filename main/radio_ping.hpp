@@ -11,6 +11,11 @@
 #include "LiotLr2021.h"
 #include "opus_codec.hpp"
 #include "audio_processor.hpp"
+#include "image_transfer.hpp"
+
+typedef void (*image_capture_cb_t)(uint16_t session_id);
+typedef void (*image_rx_complete_cb_t)(ImageTransfer *xfer);
+typedef void (*image_rx_progress_cb_t)(uint16_t received, uint16_t total, int16_t rssi);
 
 class RadioPing {
 public:
@@ -19,6 +24,18 @@ public:
     void handle_button(bsp_btn_id_t id, bool pressed);
     void suspend();
     void resume();
+
+    // Image transfer: B triggers A to capture
+    void trigger_image_capture();
+    // Image transfer: A sends JPEG fragments to B
+    void send_image(const uint8_t *jpeg, size_t jpeg_len, uint16_t session_id);
+    // Register callbacks
+    void set_image_capture_cb(image_capture_cb_t cb) { image_capture_cb_ = cb; }
+    void set_image_rx_complete_cb(image_rx_complete_cb_t cb) { image_rx_complete_cb_ = cb; }
+    void set_image_rx_progress_cb(image_rx_progress_cb_t cb) { image_rx_progress_cb_ = cb; }
+
+    ImageTransfer &image_xfer() { return image_xfer_; }
+    bool image_tx_busy() const { return image_tx_active_; }
 
 private:
     enum class Mode {
@@ -30,6 +47,7 @@ private:
     static void task_trampoline(void *arg);
     static void tx_task_trampoline(void *arg);
     static void play_task_trampoline(void *arg);
+    static void image_tx_task_trampoline(void *arg);
     static void irq_callback(void *context);
 
     void task();
@@ -52,6 +70,18 @@ private:
     void set_playback_pa(bool on);
     void update_playback_timeout();
 
+    // Image transfer methods
+    void handle_image_cmd();
+    void handle_image_start();
+    void handle_image_data();
+    void handle_image_eot();
+    void handle_image_nack();
+    void handle_image_done();
+    void image_tx_task();
+    bool send_single_packet(const uint8_t *data, uint16_t len);
+    bool wait_for_tx_done(uint32_t timeout_ms);
+    void check_image_rx_timeout();
+
     struct VoicePacket {
         uint16_t seq;
         uint16_t len;
@@ -65,13 +95,22 @@ private:
         uint8_t payload[APP_OPUS_MAX_PACKET_BYTES];
     };
 
+    struct ImageTxRequest {
+        const uint8_t *jpeg;
+        size_t jpeg_len;
+        uint16_t session_id;
+    };
+
     static RadioPing *instance_;
 
+    TaskHandle_t task_handle_ = nullptr;
     ralf_t radio_ = RALF_LR20XX_INSTANTIATE(nullptr);
     OpusCodec codec_;
     AudioProcessor audio_proc_;
+    ImageTransfer image_xfer_;
     QueueHandle_t voice_queue_ = nullptr;
     QueueHandle_t tx_queue_ = nullptr;
+    QueueHandle_t image_tx_queue_ = nullptr;
     Mode mode_ = Mode::idle;
     volatile bool ptt_active_ = false;
     volatile bool suspended_ = false;
@@ -97,4 +136,21 @@ private:
     bool have_expected_play_seq_ = false;
     bool playback_pa_on_ = false;
     bool playback_active_ = false;
+
+    // Image transfer state
+    image_capture_cb_t image_capture_cb_ = nullptr;
+    image_rx_complete_cb_t image_rx_complete_cb_ = nullptr;
+    image_rx_progress_cb_t image_rx_progress_cb_ = nullptr;
+    uint16_t image_session_id_ = 1;
+    volatile bool image_tx_active_ = false;
+    uint32_t image_rx_last_frag_ms_ = 0;
+    bool image_rx_pending_ = false;
+    uint16_t image_rx_nack_sent_ = 0;
+    int16_t image_rx_last_rssi_ = 0;
+
+    // NACK receive state for TX side (A)
+    volatile bool image_nack_received_ = false;
+    volatile bool image_done_received_ = false;
+    uint16_t nack_indices_[APP_IMAGE_NACK_MAX_INDICES] = {};
+    uint16_t nack_count_ = 0;
 };
