@@ -10,6 +10,18 @@
 
 namespace {
 constexpr const char *TAG = "img_xfer";
+
+uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len)
+{
+    crc = ~crc;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 1U) ? (crc >> 1) ^ 0xEDB88320U : (crc >> 1);
+        }
+    }
+    return ~crc;
+}
 }
 
 esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
@@ -99,12 +111,25 @@ void ImageTransfer::rx_begin(uint16_t session_id, uint16_t total_fragments)
     rx_reset();
 
     size_t buf_size = static_cast<size_t>(total_fragments) * APP_IMAGE_FRAGMENT_DATA_SIZE;
+    bool using_psram = false;
     rx_buf_ = static_cast<uint8_t *>(
-        heap_caps_calloc(1, buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        heap_caps_calloc(1, buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     rx_frag_lens_ = static_cast<uint16_t *>(
-        heap_caps_calloc(total_fragments, sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        heap_caps_calloc(total_fragments, sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     rx_received_map_ = static_cast<bool *>(
-        heap_caps_calloc(total_fragments, sizeof(bool), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        heap_caps_calloc(total_fragments, sizeof(bool), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
+    if (!rx_buf_ || !rx_frag_lens_ || !rx_received_map_) {
+        rx_reset();
+        ESP_LOGW(TAG, "rx_begin internal SRAM alloc failed, falling back to PSRAM");
+        using_psram = true;
+        rx_buf_ = static_cast<uint8_t *>(
+            heap_caps_calloc(1, buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        rx_frag_lens_ = static_cast<uint16_t *>(
+            heap_caps_calloc(total_fragments, sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        rx_received_map_ = static_cast<bool *>(
+            heap_caps_calloc(total_fragments, sizeof(bool), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
 
     if (!rx_buf_ || !rx_frag_lens_ || !rx_received_map_) {
         ESP_LOGE(TAG, "rx_begin alloc failed for %u fragments", total_fragments);
@@ -117,7 +142,9 @@ void ImageTransfer::rx_begin(uint16_t session_id, uint16_t total_fragments)
     rx_received_ = 0;
     rx_jpeg_size_ = 0;
 
-    ESP_LOGI(TAG, "rx_begin: session=%u total=%u", session_id, total_fragments);
+    ESP_LOGI(TAG, "rx_begin: session=%u total=%u bytes=%u caps=%s",
+             session_id, total_fragments, static_cast<unsigned>(buf_size),
+             using_psram ? "psram" : "internal");
 }
 
 bool ImageTransfer::rx_fragment(uint16_t session_id, uint16_t frag_index,
@@ -212,6 +239,20 @@ bool ImageTransfer::rx_build_bitmap(uint8_t *bitmap, uint16_t max_bytes,
     *out_first_missing = first_missing;
     *out_byte_count = bytes_needed;
     return true;
+}
+
+uint32_t ImageTransfer::rx_crc32() const
+{
+    if (!rx_buf_ || !rx_complete()) {
+        return 0;
+    }
+
+    uint32_t crc = 0;
+    for (uint16_t i = 0; i < rx_total_; i++) {
+        size_t frag_offset = static_cast<size_t>(i) * APP_IMAGE_FRAGMENT_DATA_SIZE;
+        crc = crc32_update(crc, rx_buf_ + frag_offset, rx_frag_lens_[i]);
+    }
+    return crc;
 }
 
 esp_err_t ImageTransfer::decode_to_rgb565(uint8_t **out_rgb565, uint32_t *out_w, uint32_t *out_h)

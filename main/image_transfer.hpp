@@ -36,6 +36,8 @@ public:
     uint16_t rx_session_id() const { return rx_session_id_; }
     uint16_t rx_received_count() const { return rx_received_; }
     uint16_t rx_total_count() const { return rx_total_; }
+    size_t rx_jpeg_size() const { return rx_jpeg_size_; }
+    uint32_t rx_crc32() const;
     bool rx_active() const { return rx_buf_ != nullptr; }
     bool rx_complete() const { return rx_total_ > 0 && rx_received_ == rx_total_; }
 

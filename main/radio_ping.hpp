@@ -129,6 +129,7 @@ private:
     uint32_t rx_packets_ = 0;
     uint32_t rx_lost_ = 0;
     uint32_t rx_crc_errors_ = 0;
+    uint32_t rx_unknown_packets_ = 0;
     uint32_t rx_queue_drops_ = 0;
     uint32_t tx_queue_drops_ = 0;
     uint32_t last_rx_audio_ms_ = 0;
@@ -144,6 +145,8 @@ private:
     uint16_t image_session_id_ = 1;
     volatile bool image_tx_active_ = false;
     uint32_t image_rx_last_frag_ms_ = 0;
+    uint32_t image_rx_last_progress_ms_ = 0;
+    uint32_t image_rx_expected_crc32_ = 0;
     bool image_rx_pending_ = false;
     uint16_t image_rx_nack_sent_ = 0;
     int16_t image_rx_last_rssi_ = 0;

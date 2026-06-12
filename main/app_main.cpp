@@ -268,9 +268,7 @@ void on_image_rx_complete(ImageTransfer *xfer)
              e, rgb565, (unsigned long)w, (unsigned long)h);
     if (e == ESP_OK && rgb565) {
         uint32_t elapsed_ms = 0; // TODO: track from rx_begin
-        uint32_t jpeg_size = 0;
-        // Approximate jpeg_size from fragment count
-        jpeg_size = xfer->rx_total_count() * APP_IMAGE_FRAGMENT_DATA_SIZE;
+        uint32_t jpeg_size = static_cast<uint32_t>(xfer->rx_jpeg_size());
 
         ESP_LOGI(TAG, "showing image: mode=%d jpeg_size=%lu",
                  (int)g_app_mode, (unsigned long)jpeg_size);

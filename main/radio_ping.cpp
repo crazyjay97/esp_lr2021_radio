@@ -52,6 +52,14 @@ uint16_t get_u16_le(const uint8_t *p)
     return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
 }
 
+uint32_t get_u32_le(const uint8_t *p)
+{
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
 TickType_t ms_to_ticks_min_1(uint32_t ms)
 {
     TickType_t ticks = pdMS_TO_TICKS(ms);
@@ -68,6 +76,18 @@ uint16_t crc16_ccitt(const uint8_t *data, size_t len)
         }
     }
     return crc;
+}
+
+uint32_t crc32_ieee(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFFU;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 1U) ? (crc >> 1) ^ 0xEDB88320U : (crc >> 1);
+        }
+    }
+    return ~crc;
 }
 
 } // namespace
@@ -600,8 +620,12 @@ void RadioPing::handle_rx_packet()
     int16_t rssi = pkt_status.rssi_sync_in_dbm;
 
     if (len < kHeaderSize || std::memcmp(rx_buf_, kMagic, sizeof(kMagic)) != 0) {
-        ESP_LOGW(TAG, "RX unknown packet len=%u rssi=%d hdr=%02x%02x%02x%02x",
-                 len, rssi, rx_buf_[0], rx_buf_[1], rx_buf_[2], rx_buf_[3]);
+        rx_unknown_packets_++;
+        if ((rx_unknown_packets_ % 50U) == 1U) {
+            ESP_LOGW(TAG, "RX unknown packets=%lu len=%u rssi=%d hdr=%02x%02x%02x%02x",
+                     static_cast<unsigned long>(rx_unknown_packets_), len, rssi,
+                     rx_buf_[0], rx_buf_[1], rx_buf_[2], rx_buf_[3]);
+        }
         return;
     }
 
@@ -614,6 +638,7 @@ void RadioPing::handle_rx_packet()
         handle_image_cmd();
     } else if (rx_buf_[4] == kPacketTypeImageData) {
         image_rx_last_rssi_ = rssi;
+        schedule_rx();
         handle_image_data();
     } else if (rx_buf_[4] == kPacketTypeImageNack) {
         handle_image_nack();
@@ -822,17 +847,22 @@ void RadioPing::trigger_image_capture()
         return;
     }
 
+    uint16_t session_id = image_session_id_++;
+    if (image_session_id_ == 0) {
+        image_session_id_ = 1;
+    }
+
     // Build ImageCmd packet
     uint8_t pkt[kHeaderSize];
     std::memcpy(pkt, kMagic, sizeof(kMagic));
     pkt[4] = kPacketTypeImageCmd;
     pkt[5] = 1;
-    put_u16_le(&pkt[6], image_session_id_);
+    put_u16_le(&pkt[6], session_id);
     put_u32_le(&pkt[8], smtc_modem_hal_get_time_in_ms());
     pkt[12] = 0;
     pkt[13] = 0;
 
-    ESP_LOGI(TAG, "trigger_image_capture: sending ImageCmd session=%u", image_session_id_);
+    ESP_LOGI(TAG, "trigger_image_capture: sending ImageCmd session=%u", session_id);
 
     // Stop RX, send cmd, return to RX
     smtc_modem_hal_protect_api_call();
@@ -903,9 +933,11 @@ void RadioPing::image_tx_task()
 
         uint16_t total_fragments = static_cast<uint16_t>(
             (req.jpeg_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) / APP_IMAGE_FRAGMENT_DATA_SIZE);
+        uint32_t jpeg_crc32 = crc32_ieee(req.jpeg, req.jpeg_len);
 
-        ESP_LOGI(TAG, "image TX start: session=%u jpeg=%u bytes frags=%u",
-                 req.session_id, static_cast<unsigned>(req.jpeg_len), total_fragments);
+        ESP_LOGI(TAG, "image TX start: session=%u jpeg=%u bytes frags=%u crc32=0x%08lx",
+                 req.session_id, static_cast<unsigned>(req.jpeg_len), total_fragments,
+                 static_cast<unsigned long>(jpeg_crc32));
 
         bool was_ptt = ptt_active_;
         ptt_active_ = false;
@@ -927,8 +959,7 @@ void RadioPing::image_tx_task()
             start_pkt[5] = 1;
             put_u16_le(&start_pkt[6], req.session_id);
             put_u16_le(&start_pkt[8], total_fragments);
-            start_pkt[10] = 0; start_pkt[11] = 0;
-            start_pkt[12] = 0; start_pkt[13] = 0;
+            put_u32_le(&start_pkt[10], jpeg_crc32);
             send_single_packet(start_pkt, kHeaderSize);
 
             image_nack_received_ = false;
@@ -996,8 +1027,6 @@ void RadioPing::image_tx_task()
             }
             if (APP_IMAGE_TX_INTER_PACKET_MS > 0) {
                 vTaskDelay(ms_to_ticks_min_1(APP_IMAGE_TX_INTER_PACKET_MS));
-            } else {
-                vTaskDelay(1);
             }
         }
 
@@ -1072,11 +1101,13 @@ void RadioPing::image_tx_task()
                     put_u16_le(&pkt[10], total_fragments);
                     put_u16_le(&pkt[12], frag_len);
                     std::memcpy(&pkt[kHeaderSize], req.jpeg + offset, frag_len);
-                    uint16_t crc = crc16_ccitt(&pkt[kHeaderSize], frag_len);
+                    uint16_t crc = crc16_ccitt(&pkt[4], kHeaderSize - 4 + frag_len);
                     put_u16_le(&pkt[kHeaderSize + frag_len], crc);
 
                     send_single_packet(pkt, static_cast<uint16_t>(kHeaderSize + frag_len + 2));
-                    vTaskDelay(1);
+                    if (APP_IMAGE_TX_INTER_PACKET_MS > 0) {
+                        vTaskDelay(ms_to_ticks_min_1(APP_IMAGE_TX_INTER_PACKET_MS));
+                    }
                 }
                 continue;
             }
@@ -1117,8 +1148,6 @@ void RadioPing::image_tx_task()
                 }
                 if (APP_IMAGE_TX_INTER_PACKET_MS > 0) {
                     vTaskDelay(ms_to_ticks_min_1(APP_IMAGE_TX_INTER_PACKET_MS));
-                } else {
-                    vTaskDelay(1);
                 }
             }
         }
@@ -1191,14 +1220,18 @@ void RadioPing::handle_image_start()
 {
     uint16_t session_id = get_u16_le(&rx_buf_[6]);
     uint16_t total_frags = get_u16_le(&rx_buf_[8]);
+    uint32_t expected_crc32 = get_u32_le(&rx_buf_[10]);
 
-    ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u", session_id, total_frags);
+    ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx",
+             session_id, total_frags, static_cast<unsigned long>(expected_crc32));
 
     // Prepare RX buffer
     image_xfer_.rx_begin(session_id, total_frags);
     image_rx_pending_ = true;
     image_rx_nack_sent_ = 0;
     image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
+    image_rx_last_progress_ms_ = 0;
+    image_rx_expected_crc32_ = expected_crc32;
 
     // Send ACK (ready) — missing_count=0 means "ready"
     uint8_t pkt[kHeaderSize];
@@ -1226,6 +1259,11 @@ void RadioPing::handle_image_data()
     uint16_t total_frags = get_u16_le(&rx_buf_[10]);
     uint16_t frag_len = get_u16_le(&rx_buf_[12]);
 
+    if (!image_rx_pending_ || session_id != image_xfer_.rx_session_id() ||
+        total_frags != image_xfer_.rx_total_count()) {
+        return;
+    }
+
     if (frag_len > APP_IMAGE_FRAGMENT_DATA_SIZE) {
         ESP_LOGW(TAG, "RX ImageData: bad frag_len=%u", frag_len);
         return;
@@ -1246,7 +1284,13 @@ void RadioPing::handle_image_data()
         image_rx_nack_sent_ = 0;
     }
 
-    if (image_rx_progress_cb_) {
+    uint32_t now = smtc_modem_hal_get_time_in_ms();
+    bool report_progress =
+        image_xfer_.rx_complete() ||
+        image_rx_last_progress_ms_ == 0 ||
+        now - image_rx_last_progress_ms_ >= APP_IMAGE_RX_PROGRESS_INTERVAL_MS;
+    if (report_progress && image_rx_progress_cb_) {
+        image_rx_last_progress_ms_ = now;
         image_rx_progress_cb_(image_xfer_.rx_received_count(), total_frags, image_rx_last_rssi_);
     }
 }
@@ -1324,6 +1368,22 @@ void RadioPing::handle_image_eot()
 
     uint16_t missing_indices[APP_IMAGE_NACK_MAX_INDICES];
     uint16_t missing_count = image_xfer_.rx_get_missing(missing_indices, APP_IMAGE_NACK_MAX_INDICES);
+    if (missing_count == 0 && image_rx_expected_crc32_ != 0) {
+        uint32_t actual_crc32 = image_xfer_.rx_crc32();
+        if (actual_crc32 != image_rx_expected_crc32_) {
+            ESP_LOGW(TAG, "image RX crc32 mismatch: expected=0x%08lx actual=0x%08lx, requesting full resend",
+                     static_cast<unsigned long>(image_rx_expected_crc32_),
+                     static_cast<unsigned long>(actual_crc32));
+            image_xfer_.rx_begin(session_id, total_frags);
+            image_rx_pending_ = true;
+            image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
+            image_rx_last_progress_ms_ = 0;
+            missing_count = image_xfer_.rx_get_missing(missing_indices, APP_IMAGE_NACK_MAX_INDICES);
+        } else {
+            ESP_LOGI(TAG, "image RX crc32 ok: 0x%08lx",
+                     static_cast<unsigned long>(actual_crc32));
+        }
+    }
 
     put_u16_le(&pkt[8], missing_count);
     put_u16_le(&pkt[10], image_xfer_.rx_received_count());
@@ -1354,17 +1414,33 @@ void RadioPing::handle_image_eot()
 void RadioPing::check_image_rx_timeout()
 {
     if (!image_rx_pending_) return;
+    uint32_t now = smtc_modem_hal_get_time_in_ms();
+    if (image_xfer_.rx_complete() &&
+        now - image_rx_last_frag_ms_ < APP_IMAGE_RX_TIMEOUT_MS) {
+        return;
+    }
     if (image_xfer_.rx_complete()) {
+        if (image_rx_expected_crc32_ != 0) {
+            uint32_t actual_crc32 = image_xfer_.rx_crc32();
+            if (actual_crc32 != image_rx_expected_crc32_) {
+                ESP_LOGW(TAG, "image RX complete timeout crc32 mismatch: expected=0x%08lx actual=0x%08lx",
+                         static_cast<unsigned long>(image_rx_expected_crc32_),
+                         static_cast<unsigned long>(actual_crc32));
+                image_xfer_.rx_begin(image_xfer_.rx_session_id(), image_xfer_.rx_total_count());
+                image_rx_last_frag_ms_ = now;
+                image_rx_last_progress_ms_ = 0;
+                return;
+            }
+        }
         image_rx_pending_ = false;
         image_rx_done_session_ = image_xfer_.rx_session_id();
-        ESP_LOGI(TAG, "image RX complete (all frags received before EOT)");
+        ESP_LOGI(TAG, "image RX complete (no EOT seen before timeout)");
         if (image_rx_complete_cb_) {
             image_rx_complete_cb_(&image_xfer_);
         }
         return;
     }
 
-    uint32_t now = smtc_modem_hal_get_time_in_ms();
     if (now - image_rx_last_frag_ms_ < 10000U) {
         return;
     }
