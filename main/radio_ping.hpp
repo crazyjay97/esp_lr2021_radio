@@ -147,6 +147,7 @@ private:
     bool image_rx_pending_ = false;
     uint16_t image_rx_nack_sent_ = 0;
     int16_t image_rx_last_rssi_ = 0;
+    uint16_t image_rx_done_session_ = 0;
 
     // NACK receive state for TX side (A)
     volatile bool image_nack_received_ = false;

@@ -1006,6 +1006,9 @@ void RadioPing::image_tx_task()
         // Step 2-8: EOT + wait ACK + retransmit loop
         bool transfer_done = false;
         for (uint16_t round = 0; round < APP_IMAGE_NACK_MAX_RETRIES && !transfer_done; round++) {
+            // Give R time to process last packets before sending EOT
+            vTaskDelay(pdMS_TO_TICKS(30));
+
             // Send EOT, retry if no response
             bool got_response = false;
             for (uint16_t eot_try = 0; eot_try < APP_IMAGE_EOT_RETRY_COUNT; eot_try++) {
@@ -1287,15 +1290,15 @@ void RadioPing::handle_image_eot()
              session_id, image_xfer_.rx_received_count(), total_frags);
 
     if (!image_rx_pending_) {
-        // Already completed or timed out — still send ACK so T knows we're done
-        if (image_xfer_.rx_complete()) {
+        // Already completed — still send ACK so T stops retrying
+        if (session_id == image_rx_done_session_) {
             uint8_t pkt[kHeaderSize];
             std::memcpy(pkt, kMagic, sizeof(kMagic));
             pkt[4] = kPacketTypeImageNack;
             pkt[5] = 3;
             put_u16_le(&pkt[6], session_id);
             put_u16_le(&pkt[8], 0);
-            put_u16_le(&pkt[10], image_xfer_.rx_received_count());
+            put_u16_le(&pkt[10], 0);
             pkt[12] = 0; pkt[13] = 0;
             send_single_packet(pkt, kHeaderSize);
             schedule_rx();
@@ -1335,6 +1338,7 @@ void RadioPing::handle_image_eot()
 
     if (missing_count == 0) {
         image_rx_pending_ = false;
+        image_rx_done_session_ = session_id;
         ESP_LOGI(TAG, "image RX complete: session=%u", session_id);
         schedule_rx();
         if (image_rx_complete_cb_) {
@@ -1351,8 +1355,8 @@ void RadioPing::check_image_rx_timeout()
 {
     if (!image_rx_pending_) return;
     if (image_xfer_.rx_complete()) {
-        // All fragments received — fire callback directly instead of waiting for EOT
         image_rx_pending_ = false;
+        image_rx_done_session_ = image_xfer_.rx_session_id();
         ESP_LOGI(TAG, "image RX complete (all frags received before EOT)");
         if (image_rx_complete_cb_) {
             image_rx_complete_cb_(&image_xfer_);
