@@ -29,33 +29,22 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
         return ESP_ERR_INVALID_SIZE;
     }
 
-    // The encoder expects YCbYCr (YUYV) byte order.
-    // SP0A39 outputs UYVY. Swizzle: [U,Y0,V,Y1] → [Y0,U,Y1,V]
-    bool need_swizzle = (pixfmt == 0x59565955); // V4L2_PIX_FMT_UYVY
-    uint8_t *enc_input = nullptr;
+    // SP0A39 outputs UYVY = [Cb, Y0, Cr, Y1]
+    // Encoder expects YCbYCr = [Y0, Cb, Y1, Cr]
+    // Swizzle: [U, Y0, V, Y1] → [Y0, U, Y1, V]
+    uint8_t *enc_input = static_cast<uint8_t *>(
+        jpeg_calloc_align(expected_len, 16));
+    if (!enc_input) {
+        ESP_LOGE(TAG, "enc input alloc failed: %u bytes",
+                 static_cast<unsigned>(expected_len));
+        return ESP_ERR_NO_MEM;
+    }
 
-    if (need_swizzle) {
-        enc_input = static_cast<uint8_t *>(
-            jpeg_calloc_align(expected_len, 16));
-        if (!enc_input) {
-            ESP_LOGE(TAG, "swizzle buffer alloc failed: %u bytes",
-                     static_cast<unsigned>(expected_len));
-            return ESP_ERR_NO_MEM;
-        }
-        for (size_t i = 0; i < expected_len; i += 4) {
-            enc_input[i + 0] = yuv422[i + 1]; // Y0
-            enc_input[i + 1] = yuv422[i + 2]; // V → treat as Cb
-            enc_input[i + 2] = yuv422[i + 3]; // Y1
-            enc_input[i + 3] = yuv422[i + 0]; // U → treat as Cr
-        }
-    } else {
-        // YUYV or compatible — use directly but need aligned copy
-        enc_input = static_cast<uint8_t *>(
-            jpeg_calloc_align(expected_len, 16));
-        if (!enc_input) {
-            return ESP_ERR_NO_MEM;
-        }
-        std::memcpy(enc_input, yuv422, expected_len);
+    for (size_t i = 0; i + 3 < expected_len; i += 4) {
+        enc_input[i + 0] = yuv422[i + 1]; // Y0
+        enc_input[i + 1] = yuv422[i + 0]; // U (Cb)
+        enc_input[i + 2] = yuv422[i + 3]; // Y1
+        enc_input[i + 3] = yuv422[i + 2]; // V (Cr)
     }
 
     jpeg_enc_config_t enc_cfg = DEFAULT_JPEG_ENC_CONFIG();
@@ -251,11 +240,11 @@ esp_err_t ImageTransfer::decode_to_rgb565(uint8_t **out_rgb565, uint32_t *out_w,
         offset += rx_frag_lens_[i];
     }
 
-    // Decode at full resolution, UI layer handles scaling
+    // Decode and scale to fit LCD preview area
     jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
     dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
-    dec_cfg.scale.width = 0;
-    dec_cfg.scale.height = 0;
+    dec_cfg.scale.width = 240;
+    dec_cfg.scale.height = 176;
 
     jpeg_dec_handle_t decoder = nullptr;
     jpeg_error_t jerr = jpeg_dec_open(&dec_cfg, &decoder);
@@ -307,8 +296,8 @@ esp_err_t ImageTransfer::decode_to_rgb565(uint8_t **out_rgb565, uint32_t *out_w,
     }
 
     *out_rgb565 = rgb_buf;
-    *out_w = header.width;
-    *out_h = header.height;
+    *out_w = dec_cfg.scale.width;
+    *out_h = dec_cfg.scale.height;
     ESP_LOGI(TAG, "JPEG decoded to RGB565: %lux%lu (%d bytes)",
              static_cast<unsigned long>(*out_w), static_cast<unsigned long>(*out_h), outbuf_len);
     return ESP_OK;

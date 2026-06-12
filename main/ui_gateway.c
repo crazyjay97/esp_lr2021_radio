@@ -636,7 +636,7 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
         s_link_rate = jpeg_size * 1000 / elapsed_ms;
     }
 
-    /* Copy image to canvas buffer */
+    /* Copy image to canvas buffer (swap R↔B for BGR panel) */
     if (s_img_canvas_buf && rgb565 && w > 0 && h > 0) {
         for (uint32_t y = 0; y < IMG_H; y++) {
             uint32_t src_y = (y * h) / IMG_H;
@@ -644,7 +644,11 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
             lv_color_t *dst = s_img_canvas_buf + y * IMG_W;
             for (uint32_t x = 0; x < IMG_W; x++) {
                 uint32_t src_x = (x * w) / IMG_W;
-                dst[x].full = src[src_x];
+                uint16_t px = src[src_x];
+                uint16_t r = (px >> 11) & 0x1F;
+                uint16_t g = (px >> 5) & 0x3F;
+                uint16_t b = px & 0x1F;
+                dst[x].full = (b << 11) | (g << 5) | r;
             }
         }
         s_has_image = true;
