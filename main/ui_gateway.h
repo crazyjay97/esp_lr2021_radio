@@ -18,6 +18,7 @@ typedef enum {
 } ui_page_t;
 
 typedef void (*ui_gw_capture_cb_t)(void);
+typedef bool (*ui_gw_interval_cb_t)(uint32_t interval_sec);
 
 esp_err_t ui_gw_init(void);
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed);
@@ -29,6 +30,7 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
 void ui_gw_rx_failed(const char *reason);
 
 void ui_gw_set_capture_cb(ui_gw_capture_cb_t cb);
+void ui_gw_set_interval_cb(ui_gw_interval_cb_t cb);
 
 #ifdef __cplusplus
 }

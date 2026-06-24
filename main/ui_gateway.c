@@ -38,7 +38,14 @@ static const char *TAG = "ui_gw";
 /* ─── State ─── */
 static ui_page_t s_page = UI_PAGE_IMAGE;
 static ui_gw_capture_cb_t s_capture_cb = NULL;
+static ui_gw_interval_cb_t s_interval_cb = NULL;
 static SemaphoreHandle_t s_lock = NULL; // points to bsp_lcd's LVGL lock
+
+/* Interval presets */
+static const uint32_t s_interval_presets[] = {0, 10, 30, 60, 300, 600, 900, 1200, 1800, 3600};
+static const char *s_interval_labels[] = {"Off", "10s", "30s", "1min", "5min", "10min", "15min", "20min", "30min", "1h"};
+#define INTERVAL_PRESET_COUNT 10
+static int s_cfg_interval_idx = 4; /* default = 5 min */
 
 /* Shared layout objects */
 static lv_obj_t *s_scr = NULL;
@@ -446,7 +453,7 @@ static void create_config_page(void)
     lv_obj_set_style_pad_row(panel, 0, 0);
 
     static const char *cfg_keys[] = {"JPEG Quality", "Resolution", "Trigger", "Interval", "Audio"};
-    static const char *cfg_vals[] = {"Q=50", "VGA", "Manual", "Off", "Off"};
+    const char *cfg_vals[] = {"Q=50", "VGA", "Manual", s_interval_labels[s_cfg_interval_idx], "Off"};
 
     for (int i = 0; i < 5; i++) {
         s_cfg_rows[i] = create_kv_row(panel, cfg_keys[i], cfg_vals[i], &s_cfg_val_lbls[i]);
@@ -526,12 +533,65 @@ void ui_gw_set_capture_cb(ui_gw_capture_cb_t cb)
     s_capture_cb = cb;
 }
 
+void ui_gw_set_interval_cb(ui_gw_interval_cb_t cb)
+{
+    s_interval_cb = cb;
+}
+
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
 {
     if (!pressed) return;
     if (!s_lock) return;
 
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+
+    if (s_page == UI_PAGE_CONFIG) {
+        /* Config page has its own key handling */
+        if (key == BSP_BTN_VOL_UP) {
+            /* K4 = next item */
+            if (s_cfg_rows[s_cfg_sel]) {
+                lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_TRANSP, 0);
+            }
+            s_cfg_sel = (s_cfg_sel + 1) % 5;
+            if (s_cfg_rows[s_cfg_sel]) {
+                lv_obj_set_style_bg_color(s_cfg_rows[s_cfg_sel], COL_GREEN, 0);
+                lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_COVER, 0);
+            }
+        } else if (key == BSP_BTN_USER1) {
+            /* K5 = prev item */
+            if (s_cfg_rows[s_cfg_sel]) {
+                lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_TRANSP, 0);
+            }
+            s_cfg_sel = (s_cfg_sel + 4) % 5;
+            if (s_cfg_rows[s_cfg_sel]) {
+                lv_obj_set_style_bg_color(s_cfg_rows[s_cfg_sel], COL_GREEN, 0);
+                lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_COVER, 0);
+            }
+        } else if (key == BSP_BTN_VOL_DN) {
+            /* K3 = action on selected row */
+            if (s_cfg_sel == 3) {
+                /* Interval row: cycle preset */
+                s_cfg_interval_idx = (s_cfg_interval_idx + 1) % INTERVAL_PRESET_COUNT;
+                if (s_cfg_val_lbls[3]) {
+                    lv_label_set_text(s_cfg_val_lbls[3], s_interval_labels[s_cfg_interval_idx]);
+                }
+                lv_label_set_text(s_status_lbl_r, "Sending...");
+                lv_refr_now(NULL);
+                bool ok = s_interval_cb ? s_interval_cb(s_interval_presets[s_cfg_interval_idx]) : false;
+                lv_label_set_text(s_status_lbl_r, ok ? "Set OK" : "Set FAIL");
+            } else if (s_cfg_sel == 0 || s_cfg_sel == 1) {
+                /* Capture button rows — trigger capture */
+                if (s_capture_cb) {
+                    s_capture_cb();
+                    lv_label_set_text(s_status_lbl_r, "Requesting...");
+                }
+            }
+        } else if (key == BSP_BTN_PTT) {
+            /* K6 = back */
+            show_page(UI_PAGE_IMAGE);
+        }
+        goto done;
+    }
 
     if (key == BSP_BTN_VOL_UP) {
         /* K4 = next page */
@@ -548,7 +608,7 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
         show_page((ui_page_t)prev);
     } else if (key == BSP_BTN_VOL_DN) {
         /* K3 = confirm / capture */
-        if (s_page == UI_PAGE_IMAGE || s_page == UI_PAGE_CONFIG) {
+        if (s_page == UI_PAGE_IMAGE) {
             if (s_capture_cb) {
                 s_capture_cb();
                 lv_label_set_text(s_status_lbl_r, "Requesting...");

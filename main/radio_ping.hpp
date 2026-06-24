@@ -16,6 +16,7 @@
 typedef void (*image_capture_cb_t)(uint16_t session_id);
 typedef void (*image_rx_complete_cb_t)(ImageTransfer *xfer);
 typedef void (*image_rx_progress_cb_t)(uint16_t received, uint16_t total, int16_t rssi);
+typedef void (*config_received_cb_t)(uint8_t key, uint32_t value);
 
 class RadioPing {
 public:
@@ -33,6 +34,9 @@ public:
     void set_image_capture_cb(image_capture_cb_t cb) { image_capture_cb_ = cb; }
     void set_image_rx_complete_cb(image_rx_complete_cb_t cb) { image_rx_complete_cb_ = cb; }
     void set_image_rx_progress_cb(image_rx_progress_cb_t cb) { image_rx_progress_cb_ = cb; }
+    void set_config_received_cb(config_received_cb_t cb) { config_received_cb_ = cb; }
+
+    bool send_config(uint8_t key, uint32_t value);
 
     ImageTransfer &image_xfer() { return image_xfer_; }
     bool image_tx_busy() const { return image_tx_active_; }
@@ -81,6 +85,7 @@ private:
     bool send_single_packet(const uint8_t *data, uint16_t len);
     bool wait_for_tx_done(uint32_t timeout_ms);
     void check_image_rx_timeout();
+    void send_config_ack(uint8_t key, uint32_t value);
 
     struct VoicePacket {
         uint16_t seq;
@@ -142,6 +147,7 @@ private:
     image_capture_cb_t image_capture_cb_ = nullptr;
     image_rx_complete_cb_t image_rx_complete_cb_ = nullptr;
     image_rx_progress_cb_t image_rx_progress_cb_ = nullptr;
+    config_received_cb_t config_received_cb_ = nullptr;
     uint16_t image_session_id_ = 1;
     volatile bool image_tx_active_ = false;
     uint32_t image_rx_last_frag_ms_ = 0;
@@ -157,4 +163,7 @@ private:
     volatile bool image_done_received_ = false;
     uint16_t nack_indices_[APP_IMAGE_NACK_MAX_INDICES] = {};
     uint16_t nack_count_ = 0;
+
+    // Config ACK state
+    volatile bool config_ack_received_ = false;
 };

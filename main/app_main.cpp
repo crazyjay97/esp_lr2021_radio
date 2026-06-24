@@ -37,6 +37,13 @@ volatile bool g_capture_busy = false;
 AppMode g_app_mode = AppMode::camera;
 bool g_radio_active = false;
 
+// Auto-capture timer state
+esp_timer_handle_t g_auto_capture_timer = nullptr;
+esp_timer_handle_t g_countdown_timer = nullptr;
+uint32_t g_capture_interval_sec = APP_AUTO_CAPTURE_DEFAULT_SEC;
+uint16_t g_auto_session_id = 0x8000;
+int64_t g_last_capture_time_us = 0;
+
 // K6 short/long press state
 int64_t g_ptt_press_time_us = 0;
 bool g_ptt_held_long = false;
@@ -98,6 +105,133 @@ void save_app_mode(AppMode mode)
     nvs_close(nvs);
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "save mode nvs: %s", esp_err_to_name(e));
+    }
+}
+
+uint32_t load_capture_interval()
+{
+    nvs_handle_t nvs;
+    uint32_t val = APP_AUTO_CAPTURE_DEFAULT_SEC;
+    if (nvs_open(kNvsNs, NVS_READONLY, &nvs) == ESP_OK) {
+        (void)nvs_get_u32(nvs, "interval", &val);
+        nvs_close(nvs);
+    }
+    return val;
+}
+
+void save_capture_interval(uint32_t sec)
+{
+    nvs_handle_t nvs;
+    esp_err_t e = nvs_open(kNvsNs, NVS_READWRITE, &nvs);
+    if (e != ESP_OK) return;
+    e = nvs_set_u32(nvs, "interval", sec);
+    if (e == ESP_OK) e = nvs_commit(nvs);
+    nvs_close(nvs);
+}
+
+void on_image_capture_request(uint16_t session_id);
+
+void auto_capture_timer_cb(void *arg)
+{
+    (void)arg;
+    if (g_app_mode != AppMode::camera) return;
+    if (g_capture_busy) {
+        ESP_LOGW(TAG, "auto-capture skipped: busy");
+        return;
+    }
+    g_last_capture_time_us = esp_timer_get_time();
+    uint16_t sid = g_auto_session_id++;
+    if (g_auto_session_id == 0) g_auto_session_id = 0x8000;
+    ESP_LOGI(TAG, "auto-capture trigger: session=%u interval=%lus",
+             sid, static_cast<unsigned long>(g_capture_interval_sec));
+    on_image_capture_request(sid);
+}
+
+void start_auto_capture_timer()
+{
+    if (g_auto_capture_timer) {
+        esp_timer_stop(g_auto_capture_timer);
+    }
+    if (g_capture_interval_sec == 0) {
+        ESP_LOGI(TAG, "auto-capture disabled");
+        return;
+    }
+    uint64_t period_us = static_cast<uint64_t>(g_capture_interval_sec) * 1000000ULL;
+    if (!g_auto_capture_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = auto_capture_timer_cb,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "auto_cap",
+            .skip_unhandled_events = true,
+        };
+        esp_timer_create(&args, &g_auto_capture_timer);
+    }
+    esp_timer_start_periodic(g_auto_capture_timer, period_us);
+    ESP_LOGI(TAG, "auto-capture timer started: %lus", static_cast<unsigned long>(g_capture_interval_sec));
+}
+
+void countdown_timer_cb(void *arg)
+{
+    (void)arg;
+    if (g_app_mode != AppMode::camera) return;
+    if (g_capture_busy) return;
+
+    char buf[48];
+    if (g_capture_interval_sec == 0) {
+        snprintf(buf, sizeof(buf), "Auto: Off");
+    } else {
+        int64_t elapsed_us = esp_timer_get_time() - g_last_capture_time_us;
+        int32_t remaining = static_cast<int32_t>(g_capture_interval_sec) -
+                            static_cast<int32_t>(elapsed_us / 1000000LL);
+        if (remaining < 0) remaining = 0;
+
+        const char *unit;
+        uint32_t val;
+        if (g_capture_interval_sec >= 3600) {
+            unit = "h"; val = g_capture_interval_sec / 3600;
+        } else if (g_capture_interval_sec >= 60) {
+            unit = "min"; val = g_capture_interval_sec / 60;
+        } else {
+            unit = "s"; val = g_capture_interval_sec;
+        }
+        snprintf(buf, sizeof(buf), "%lu%s | %lds", static_cast<unsigned long>(val), unit,
+                 static_cast<long>(remaining));
+    }
+    bsp_lcd_set_camera_status(buf);
+}
+
+void update_camera_timer_status()
+{
+    g_last_capture_time_us = esp_timer_get_time();
+    countdown_timer_cb(nullptr);
+}
+
+void start_countdown_timer()
+{
+    if (g_countdown_timer) return;
+    const esp_timer_create_args_t args = {
+        .callback = countdown_timer_cb,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "countdown",
+        .skip_unhandled_events = true,
+    };
+    esp_timer_create(&args, &g_countdown_timer);
+    esp_timer_start_periodic(g_countdown_timer, 1000000ULL);
+}
+
+void on_config_received(uint8_t key, uint32_t value)
+{
+    if (key == APP_CFG_KEY_INTERVAL) {
+        if (value != 0 && value < APP_AUTO_CAPTURE_MIN_SEC) {
+            value = APP_AUTO_CAPTURE_MIN_SEC;
+        }
+        g_capture_interval_sec = value;
+        save_capture_interval(value);
+        start_auto_capture_timer();
+        update_camera_timer_status();
+        ESP_LOGI(TAG, "config: interval=%lus", static_cast<unsigned long>(value));
     }
 }
 
@@ -219,7 +353,6 @@ void image_capture_task(void *arg)
     }
 
     heap_caps_free(jpeg);
-    bsp_lcd_set_camera_status("Image sent");
     g_capture_busy = false;
     vTaskDelete(nullptr);
 }
@@ -434,6 +567,13 @@ void on_gw_capture(void)
     g_radio.trigger_image_capture();
 }
 
+// Gateway UI interval change callback — sends config to camera node
+bool on_gw_interval_change(uint32_t interval_sec)
+{
+    ESP_LOGI(TAG, "UI interval change: %lus", static_cast<unsigned long>(interval_sec));
+    return g_radio.send_config(APP_CFG_KEY_INTERVAL, interval_sec);
+}
+
 void on_button(bsp_btn_id_t id, bool pressed, void *user)
 {
     (void)user;
@@ -583,6 +723,7 @@ extern "C" void app_main(void)
             g_radio.set_image_capture_cb(on_image_capture_request);
             g_radio.set_image_rx_complete_cb(on_image_rx_complete);
             g_radio.set_image_rx_progress_cb(on_image_rx_progress);
+            g_radio.set_config_received_cb(on_config_received);
         }
         if (g_app_mode == AppMode::radio && radio_ok) {
 #if APP_RADIO_TASKS_ENABLE
@@ -600,6 +741,11 @@ extern "C" void app_main(void)
                 ESP_LOGE(TAG, "radio task start (camera mode): %s", esp_err_to_name(e));
             }
             ESP_LOGI(TAG, "camera mode: radio initialized for image transfer");
+            // Start auto-capture timer
+            g_capture_interval_sec = load_capture_interval();
+            start_auto_capture_timer();
+            update_camera_timer_status();
+            start_countdown_timer();
         }
     }
 #else
@@ -621,6 +767,7 @@ extern "C" void app_main(void)
             ESP_LOGE(TAG, "gateway ui start: %s", esp_err_to_name(e));
         } else {
             ui_gw_set_capture_cb(on_gw_capture);
+            ui_gw_set_interval_cb(on_gw_interval_change);
         }
     } else if ((e = bsp_lcd_start_camera_ui(on_lcd_capture, nullptr)) != ESP_OK) {
         ESP_LOGE(TAG, "camera ui start: %s", esp_err_to_name(e));

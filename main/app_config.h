@@ -190,6 +190,12 @@
 
 /* ----- Camera/LCD bring-up -------------------------------------------------- */
 
+/* ----- Auto-capture timer ------------------------------------------------ */
+
+#define APP_AUTO_CAPTURE_DEFAULT_SEC    300U   /* 5 minutes */
+#define APP_AUTO_CAPTURE_MIN_SEC        10U    /* 10 seconds minimum */
+#define APP_CFG_KEY_INTERVAL            0x01
+
 /* ----- Image transfer over FLRC ------------------------------------------ */
 
 #define APP_IMAGE_JPEG_QUALITY          50

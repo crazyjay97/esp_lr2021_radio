@@ -26,7 +26,10 @@ constexpr uint8_t kPacketTypeImageNack = 5;
 constexpr uint8_t kPacketTypeImageDone = 6;
 constexpr uint8_t kPacketTypeImageEOT = 7;
 constexpr uint8_t kPacketTypeImageStart = 8;
+constexpr uint8_t kPacketTypeConfig = 9;
+constexpr uint8_t kPacketTypeConfigAck = 10;
 constexpr uint16_t kHeaderSize = 14;
+constexpr uint32_t kConfigAckTimeoutMs = 500;
 
 int32_t abs16(int16_t v)
 {
@@ -648,6 +651,17 @@ void RadioPing::handle_rx_packet()
         handle_image_eot();
     } else if (rx_buf_[4] == kPacketTypeImageStart) {
         handle_image_start();
+    } else if (rx_buf_[4] == kPacketTypeConfig) {
+        uint8_t key = rx_buf_[8];
+        uint32_t value = get_u32_le(&rx_buf_[9]);
+        ESP_LOGI(TAG, "RX Config: key=%u value=%lu", key, static_cast<unsigned long>(value));
+        if (config_received_cb_) {
+            config_received_cb_(key, value);
+        }
+        send_config_ack(key, value);
+    } else if (rx_buf_[4] == kPacketTypeConfigAck) {
+        ESP_LOGI(TAG, "RX ConfigAck");
+        config_ack_received_ = true;
     } else {
         ESP_LOGW(TAG, "RX unsupported packet type=%u len=%u rssi=%d", rx_buf_[4], len, rssi);
     }
@@ -1450,4 +1464,92 @@ void RadioPing::check_image_rx_timeout()
     image_rx_pending_ = false;
     image_xfer_.rx_reset();
     image_rx_nack_sent_ = 0;
+}
+
+bool RadioPing::send_config(uint8_t key, uint32_t value)
+{
+    ESP_LOGI(TAG, "send_config: key=%u value=%lu", key, static_cast<unsigned long>(value));
+
+    suspended_ = true;
+
+    uint8_t pkt[kHeaderSize];
+    std::memcpy(pkt, kMagic, sizeof(kMagic));
+    pkt[4] = kPacketTypeConfig;
+    pkt[5] = 1;
+    put_u16_le(&pkt[6], 0);
+    pkt[8] = key;
+    put_u32_le(&pkt[9], value);
+    pkt[13] = 0;
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        smtc_modem_hal_protect_api_call();
+        if (mode_ == Mode::rx_pending) {
+            (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+            (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+            mode_ = Mode::idle;
+        }
+        smtc_modem_hal_unprotect_api_call();
+
+        send_single_packet(pkt, kHeaderSize);
+
+        config_ack_received_ = false;
+        schedule_rx();
+
+        uint32_t wait_start = smtc_modem_hal_get_time_in_ms();
+        while (!config_ack_received_) {
+            if (smtc_modem_hal_get_time_in_ms() - wait_start > kConfigAckTimeoutMs) {
+                break;
+            }
+            if (irq_pending_) {
+                irq_pending_ = false;
+                ral_irq_t irq = RAL_IRQ_NONE;
+                smtc_modem_hal_protect_api_call();
+                ral_status_t s = ral_get_and_clear_irq_status(&radio_.ral, &irq);
+                smtc_modem_hal_unprotect_api_call();
+                if (s == RAL_STATUS_OK && irq != RAL_IRQ_NONE) {
+                    handle_irq(irq);
+                }
+            }
+            taskYIELD();
+        }
+
+        if (config_ack_received_) {
+            ESP_LOGI(TAG, "send_config: ACK received on attempt %d", attempt + 1);
+            suspended_ = false;
+            if (!ptt_active_) schedule_rx();
+            return true;
+        }
+        ESP_LOGW(TAG, "send_config: no ACK, attempt %d/3", attempt + 1);
+    }
+
+    ESP_LOGW(TAG, "send_config: failed after 3 attempts");
+    suspended_ = false;
+    if (!ptt_active_) schedule_rx();
+    return false;
+}
+
+void RadioPing::send_config_ack(uint8_t key, uint32_t value)
+{
+    uint8_t pkt[kHeaderSize];
+    std::memcpy(pkt, kMagic, sizeof(kMagic));
+    pkt[4] = kPacketTypeConfigAck;
+    pkt[5] = 1;
+    put_u16_le(&pkt[6], 0);
+    pkt[8] = key;
+    put_u32_le(&pkt[9], value);
+    pkt[13] = 0;
+
+    smtc_modem_hal_protect_api_call();
+    if (mode_ == Mode::rx_pending) {
+        (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+        (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+        mode_ = Mode::idle;
+    }
+    smtc_modem_hal_unprotect_api_call();
+
+    send_single_packet(pkt, kHeaderSize);
+
+    if (!ptt_active_) {
+        schedule_rx();
+    }
 }
