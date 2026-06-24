@@ -1,0 +1,1419 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 LoRa WildCam Open Kit 项目需求最终版</title>
+  <style>
+    :root {
+      --bg: #f5f7f6;
+      --paper: #ffffff;
+      --ink: #1d2926;
+      --muted: #60706a;
+      --line: #dbe3df;
+      --deep: #1f3d35;
+      --green: #2f7d5b;
+      --blue: #2e6d8f;
+      --amber: #b76a2c;
+      --red: #a94442;
+      --soft-green: #e8f3ed;
+      --soft-blue: #e8f1f6;
+      --soft-amber: #fff2df;
+      --shadow: 0 14px 36px rgba(29, 41, 38, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+      line-height: 1.62;
+    }
+
+    a {
+      color: var(--green);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    header {
+      color: #fff;
+      background:
+        linear-gradient(110deg, rgba(20, 40, 34, 0.96), rgba(31, 61, 53, 0.88)),
+        radial-gradient(circle at 88% 18%, rgba(105, 180, 132, 0.28), transparent 26%),
+        #1f3d35;
+      padding: 52px 28px 64px;
+    }
+
+    .hero,
+    main,
+    footer {
+      max-width: 1180px;
+      margin: 0 auto;
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: #bfe1ca;
+      font-size: 14px;
+      font-weight: 800;
+    }
+
+    h1 {
+      max-width: 860px;
+      margin: 0;
+      font-size: clamp(34px, 6vw, 58px);
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      max-width: 780px;
+      margin: 18px 0 0;
+      color: rgba(255, 255, 255, 0.86);
+      font-size: 18px;
+    }
+
+    .hero-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 24px;
+    }
+
+    .hero-meta span {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 5px 11px;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.08);
+      color: rgba(255, 255, 255, 0.92);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    main {
+      padding: 0 24px 68px;
+      margin-top: -28px;
+    }
+
+    .toc {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 26px;
+    }
+
+    .toc a {
+      display: block;
+      min-height: 74px;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+      color: var(--ink);
+      font-weight: 800;
+    }
+
+    .toc small {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-weight: 500;
+    }
+
+    section {
+      margin-top: 24px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .section-head {
+      padding: 22px 26px 16px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfb;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 24px;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 0 0 8px;
+      font-size: 18px;
+    }
+
+    .section-desc {
+      margin: 8px 0 0;
+      color: var(--muted);
+    }
+
+    .content {
+      padding: 24px 26px 28px;
+    }
+
+    .grid-2,
+    .grid-3,
+    .grid-4 {
+      display: grid;
+      gap: 16px;
+    }
+
+    .grid-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .grid-3 {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .grid-4 {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .card {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    .card.soft-green {
+      background: var(--soft-green);
+    }
+
+    .card.soft-blue {
+      background: var(--soft-blue);
+    }
+
+    .card.soft-amber {
+      background: var(--soft-amber);
+    }
+
+    .card p,
+    .card ul {
+      margin: 8px 0 0;
+      color: var(--muted);
+    }
+
+    .card ul {
+      padding-left: 20px;
+    }
+
+    .metric b {
+      display: block;
+      color: var(--green);
+      font-size: 26px;
+      line-height: 1.1;
+    }
+
+    .metric span {
+      display: block;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .tag-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      background: var(--soft-green);
+      color: #295344;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .tag.blue {
+      background: var(--soft-blue);
+      color: #2d5b76;
+    }
+
+    .tag.amber {
+      background: var(--soft-amber);
+      color: #85501f;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    table {
+      width: 100%;
+      min-width: 980px;
+      border-collapse: collapse;
+      background: #fff;
+    }
+
+    th,
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }
+
+    th {
+      background: #edf4ef;
+      color: #263a31;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .arch {
+      display: grid;
+      grid-template-columns: 1fr 110px 1fr;
+      gap: 16px;
+      align-items: stretch;
+    }
+
+    .node {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      overflow: hidden;
+    }
+
+    .node h3 {
+      margin: 0;
+      padding: 14px 16px;
+      color: #fff;
+      background: var(--deep);
+    }
+
+    .node.gateway h3 {
+      background: var(--blue);
+    }
+
+    .node ul {
+      margin: 0;
+      padding: 16px 18px 18px 36px;
+    }
+
+    .link {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 220px;
+      border: 1px dashed rgba(47, 125, 91, 0.45);
+      border-radius: 8px;
+      background: #f8fbf9;
+      text-align: center;
+      color: var(--green);
+      font-weight: 900;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+      counter-reset: step;
+    }
+
+    .flow div {
+      position: relative;
+      min-height: 104px;
+      padding: 36px 12px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .flow div::before {
+      counter-increment: step;
+      content: counter(step);
+      position: absolute;
+      top: 10px;
+      left: 12px;
+      width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      background: var(--green);
+      color: #fff;
+      text-align: center;
+      line-height: 22px;
+      font-weight: 900;
+      font-size: 12px;
+    }
+
+    .priority {
+      font-weight: 900;
+    }
+
+    .p0 {
+      color: var(--green);
+    }
+
+    .p1 {
+      color: var(--blue);
+    }
+
+    .p2 {
+      color: var(--amber);
+    }
+
+    .risk {
+      color: var(--red);
+      font-weight: 900;
+    }
+
+    .concept-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    .concept-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      overflow: hidden;
+    }
+
+    .concept-card h3 {
+      margin: 0;
+      padding: 14px 16px;
+      color: #fff;
+      background: var(--deep);
+    }
+
+    .concept-card.gateway h3 {
+      background: var(--blue);
+    }
+
+    .concept-art {
+      padding: 16px;
+      background: #f8faf8;
+    }
+
+    .concept-art svg {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .product-visual-compact .concept-art svg {
+      max-width: 820px;
+      margin: 0 auto;
+    }
+
+    .product-visual-compact .concept-art {
+      padding: 12px;
+    }
+
+    .legend {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 12px;
+      margin: 0;
+      padding: 14px 18px 18px;
+      color: var(--muted);
+      font-size: 13px;
+      list-style: none;
+    }
+
+    .legend li::before {
+      content: "";
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      margin-right: 7px;
+      border-radius: 99px;
+      background: var(--green);
+      vertical-align: middle;
+    }
+
+    code {
+      padding: 2px 5px;
+      border-radius: 4px;
+      background: #eef2ef;
+      font-family: Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      margin: 0;
+      padding: 16px;
+      overflow-x: auto;
+      border-radius: 8px;
+      background: #17241f;
+      color: #d9efe4;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .callout {
+      padding: 16px 18px;
+      border-left: 4px solid var(--green);
+      border-radius: 8px;
+      background: var(--soft-green);
+    }
+
+    .callout p {
+      margin: 0;
+      color: #33463e;
+    }
+
+    footer {
+      padding: 0 24px 44px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 980px) {
+      .toc,
+      .grid-2,
+      .grid-3,
+      .grid-4,
+      .concept-grid,
+      .arch,
+      .flow {
+        grid-template-columns: 1fr;
+      }
+
+      .link {
+        min-height: 90px;
+      }
+    }
+
+    @media (max-width: 560px) {
+      header {
+        padding: 36px 20px 58px;
+      }
+
+      main {
+        padding: 0 14px 56px;
+      }
+
+      .section-head,
+      .content {
+        padding-left: 18px;
+        padding-right: 18px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="hero">
+      <p class="eyebrow">开源项目需求最终版</p>
+      <h1>ESP32 LoRa WildCam Open Kit</h1>
+      <p class="subtitle">基于 ESP32 + LR2021 开发板的低功耗野外相机开源套件，用两块开发板完成拍摄、触发、FLRC 图传、显示、配置与演示闭环。</p>
+      <div class="hero-meta">
+        <span>野生动物观测</span>
+        <span>农场/林业监测</span>
+        <span>户外安防</span>
+        <span>LR2021 能力展示</span>
+        <span>开源硬件引流</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+
+    <nav class="toc">
+      <a href="#position">项目定位<small>目标、边界、用户</small></a>
+      <a href="#architecture">系统架构<small>拍摄端 + 显示端</small></a>
+      <a href="#requirements">功能需求<small>P0/P1/P2 需求池</small></a>
+      <a href="#delivery">开源交付<small>仓库、测试、路线图</small></a>
+    </nav>
+
+    <section id="position">
+      <div class="section-head">
+        <h2>1. 项目定位</h2>
+        <p class="section-desc">先把它定义清楚：这是一套“远距离无线野外图像节点”开源参考设计，不是消费级高清相机。</p>
+      </div>
+      <div class="content">
+        <div class="callout">
+          <p><strong>ESP32 LoRa WildCam Open Kit 是什么：</strong>一套由“野外相机端 + 手持接收端”组成的开源套件。野外相机端部署在树干、围栏、农场、林地或户外入口处，平时低功耗休眠；被定时、PIR/红外或声音触发后拍照，并通过 LR2021 FLRC 把图片回传到手持接收端。接收端显示图片、电量、距离、信号质量和传输速率，用来演示 ESP32+LR2021 模组在远距离图像传感器场景中的能力。</p>
+        </div>
+
+        <div class="grid-4" style="margin-top: 16px;">
+          <div class="card metric">
+            <b>远距离</b>
+            <span>不依赖现场 Wi-Fi 覆盖，拍摄端通过 LR2021 把事件图片和状态发给接收端。</span>
+          </div>
+          <div class="card metric">
+            <b>低功耗</b>
+            <span>拍摄端常态休眠，只有定时、PIR/红外、声音或命令触发时才唤醒工作。</span>
+          </div>
+          <div class="card metric">
+            <b>可视化</b>
+            <span>接收端屏幕直接展示图片、RSSI/SNR、传输耗时、速率、丢包率和电量。</span>
+          </div>
+          <div class="card metric">
+            <b>可复现</b>
+            <span>以 GitHub 开源项目交付固件、协议、外壳、BOM、接线图和测试数据。</span>
+          </div>
+        </div>
+
+        <div class="grid-4" style="margin-top: 16px;">
+          <div class="card soft-green">
+            <h3>野生动物观测</h3>
+            <p>部署在林地、院子、鸟类活动点或动物路径附近。定时拍照或由 PIR 触发，接收端查看最新图片和触发时间，用于低成本记录“有什么动物出现过”。</p>
+          </div>
+          <div class="card soft-green">
+            <h3>农场/林业监测</h3>
+            <p>部署在果园、农田、林区边界、饲料点或仓储入口。用于查看野生动物、牲畜、人员或异常活动，适合展示远距离图像节点和多点部署潜力。</p>
+          </div>
+          <div class="card soft-blue">
+            <h3>户外安防告警</h3>
+            <p>部署在围栏、临时工地、户外设备箱或偏远入口。触发后拍照回传，可选播放预设音频，作为低成本户外告警和事件确认方案。</p>
+          </div>
+          <div class="card soft-blue">
+            <h3>模组能力 Demo</h3>
+            <p>用于展会、客户拜访和代理商演示。现场按键触发拍照，接收端实时显示图片传输进度、速率和链路质量，让客户直观看到 LR2021 的价值。</p>
+          </div>
+        </div>
+
+        <div class="grid-3" style="margin-top: 16px;">
+          <div class="card soft-green">
+            <h3>项目最终交付</h3>
+            <ul>
+              <li>两块开发板跑通拍摄端和接收端。</li>
+              <li>完整开源固件、通信协议和接线说明。</li>
+              <li>3D 打印外壳、BOM、测试报告和演示素材。</li>
+            </ul>
+          </div>
+          <div class="card soft-amber">
+            <h3>能力边界</h3>
+            <ul>
+              <li>不对标商业高清 Trail Camera。</li>
+              <li>不做连续视频流。</li>
+              <li>不承诺板端动物识别 AI。</li>
+              <li>不依赖 SD 卡存储。</li>
+            </ul>
+          </div>
+          <div class="card soft-blue">
+            <h3>面向人群</h3>
+            <ul>
+              <li>开源硬件玩家与 Maker。</li>
+              <li>IoT/无线模组方案工程师。</li>
+              <li>农场、林业、安防等 ToB 客户。</li>
+              <li>模组代理商和渠道客户。</li>
+              <li>需要远距离图像传感器参考方案的团队。</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="product-visual" class="product-visual-compact">
+      <div class="section-head">
+        <h2>产品外观示意</h2>
+        <p class="section-desc">用于项目组评审的产品外观方向图：左侧为野外相机端，右侧为手持接收端，重点确认外壳形态、天线、PIR 散射罩、屏幕和外部接口位置。</p>
+      </div>
+      <div class="content">
+        <div class="concept-card">
+          <h3>ESP32 LoRa WildCam Open Kit 产品外观示意</h3>
+          <div class="concept-art">
+            <svg viewBox="0 0 980 620" role="img" aria-label="ESP32 LoRa WildCam Open Kit 产品外观示意图">
+              <defs>
+                <linearGradient id="forestCase" x1="0" x2="1" y1="0" y2="1">
+                  <stop offset="0" stop-color="#243d1e"></stop>
+                  <stop offset="1" stop-color="#172612"></stop>
+                </linearGradient>
+                <linearGradient id="gatewayCase" x1="0" x2="1" y1="0" y2="1">
+                  <stop offset="0" stop-color="#0d2a3d"></stop>
+                  <stop offset="1" stop-color="#071823"></stop>
+                </linearGradient>
+                <radialGradient id="lensGlow" cx="50%" cy="45%" r="60%">
+                  <stop offset="0" stop-color="#343a72"></stop>
+                  <stop offset="0.48" stop-color="#15182d"></stop>
+                  <stop offset="1" stop-color="#040509"></stop>
+                </radialGradient>
+                <radialGradient id="pirDome" cx="42%" cy="35%" r="62%">
+                  <stop offset="0" stop-color="#f1f6ee" stop-opacity="0.95"></stop>
+                  <stop offset="0.55" stop-color="#ccd8c3" stop-opacity="0.72"></stop>
+                  <stop offset="1" stop-color="#8ea17e" stop-opacity="0.68"></stop>
+                </radialGradient>
+                <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+                  <feDropShadow dx="0" dy="16" stdDeviation="14" flood-color="#000000" flood-opacity="0.38"></feDropShadow>
+                </filter>
+                <style>
+                  .scene-bg{fill:#141628}
+                  .title-light{font:700 17px Microsoft YaHei,Arial;fill:#c5f486}
+                  .title-blue{font:700 17px Microsoft YaHei,Arial;fill:#76c8ff}
+                  .label-light{font:500 13px Microsoft YaHei,Arial;fill:#d6ddcf}
+                  .label-green{font:600 13px Microsoft YaHei,Arial;fill:#8ee84f}
+                  .label-blue{font:600 13px Microsoft YaHei,Arial;fill:#6ed4ff}
+                  .tiny{font:500 11px Microsoft YaHei,Arial;fill:#93a093}
+                  .kit-line{stroke:#7ede35;stroke-width:3;fill:none;stroke-dasharray:8 8}
+                  .flrc-line{stroke:#ff9f20;stroke-width:3;fill:none;stroke-dasharray:10 8}
+                </style>
+              </defs>
+
+              <rect x="0" y="0" width="980" height="620" class="scene-bg"></rect>
+
+              <text x="168" y="54" class="title-light">野外相机端</text>
+              <text x="655" y="54" class="title-blue">手持接收端</text>
+
+              <path d="M370 270 C470 270 535 270 630 270" class="flrc-line"></path>
+              <text x="455" y="258" fill="#ffb347" font-family="Microsoft YaHei,Arial" font-weight="700" font-size="13">FLRC：图片回传</text>
+
+              <g filter="url(#softShadow)">
+                <rect x="108" y="78" width="270" height="462" rx="18" fill="url(#forestCase)" stroke="#94dc44" stroke-width="3"></rect>
+                <rect x="118" y="94" width="52" height="22" rx="5" fill="#3d4550" stroke="#7c8790"></rect>
+                <text x="129" y="110" class="tiny">SMA</text>
+                <rect x="126" y="26" width="22" height="74" rx="11" fill="#101719" stroke="#5b646a"></rect>
+
+                <circle cx="151" cy="116" r="18" fill="#35502b" opacity="0.55"></circle>
+                <circle cx="333" cy="158" r="25" fill="#35502b" opacity="0.45"></circle>
+                <circle cx="181" cy="432" r="22" fill="#3b572e" opacity="0.55"></circle>
+
+                <circle cx="244" cy="198" r="44" fill="#08090d" stroke="#657064" stroke-width="4"></circle>
+                <circle cx="244" cy="198" r="33" fill="#171922" stroke="#2e3337" stroke-width="3"></circle>
+                <circle cx="244" cy="198" r="18" fill="url(#lensGlow)" stroke="#485077" stroke-width="3"></circle>
+                <circle cx="236" cy="190" r="7" fill="#8b91c8" opacity="0.24"></circle>
+
+                <circle cx="164" cy="286" r="27" fill="url(#pirDome)" stroke="#d8e2d0" stroke-width="3"></circle>
+                <path d="M144 286 Q164 264 184 286" stroke="#b5c4ad" stroke-width="2" fill="none" opacity="0.85"></path>
+                <path d="M139 296 Q164 274 189 296" stroke="#b5c4ad" stroke-width="2" fill="none" opacity="0.75"></path>
+                <text x="125" y="330" class="label-light">PIR 圆形散射罩</text>
+
+                <circle cx="306" cy="286" r="5" fill="#de3b2f"></circle>
+                <text x="318" y="290" class="tiny">状态灯</text>
+
+                <rect x="178" y="374" width="132" height="74" rx="8" fill="#22351d" stroke="#405a35" stroke-dasharray="5 5"></rect>
+                <text x="207" y="416" class="tiny">电池仓/后盖</text>
+
+                <circle cx="334" cy="360" r="4" fill="#78906d"></circle>
+                <circle cx="344" cy="360" r="4" fill="#78906d"></circle>
+                <circle cx="354" cy="360" r="4" fill="#78906d"></circle>
+                <text x="286" y="386" class="tiny">MIC / SPK 孔</text>
+
+                <rect x="214" y="540" width="62" height="10" rx="5" fill="#121b19" stroke="#708371"></rect>
+                <text x="206" y="566" class="tiny">底部 USB-C 防水塞</text>
+
+                <rect x="96" y="356" width="12" height="30" rx="4" fill="#6b755e" stroke="#96aa83"></rect>
+                <rect x="378" y="396" width="12" height="38" rx="4" fill="#6b755e" stroke="#96aa83"></rect>
+                <text x="112" y="572" class="label-light">迷彩防水壳 · 绑带/三脚架固定 · 电池供电</text>
+              </g>
+
+              <g filter="url(#softShadow)">
+                <rect x="618" y="78" width="242" height="462" rx="18" fill="url(#gatewayCase)" stroke="#18a9ff" stroke-width="3"></rect>
+                <rect x="628" y="94" width="52" height="22" rx="5" fill="#39424a" stroke="#74838e"></rect>
+                <text x="639" y="110" class="tiny">SMA</text>
+                <rect x="636" y="26" width="22" height="74" rx="11" fill="#101719" stroke="#5b646a"></rect>
+
+                <rect x="650" y="126" width="178" height="210" rx="10" fill="#07130d" stroke="#314b38" stroke-width="4"></rect>
+                <rect x="672" y="150" width="134" height="112" rx="5" fill="#12331b" stroke="#3e8e4c"></rect>
+                <text x="711" y="184" fill="#78f47e" font-family="Microsoft YaHei,Arial" font-weight="700" font-size="14">[ 鸟类图片 ]</text>
+                <text x="704" y="210" fill="#78f47e" font-family="Microsoft YaHei,Arial" font-size="12">2026-06-09 16:32</text>
+                <text x="702" y="292" fill="#78f47e" font-family="Microsoft YaHei,Arial" font-size="12">图片：在线 | 128K</text>
+                <text x="702" y="313" fill="#78f47e" font-family="Microsoft YaHei,Arial" font-size="12">电量：78%</text>
+                <text x="702" y="334" fill="#78f47e" font-family="Microsoft YaHei,Arial" font-size="12">距离：320m | SF9</text>
+
+                <rect x="856" y="190" width="10" height="34" rx="5" fill="#1b2526" stroke="#7c8a78"></rect>
+                <rect x="856" y="246" width="10" height="34" rx="5" fill="#1b2526" stroke="#7c8a78"></rect>
+                <rect x="856" y="302" width="10" height="34" rx="5" fill="#1b2526" stroke="#7c8a78"></rect>
+                <text x="872" y="212" class="tiny">侧键</text>
+                <text x="872" y="268" class="tiny">拍照</text>
+                <text x="872" y="324" class="tiny">浏览</text>
+
+                <rect x="667" y="452" width="144" height="26" rx="5" fill="#121b19" stroke="#6d735e"></rect>
+                <text x="696" y="469" class="tiny">扬声器/提示音</text>
+
+                <rect x="696" y="540" width="86" height="9" rx="5" fill="#101719" stroke="#758696"></rect>
+                <text x="704" y="568" class="tiny">底部 USB-C</text>
+                <text x="650" y="572" class="label-light">手持接收端 · 触摸屏 · 左上 SMA 胶棒天线 · 锂电池供电</text>
+              </g>
+            </svg>
+          </div>
+          <ul class="legend">
+            <li>左侧为拍摄端：迷彩/深绿外壳，适合绑在树干、围栏、农场棚架上</li>
+            <li>拍摄端正面保留摄像头窗口和 PIR 圆形散射罩窗口</li>
+            <li>拍摄端预留麦克风/扬声器孔，可做声音触发和告警播放</li>
+            <li>右侧为手持接收端：屏幕显示图片、电量、距离、速率和链路状态</li>
+            <li>两端左上角均体现 SMA 接口和胶棒天线，贴合实物开发板布局</li>
+            <li>中间仅保留 FLRC 图片回传链路，突出本项目图传演示重点</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+
+    <section id="hardware">
+      <div class="section-head">
+        <h2>2. 既定硬件与设计边界</h2>
+        <p class="section-desc">项目需求以当前已定型开发板为基础，避免提出必须改板才能实现的核心功能。</p>
+      </div>
+      <div class="content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>硬件条件</th>
+                <th>当前能力</th>
+                <th>需求影响</th>
+                <th>项目策略</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>主控与无线</td>
+                <td>ESP32 + LR2021 二合一模组，8M Flash + 8M PSRAM。</td>
+                <td>可完成拍照缓存、分片传输、近场 Wi-Fi 配置和低功耗控制。</td>
+                <td>把 LR2021 FLRC 图传和链路指标作为主卖点。</td>
+              </tr>
+              <tr>
+                <td>摄像头</td>
+                <td>低像素 SP0A39。</td>
+                <td>不适合高清图像和物种细节识别。</td>
+                <td>定位为事件确认、场景截图、低成本野外图像节点。</td>
+              </tr>
+              <tr>
+                <td>存储</td>
+                <td>无 SD 卡。</td>
+                <td>拍摄端无法长期本地保存图片/音频。</td>
+                <td>采用“即拍即传”，显示端/PC/Web 端保存。</td>
+              </tr>
+              <tr>
+                <td>音频</td>
+                <td>麦克风、扬声器可插接。</td>
+                <td>可做声音触发、拍照同步录音、动物声音模拟和安防告警。</td>
+                <td>音频列为 P1，先保证拍照和图传闭环。</td>
+              </tr>
+              <tr>
+                <td>显示</td>
+                <td>触摸 LCD 可插接。</td>
+                <td>适合做显示端/网关端 UI，不适合拍摄端常插屏。</td>
+                <td>拍摄端不插屏低功耗，显示端接屏做可视化演示。</td>
+              </tr>
+              <tr>
+                <td>供电</td>
+                <td>带电池插槽。</td>
+                <td>可做电池供电演示，但实际待机功耗受开发板 LDO、USB 芯片和外设影响。</td>
+                <td>区分开发板功耗与模组级潜力，提供实测数据。</td>
+              </tr>
+              <tr>
+                <td>结构</td>
+                <td>外壳可按需求设计 3D 打印件。</td>
+                <td>可形成完整开源项目资产。</td>
+                <td>提供拍摄端户外壳和显示端桌面/手持壳。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <div class="section-head">
+        <h2>3. 系统架构</h2>
+        <p class="section-desc">采用两块开发板组成完整链路：拍摄端负责低功耗采集，显示端负责接收、显示、配置和演示。</p>
+      </div>
+      <div class="content">
+        <div class="arch">
+          <div class="node">
+            <h3>Camera Node 拍摄端</h3>
+            <ul>
+              <li>不插 LCD，低功耗优先。</li>
+              <li>SP0A39 拍照，PSRAM 缓存。</li>
+              <li>定时、红外/PIR、声音、手动命令触发。</li>
+              <li>可插麦克风和扬声器。</li>
+              <li>电池供电，定期上报电压。</li>
+              <li>3D 打印户外外壳。</li>
+            </ul>
+          </div>
+          <div class="link">
+            LR2021<br>FLRC 图传<br>状态/控制包
+          </div>
+          <div class="node gateway">
+            <h3>Display Gateway 显示端</h3>
+            <ul>
+              <li>接触摸 LCD，显示最新图片。</li>
+              <li>显示 RSSI、SNR、速率、丢包率、耗时。</li>
+              <li>Wi-Fi AP 配置参数。</li>
+              <li>下发拍照、播放音频、切换模式命令。</li>
+              <li>可选 USB/网页导出图片和日志。</li>
+              <li>桌面或手持外壳。</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="flow" style="margin-top: 18px;">
+          <div>拍摄端 deep sleep，仅保留 RTC 与触发源。</div>
+          <div>定时、红外/PIR、声音或显示端命令触发唤醒。</div>
+          <div>拍摄端拍照，可同步采集短音频。</div>
+          <div>图片压缩后通过 LR2021 FLRC 分片发送。</div>
+          <div>显示端接收重组，显示图片与链路指标。</div>
+          <div>拍摄端发送电量与状态后重新休眠。</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="modes">
+      <div class="section-head">
+        <h2>4. 工作模式</h2>
+        <p class="section-desc">工作模式要服务开源演示和真实野外节点两类需求。</p>
+      </div>
+      <div class="content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>模式</th>
+                <th>触发方式</th>
+                <th>核心流程</th>
+                <th>主要展示价值</th>
+                <th>优先级</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>延时摄影模式</td>
+                <td>RTC 定时唤醒</td>
+                <td>按周期唤醒、拍照、发送、休眠。</td>
+                <td>展示低功耗周期采集，适合野外、农场、林业监测。</td>
+                <td class="priority p0">P0</td>
+              </tr>
+              <tr>
+                <td>红外/PIR 触发模式</td>
+                <td>外接 PIR 或红外触发模块</td>
+                <td>目标经过后唤醒，拍照并发送事件图片。</td>
+                <td>展示野外相机典型事件触发能力。</td>
+                <td class="priority p0">P0</td>
+              </tr>
+              <tr>
+                <td>声音触发模式</td>
+                <td>麦克风音量阈值或声音检测</td>
+                <td>声音超过阈值后唤醒，拍照并可同步录音。</td>
+                <td>展示鸟鸣、动物叫声、异常声音监测能力。</td>
+                <td class="priority p1">P1</td>
+              </tr>
+              <tr>
+                <td>手动演示模式</td>
+                <td>显示端触摸按钮或串口命令</td>
+                <td>下发拍照命令，实时显示传输进度和链路指标。</td>
+                <td>最适合展会、客户拜访和视频演示。</td>
+                <td class="priority p0">P0</td>
+              </tr>
+              <tr>
+                <td>安防/驱离模式</td>
+                <td>事件触发或远程命令</td>
+                <td>播放预设音频，记录告警事件，发送图片。</td>
+                <td>展示扬声器扩展和户外安防应用。</td>
+                <td class="priority p1">P1</td>
+              </tr>
+              <tr>
+                <td>多节点模式</td>
+                <td>多个拍摄端上报</td>
+                <td>显示端按 Node ID 接收不同节点图片和状态。</td>
+                <td>展示 LR2021 组网和 ToB 扩展潜力。</td>
+                <td class="priority p2">P2</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="requirements">
+      <div class="section-head">
+        <h2>5. 功能需求清单</h2>
+        <p class="section-desc">优先保证开源项目第一版能跑通、能复现、能演示，再扩展高级功能。</p>
+      </div>
+      <div class="content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>模块</th>
+                <th>需求</th>
+                <th>验收标准</th>
+                <th>优先级</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>拍照</td>
+                <td>支持 SP0A39 初始化、QVGA/VGA 拍照、PSRAM 缓存、压缩质量配置。</td>
+                <td>拍摄端可稳定生成可显示图片，显示端可完整展示。</td>
+                <td class="priority p0">P0</td>
+              </tr>
+              <tr>
+                <td>延时摄影</td>
+                <td>支持 1 分钟、5 分钟、30 分钟、1 小时等周期配置。</td>
+                <td>拍摄端按配置周期唤醒、拍照、发送并回到休眠。</td>
+                <td class="priority p0">P0</td>
+              </tr>
+              <tr>
+                <td>红外/PIR 唤醒</td>
+                <td>支持 GPIO 外部唤醒，兼容常见 PIR/红外模块。</td>
+                <td>触发后 5 秒内完成拍照流程启动。</td>
+                <td class="priority p0">P0</td>
+              </tr>
+              <tr>
+                <td>FLRC 图传</td>
+                <td>图片分片发送，支持包序号、总包数、CRC、缺包重传。</td>
+                <td>在演示距离内，图片可重组，显示端展示传输耗时和平均速率。</td>
+                <td class="priority p0">P0</td>
+              </tr>
+              <tr>
+                <td>链路指标</td>
+                <td>显示 RSSI、SNR 或等效链路质量、包数、丢包率、重传次数、速率。</td>
+                <td>每次图传完成后显示端自动刷新指标。</td>
+                <td class="priority p0">P0</td>
+              </tr>
+              <tr>
+                <td>低功耗</td>
+                <td>拍摄端常态 deep sleep，事件完成后自动休眠。</td>
+                <td>提供实测待机电流、拍照电流、发送电流、一次事件能耗。</td>
+                <td class="priority p0">P0</td>
+              </tr>
+              <tr>
+                <td>近场 Wi-Fi 配置</td>
+                <td>通过 Wi-Fi AP 页面配置模式、周期、图片尺寸、触发源、音频开关。</td>
+                <td>手机连接 AP 后可修改配置，重启后配置保持。</td>
+                <td class="priority p0">P0</td>
+              </tr>
+              <tr>
+                <td>电量显示</td>
+                <td>拍摄端上报电池电压和估算电量，显示端显示本机与远端电量。</td>
+                <td>显示端图片页或状态页能看到两个设备电量。</td>
+                <td class="priority p0">P0</td>
+              </tr>
+              <tr>
+                <td>声音触发</td>
+                <td>麦克风检测音量阈值，超过阈值触发拍照。</td>
+                <td>阈值可配置，触发事件中记录 trigger=sound。</td>
+                <td class="priority p1">P1</td>
+              </tr>
+              <tr>
+                <td>同步录音</td>
+                <td>拍照时同步采集 3-10 秒低码率音频，可选择传输或仅保存摘要。</td>
+                <td>显示端可看到音频状态；如传输音频，可在 PC/Web 端导出。</td>
+                <td class="priority p1">P1</td>
+              </tr>
+              <tr>
+                <td>音频播放</td>
+                <td>支持播放预设音频，用于动物声音模拟或安防告警。</td>
+                <td>显示端可下发播放命令，拍摄端执行并回传结果。</td>
+                <td class="priority p1">P1</td>
+              </tr>
+              <tr>
+                <td>手动控制</td>
+                <td>显示端支持手动拍照、切换模式、播放音频、休眠命令。</td>
+                <td>触摸屏或串口命令可成功控制拍摄端。</td>
+                <td class="priority p1">P1</td>
+              </tr>
+              <tr>
+                <td>多节点</td>
+                <td>一个显示端接收多个 Camera Node。</td>
+                <td>显示端按 Node ID 展示最新图片和状态。</td>
+                <td class="priority p2">P2</td>
+              </tr>
+              <tr>
+                <td>Web 导出</td>
+                <td>显示端提供 Web 页面或 USB 工具导出图片、日志和链路数据。</td>
+                <td>电脑/手机可查看历史事件与下载图片。</td>
+                <td class="priority p2">P2</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="protocol">
+      <div class="section-head">
+        <h2>6. 通信协议需求</h2>
+        <p class="section-desc">协议要简单、公开、可复用，帮助客户理解 LR2021 模组能做什么。</p>
+      </div>
+      <div class="content">
+        <div class="grid-2">
+          <div class="card">
+            <h3>数据包类型</h3>
+            <ul>
+              <li><code>HELLO</code>：节点上线与配对。</li>
+              <li><code>STATUS</code>：电量、模式、固件版本、唤醒原因。</li>
+              <li><code>IMAGE_START</code>：图片 ID、大小、分辨率、总包数。</li>
+              <li><code>IMAGE_CHUNK</code>：图片分片数据。</li>
+              <li><code>IMAGE_ACK</code>：接收确认和缺包列表。</li>
+              <li><code>CMD</code>：拍照、休眠、播放音频、切换模式。</li>
+              <li><code>AUDIO_META</code>：音频片段元数据。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>关键指标</h3>
+            <ul>
+              <li>图片大小：Bytes。</li>
+              <li>总包数、成功包数、重传包数。</li>
+              <li>首包时间、尾包时间、总耗时。</li>
+              <li>平均有效速率：图片大小 / 传输耗时。</li>
+              <li>RSSI、SNR 或 LR2021 可提供的链路质量指标。</li>
+              <li>触发原因：timer / pir / sound / manual / command。</li>
+            </ul>
+          </div>
+        </div>
+
+        <div style="margin-top: 16px;">
+          <pre>Packet Header v1
+--------------------------------------------------
+magic        2 bytes   固定标识
+version      1 byte    协议版本
+type         1 byte    数据包类型
+node_id      2 bytes   拍摄端 ID
+session_id   2 bytes   会话 ID
+seq          2 bytes   当前包序号
+total        2 bytes   总包数
+payload_len  2 bytes   负载长度
+crc16        2 bytes   头部+负载校验
+payload      N bytes   图片分片/状态/命令</pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="ui">
+      <div class="section-head">
+        <h2>7. 显示端 UI 需求</h2>
+        <p class="section-desc">显示端是开源项目最重要的演示窗口，需要让客户一眼看到“图片传过来了，链路质量如何”。</p>
+      </div>
+      <div class="content">
+        <div class="grid-4">
+          <div class="card">
+            <h3>图片页</h3>
+            <p>显示最新图片、拍摄时间、触发原因、远端电量、Node ID。</p>
+          </div>
+          <div class="card">
+            <h3>链路页</h3>
+            <p>显示 RSSI/SNR、传输速率、耗时、丢包率、重传次数、包进度。</p>
+          </div>
+          <div class="card">
+            <h3>配置页</h3>
+            <p>配置拍照周期、图片尺寸、触发方式、FLRC 参数、音频开关。</p>
+          </div>
+          <div class="card">
+            <h3>控制页</h3>
+            <p>手动拍照、播放音频、进入休眠、刷新状态、切换工作模式。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="enclosure">
+      <div class="section-head">
+        <h2>8. 产品外观与外壳需求</h2>
+        <p class="section-desc">外观示意图用于让团队和客户一眼理解产品形态：左侧为野外相机端，右侧为手持/桌面接收显示端。</p>
+      </div>
+      <div class="content">
+        <div class="callout">
+          <p><strong>外观图依据：</strong>基于当前开发板和屏幕实拍照片抽象绘制，表达最终产品外观方向。野外相机端预留摄像头窗口、现成 PIR 模块圆形散射罩窗口、麦克风/扬声器孔、天线和底部接口；显示端接触摸屏，作为图片接收和链路仪表盘。</p>
+        </div>
+
+
+        <div class="grid-2">
+          <div class="card soft-green">
+            <h3>拍摄端外壳</h3>
+            <ul>
+              <li>不插屏，体积尽量小。</li>
+              <li>预留摄像头窗口和透明保护片位置。</li>
+              <li>预留 PIR/红外窗口、麦克风孔、扬声器孔。</li>
+              <li>预留 LR2021 天线出口或外置天线安装位。</li>
+              <li>电池仓可开盖更换。</li>
+              <li>支持树绑、墙装、杆装或三脚架孔。</li>
+              <li>标注 3D 打印外壳为防泼溅/实验级，不宣称量产 IP 等级。</li>
+            </ul>
+          </div>
+          <div class="card soft-blue">
+            <h3>显示端外壳</h3>
+            <ul>
+              <li>适配触摸 LCD。</li>
+              <li>支持桌面支架或手持外形。</li>
+              <li>预留 USB 口、复位键、下载口和电源开关。</li>
+              <li>可选扬声器开孔。</li>
+              <li>外观适合展会桌面演示。</li>
+              <li>背面标注项目名和 GitHub 二维码位置。</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="delivery">
+      <div class="section-head">
+        <h2>9. 开源交付物</h2>
+        <p class="section-desc">项目要像一个真正可复现的开源产品，而不是单个 Demo 源码。</p>
+      </div>
+      <div class="content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>目录/资产</th>
+                <th>内容</th>
+                <th>验收标准</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>firmware/camera-node</code></td>
+                <td>拍摄端固件，包含拍照、触发、低功耗、FLRC 发送。</td>
+                <td>按 README 烧录后可与显示端通信。</td>
+              </tr>
+              <tr>
+                <td><code>firmware/display-gateway</code></td>
+                <td>显示端固件，包含图像重组、LCD UI、Wi-Fi 配置、控制命令。</td>
+                <td>可显示图片和链路指标。</td>
+              </tr>
+              <tr>
+                <td><code>protocol/</code></td>
+                <td>通信协议文档、包格式、示例数据。</td>
+                <td>第三方开发者可按协议实现自己的网关。</td>
+              </tr>
+              <tr>
+                <td><code>hardware/</code></td>
+                <td>接线图、BOM、外设推荐、PIR/麦克风/扬声器连接说明。</td>
+                <td>用户能按文档接线复现。</td>
+              </tr>
+              <tr>
+                <td><code>enclosure/</code></td>
+                <td>拍摄端和显示端 STL/STEP 文件。</td>
+                <td>普通 3D 打印机可打印装配。</td>
+              </tr>
+              <tr>
+                <td><code>tools/</code></td>
+                <td>PC 端图片接收/日志导出/测试脚本。</td>
+                <td>可辅助调试和生成测试报告。</td>
+              </tr>
+              <tr>
+                <td><code>docs/</code></td>
+                <td>快速开始、烧录教程、故障排查、功耗测试、距离测试。</td>
+                <td>新用户 30 分钟内跑通基础 Demo。</td>
+              </tr>
+              <tr>
+                <td><code>media/</code></td>
+                <td>README 图片、演示视频脚本、ToB 展示素材。</td>
+                <td>GitHub 首页能清楚展示项目价值。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div style="margin-top: 16px;">
+          <pre>建议仓库结构
+ESP32-LoRa-WildCam-Open-Kit/
+  README.md
+  LICENSE
+  firmware/
+    camera-node/
+    display-gateway/
+  protocol/
+    packet-format.md
+    examples/
+  hardware/
+    wiring.md
+    bom.md
+    peripherals.md
+  enclosure/
+    camera-node/
+    display-gateway/
+  tools/
+    image_receiver/
+    log_parser/
+  docs/
+    quick-start.md
+    power-test.md
+    range-test.md
+    troubleshooting.md
+  media/
+    photos/
+    demo-script.md</pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="test">
+      <div class="section-head">
+        <h2>10. 测试与验收需求</h2>
+        <p class="section-desc">开源项目必须提供可复现的测试数据，尤其是传输速率、距离和功耗。</p>
+      </div>
+      <div class="content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>测试项</th>
+                <th>测试内容</th>
+                <th>输出结果</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>图传稳定性</td>
+                <td>不同图片大小、不同距离、不同重传次数下的传输成功率。</td>
+                <td>成功率、平均耗时、最大耗时、失败原因。</td>
+              </tr>
+              <tr>
+                <td>FLRC 速率</td>
+                <td>固定距离下传输 QVGA/VGA 图片。</td>
+                <td>有效吞吐、包速率、丢包率。</td>
+              </tr>
+              <tr>
+                <td>链路距离</td>
+                <td>室内、空旷户外、树林/遮挡环境对比。</td>
+                <td>RSSI/SNR 曲线、最大可用距离。</td>
+              </tr>
+              <tr>
+                <td>功耗</td>
+                <td>deep sleep、拍照、FLRC 发送、Wi-Fi 配置、LCD 显示。</td>
+                <td>电流曲线、单次事件耗电、估算续航。</td>
+              </tr>
+              <tr>
+                <td>触发</td>
+                <td>PIR/红外、声音、定时、手动命令触发。</td>
+                <td>触发延迟、误触发记录、漏触发记录。</td>
+              </tr>
+              <tr>
+                <td>外壳</td>
+                <td>装配、开孔、天线、摄像头角度、电池更换。</td>
+                <td>装配说明、问题清单、改版记录。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="roadmap">
+      <div class="section-head">
+        <h2>11. 发布路线图</h2>
+        <p class="section-desc">建议按可演示闭环优先，先把 P0 做扎实，再叠加音频和多节点能力。</p>
+      </div>
+      <div class="content">
+        <div class="grid-3">
+          <div class="card soft-green">
+            <h3>V0.1 MVP</h3>
+            <ul>
+              <li>两块板完成拍照和 FLRC 图传。</li>
+              <li>显示端 LCD 显示图片与链路指标。</li>
+              <li>支持定时唤醒、PIR/红外唤醒。</li>
+              <li>支持电量上报。</li>
+              <li>基础 3D 外壳和快速开始文档。</li>
+            </ul>
+          </div>
+          <div class="card soft-blue">
+            <h3>V0.2 Audio & Config</h3>
+            <ul>
+              <li>Wi-Fi AP 配置页面完善。</li>
+              <li>声音触发。</li>
+              <li>拍照同步短音频。</li>
+              <li>预设音频播放和安防告警。</li>
+              <li>PC/Web 日志导出工具。</li>
+            </ul>
+          </div>
+          <div class="card soft-amber">
+            <h3>V0.3 Network Demo</h3>
+            <ul>
+              <li>多节点接入。</li>
+              <li>LoRa/FLRC 模式对比。</li>
+              <li>MQTT/HTTP 网关示例。</li>
+              <li>更完整功耗和距离报告。</li>
+              <li>ToB 演示资料包。</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="risks">
+      <div class="section-head">
+        <h2>12. 风险与取舍</h2>
+        <p class="section-desc">这些风险需要在 README 和产品介绍中主动说明，避免用户预期偏差。</p>
+      </div>
+      <div class="content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>风险</th>
+                <th>影响</th>
+                <th>处理策略</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="risk">摄像头像素低</td>
+                <td>图片无法与商业野外相机对比，动物细节有限。</td>
+                <td>明确定位为低成本事件确认和 LR2021 图传 Demo。</td>
+              </tr>
+              <tr>
+                <td class="risk">无 SD 卡</td>
+                <td>拍摄端无法保存大量历史图片。</td>
+                <td>采用即拍即传；显示端或 PC 端保存图片。</td>
+              </tr>
+              <tr>
+                <td class="risk">低功耗受开发板影响</td>
+                <td>实测待机电流可能高于模组理论值。</td>
+                <td>文档区分开发板演示功耗和模组级低功耗潜力。</td>
+              </tr>
+              <tr>
+                <td class="risk">室外误触发</td>
+                <td>PIR/红外/声音都会受环境影响。</td>
+                <td>提供阈值配置、安装建议和多触发策略。</td>
+              </tr>
+              <tr>
+                <td class="risk">音频传输占带宽</td>
+                <td>短音频会增加传输耗时和功耗。</td>
+                <td>音频 P1 实现，默认只传图片，音频可选。</td>
+              </tr>
+              <tr>
+                <td class="risk">外壳非量产防水</td>
+                <td>3D 打印件户外长期可靠性有限。</td>
+                <td>标注实验级外壳，提供密封胶圈/透明片/安装建议。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>整理日期：2026-06-09。用途：ESP32 + LR2021 开源项目立项、研发拆解、GitHub 仓库规划和 ToB 演示方案输入。</p>
+  </footer>
+</body>
+</html>
+
+
+
+

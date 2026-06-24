@@ -344,6 +344,33 @@ esp_err_t ImageTransfer::decode_to_rgb565(uint8_t **out_rgb565, uint32_t *out_w,
     return ESP_OK;
 }
 
+esp_err_t ImageTransfer::rx_reassemble(uint8_t **out_buf, size_t *out_len)
+{
+    if (!rx_buf_ || !rx_complete() || rx_jpeg_size_ == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!out_buf || !out_len) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t *buf = static_cast<uint8_t *>(
+        heap_caps_malloc(rx_jpeg_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!buf) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t offset = 0;
+    for (uint16_t i = 0; i < rx_total_; i++) {
+        size_t frag_offset = static_cast<size_t>(i) * APP_IMAGE_FRAGMENT_DATA_SIZE;
+        std::memcpy(buf + offset, rx_buf_ + frag_offset, rx_frag_lens_[i]);
+        offset += rx_frag_lens_[i];
+    }
+
+    *out_buf = buf;
+    *out_len = offset;
+    return ESP_OK;
+}
+
 void ImageTransfer::rx_reset()
 {
     if (rx_buf_) {

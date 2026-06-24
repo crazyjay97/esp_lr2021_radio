@@ -122,6 +122,10 @@ esp_err_t RadioPing::init()
         return ESP_ERR_NO_MEM;
     }
 
+    if (!audio_ringbuf_.init(APP_AUDIO_RINGBUF_SAMPLES)) {
+        ESP_LOGW(TAG, "audio ring buffer alloc failed (PSRAM?)");
+    }
+
 #if !APP_RADIO_HW_INIT_ENABLE
     ESP_LOGW(TAG, "LR2021 hardware init disabled for camera isolation");
     return ESP_OK;
@@ -301,11 +305,17 @@ void RadioPing::task()
 void RadioPing::tx_task()
 {
     while (true) {
-        if (suspended_ || !ptt_active_) {
+        if (suspended_ || image_tx_active_) {
             vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
             continue;
         }
-        capture_voice_packet();
+
+        if (!read_mono_frame(tx_pcm_, APP_AUDIO_FRAME_SAMPLES)) {
+            vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
+            continue;
+        }
+
+        audio_ringbuf_.write(tx_pcm_, APP_AUDIO_FRAME_SAMPLES);
     }
 }
 
@@ -556,10 +566,7 @@ bool RadioPing::build_voice_packet(uint16_t *tx_size)
 
 void RadioPing::capture_voice_packet()
 {
-    if (tx_queue_ == nullptr || !read_mono_frame(tx_pcm_, APP_AUDIO_FRAME_SAMPLES)) {
-        return;
-    }
-    if (!ptt_active_) {
+    if (tx_queue_ == nullptr) {
         return;
     }
 
@@ -1552,4 +1559,9 @@ void RadioPing::send_config_ack(uint8_t key, uint32_t value)
     if (!ptt_active_) {
         schedule_rx();
     }
+}
+
+size_t RadioPing::snapshot_audio(int16_t *out, size_t max_samples)
+{
+    return audio_ringbuf_.snapshot(out, max_samples);
 }

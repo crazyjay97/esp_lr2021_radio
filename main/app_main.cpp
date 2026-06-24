@@ -2,6 +2,7 @@
 #include "camera_uart.hpp"
 #include "image_transfer.hpp"
 #include "radio_ping.hpp"
+#include "opus_codec.hpp"
 #include "ui_gateway.h"
 
 #include "freertos/FreeRTOS.h"
@@ -13,6 +14,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_jpeg_common.h"
+#include "esp_jpeg_dec.h"
 
 #include <stdio.h>
 #include <new>
@@ -278,7 +280,23 @@ void image_capture_task(void *arg)
 
     bsp_lcd_set_camera_status("Remote capture...");
 
+    // Snapshot ring buffer before pausing I2S
+    int16_t *pcm_snap = static_cast<int16_t *>(
+        heap_caps_malloc(APP_AUDIO_RINGBUF_BYTES, MALLOC_CAP_SPIRAM));
+    size_t snap_samples = 0;
+    if (pcm_snap) {
+        snap_samples = g_radio.snapshot_audio(pcm_snap, APP_AUDIO_RINGBUF_SAMPLES);
+        if (snap_samples < APP_AUDIO_RINGBUF_SAMPLES) {
+            std::memset(&pcm_snap[snap_samples], 0,
+                        (APP_AUDIO_RINGBUF_SAMPLES - snap_samples) * sizeof(int16_t));
+            snap_samples = APP_AUDIO_RINGBUF_SAMPLES;
+        }
+        ESP_LOGI(TAG, "audio snapshot: %u samples", static_cast<unsigned>(snap_samples));
+    }
+
 #if APP_AUDIO_FEATURES_ENABLE
+    g_radio.pause_audio_capture();
+    vTaskDelay(pdMS_TO_TICKS(APP_AUDIO_FRAME_MS + 5));
     esp_err_t audio_e = bsp_audio_suspend();
     if (audio_e != ESP_OK) {
         ESP_LOGW(TAG, "audio suspend for image capture: %s", esp_err_to_name(audio_e));
@@ -292,7 +310,9 @@ void image_capture_task(void *arg)
         bsp_lcd_set_camera_status("LCD release failed");
 #if APP_AUDIO_FEATURES_ENABLE
         bsp_audio_resume();
+        g_radio.resume_audio_capture();
 #endif
+        heap_caps_free(pcm_snap);
         g_capture_busy = false;
         vTaskDelete(nullptr);
         return;
@@ -316,6 +336,8 @@ void image_capture_task(void *arg)
 
     if (capture_e != ESP_OK || !frame) {
         bsp_lcd_set_camera_status("Capture failed");
+        heap_caps_free(pcm_snap);
+        g_radio.resume_audio_capture();
         g_capture_busy = false;
         vTaskDelete(nullptr);
         return;
@@ -329,21 +351,75 @@ void image_capture_task(void *arg)
 
     if (e != ESP_OK || !jpeg) {
         bsp_lcd_set_camera_status("JPEG encode failed");
+        heap_caps_free(pcm_snap);
+        g_radio.resume_audio_capture();
         g_capture_busy = false;
         vTaskDelete(nullptr);
         return;
     }
 
+    // Opus encode
+    size_t opus_len = 0;
+    uint8_t *opus_buf = nullptr;
+    if (pcm_snap && snap_samples >= APP_AUDIO_FRAME_SAMPLES) {
+        opus_buf = static_cast<uint8_t *>(
+            heap_caps_malloc(APP_AUDIO_CLIP_MAX_OPUS_BYTES, MALLOC_CAP_SPIRAM));
+        if (opus_buf) {
+            OpusCodec clip_codec;
+            if (clip_codec.init() == ESP_OK) {
+                size_t num_frames = snap_samples / APP_AUDIO_FRAME_SAMPLES;
+                for (size_t i = 0; i < num_frames; i++) {
+                    const int16_t *pcm_frame = &pcm_snap[i * APP_AUDIO_FRAME_SAMPLES];
+                    uint8_t enc_buf[APP_OPUS_MAX_PACKET_BYTES];
+                    int enc_len = clip_codec.encode(pcm_frame, APP_AUDIO_FRAME_SAMPLES,
+                                                   enc_buf, APP_OPUS_MAX_PACKET_BYTES);
+                    if (enc_len <= 0 || enc_len > 255) continue;
+                    if (opus_len + 1 + enc_len > APP_AUDIO_CLIP_MAX_OPUS_BYTES) break;
+                    opus_buf[opus_len++] = static_cast<uint8_t>(enc_len);
+                    memcpy(&opus_buf[opus_len], enc_buf, enc_len);
+                    opus_len += enc_len;
+                }
+                ESP_LOGI(TAG, "audio clip encoded: %u frames, %u bytes",
+                         static_cast<unsigned>(num_frames), static_cast<unsigned>(opus_len));
+            }
+        }
+    }
+    heap_caps_free(pcm_snap);
+
+    // Build combined blob: [4 bytes jpeg_len LE] + [jpeg] + [opus]
+    size_t blob_len = 4 + jpeg_len + opus_len;
+    uint8_t *blob = static_cast<uint8_t *>(
+        heap_caps_malloc(blob_len, MALLOC_CAP_SPIRAM));
+    if (!blob) {
+        ESP_LOGE(TAG, "blob alloc failed: %u bytes", static_cast<unsigned>(blob_len));
+        heap_caps_free(jpeg);
+        heap_caps_free(opus_buf);
+        g_radio.resume_audio_capture();
+        g_capture_busy = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    blob[0] = static_cast<uint8_t>(jpeg_len);
+    blob[1] = static_cast<uint8_t>(jpeg_len >> 8);
+    blob[2] = static_cast<uint8_t>(jpeg_len >> 16);
+    blob[3] = static_cast<uint8_t>(jpeg_len >> 24);
+    memcpy(&blob[4], jpeg, jpeg_len);
+    if (opus_len > 0) {
+        memcpy(&blob[4 + jpeg_len], opus_buf, opus_len);
+    }
+    heap_caps_free(jpeg);
+    heap_caps_free(opus_buf);
+
     char status[48];
     uint16_t total_frags = static_cast<uint16_t>(
-        (jpeg_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) / APP_IMAGE_FRAGMENT_DATA_SIZE);
+        (blob_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) / APP_IMAGE_FRAGMENT_DATA_SIZE);
     snprintf(status, sizeof(status), "Sending %u pkts...", total_frags);
     bsp_lcd_set_camera_status(status);
 
-    // Send via radio (blocks until done or timeout)
-    g_radio.send_image(jpeg, jpeg_len, session_id);
+    uint16_t tx_session = session_id | APP_AUDIO_SESSION_FLAG;
+    g_radio.send_image(blob, blob_len, tx_session);
 
-    // Wait for image_tx_task to finish transmitting before freeing jpeg
     uint32_t wait_start = xTaskGetTickCount();
     while (xTaskGetTickCount() - wait_start < pdMS_TO_TICKS(30000)) {
         if (!g_radio.image_tx_busy()) {
@@ -352,7 +428,8 @@ void image_capture_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    heap_caps_free(jpeg);
+    heap_caps_free(blob);
+    g_radio.resume_audio_capture();
     g_capture_busy = false;
     vTaskDelete(nullptr);
 }
@@ -388,40 +465,121 @@ void on_image_capture_request(uint16_t session_id)
 }
 
 // Callback: device B receives complete image
+void play_audio_clip(const uint8_t *opus_packed, size_t total_len)
+{
+    OpusCodec clip_codec;
+    if (clip_codec.init() != ESP_OK) {
+        ESP_LOGE(TAG, "play_audio_clip: codec init failed");
+        return;
+    }
+    bsp_audio_pa_enable(true);
+
+    size_t pos = 0;
+    int16_t pcm[APP_AUDIO_FRAME_SAMPLES];
+    int16_t stereo[APP_AUDIO_FRAME_SAMPLES * 2];
+    uint32_t frames_played = 0;
+
+    while (pos < total_len) {
+        uint8_t flen = opus_packed[pos++];
+        if (flen == 0 || pos + flen > total_len) break;
+        int decoded = clip_codec.decode(&opus_packed[pos], flen, pcm, APP_AUDIO_FRAME_SAMPLES);
+        pos += flen;
+        if (decoded <= 0) continue;
+        for (int i = 0; i < decoded; i++) {
+            stereo[2 * i] = pcm[i];
+            stereo[2 * i + 1] = pcm[i];
+        }
+        size_t written = 0;
+        bsp_audio_write(stereo, decoded * 2 * sizeof(int16_t), &written);
+        frames_played++;
+    }
+    ESP_LOGI(TAG, "audio clip played: %lu frames", static_cast<unsigned long>(frames_played));
+    bsp_audio_pa_enable(false);
+}
+
 void on_image_rx_complete(ImageTransfer *xfer)
 {
     ESP_LOGI(TAG, "on_image_rx_complete: xfer=%p complete=%d",
              xfer, xfer ? xfer->rx_complete() : -1);
     if (!xfer || !xfer->rx_complete()) return;
 
-    uint8_t *rgb565 = nullptr;
-    uint32_t w = 0, h = 0;
-    esp_err_t e = xfer->decode_to_rgb565(&rgb565, &w, &h);
-    ESP_LOGI(TAG, "decode_to_rgb565: e=%d rgb565=%p w=%lu h=%lu",
-             e, rgb565, (unsigned long)w, (unsigned long)h);
-    if (e == ESP_OK && rgb565) {
-        uint32_t elapsed_ms = 0; // TODO: track from rx_begin
-        uint32_t jpeg_size = static_cast<uint32_t>(xfer->rx_jpeg_size());
+    uint16_t sid = xfer->rx_session_id();
+    bool has_audio = (sid & APP_AUDIO_SESSION_FLAG) != 0;
 
-        ESP_LOGI(TAG, "showing image: mode=%d jpeg_size=%lu",
-                 (int)g_app_mode, (unsigned long)jpeg_size);
-        if (g_app_mode == AppMode::radio) {
-            ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565), w, h,
-                              jpeg_size, elapsed_ms);
-        } else {
-            bsp_lcd_show_rgb565_photo(reinterpret_cast<const uint16_t *>(rgb565), w, h);
-            bsp_lcd_set_camera_status("Photo received");
-        }
-        jpeg_free_align(rgb565);
-    } else {
-        ESP_LOGE(TAG, "decode failed: e=%d", e);
-        if (g_app_mode == AppMode::radio) {
-            ui_gw_rx_failed("Decode failed");
-        } else {
-            bsp_lcd_set_camera_status("Decode failed");
-        }
+    // Reassemble the received data
+    uint8_t *raw = nullptr;
+    size_t raw_len = 0;
+    esp_err_t e = xfer->rx_reassemble(&raw, &raw_len);
+    if (e != ESP_OK || !raw) {
+        ESP_LOGE(TAG, "rx_reassemble failed: %d", e);
+        xfer->rx_reset();
+        return;
     }
 
+    const uint8_t *jpeg_data = raw;
+    size_t jpeg_len = raw_len;
+    const uint8_t *opus_data = nullptr;
+    size_t opus_len = 0;
+
+    if (has_audio && raw_len > 4) {
+        uint32_t jlen = static_cast<uint32_t>(raw[0])
+                      | (static_cast<uint32_t>(raw[1]) << 8)
+                      | (static_cast<uint32_t>(raw[2]) << 16)
+                      | (static_cast<uint32_t>(raw[3]) << 24);
+        if (jlen <= raw_len - 4) {
+            jpeg_data = &raw[4];
+            jpeg_len = jlen;
+            opus_data = &raw[4 + jlen];
+            opus_len = raw_len - 4 - jlen;
+        }
+        ESP_LOGI(TAG, "combined blob: jpeg=%u opus=%u",
+                 static_cast<unsigned>(jpeg_len), static_cast<unsigned>(opus_len));
+    }
+
+    // Decode and display JPEG
+    jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
+    dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
+    dec_cfg.scale.width = 240;
+    dec_cfg.scale.height = 176;
+
+    jpeg_dec_handle_t decoder = nullptr;
+    jpeg_error_t jerr = jpeg_dec_open(&dec_cfg, &decoder);
+    if (jerr == JPEG_ERR_OK && decoder) {
+        jpeg_dec_io_t io = {};
+        io.inbuf = const_cast<unsigned char *>(jpeg_data);
+        io.inbuf_len = static_cast<int>(jpeg_len);
+
+        jpeg_dec_header_info_t header = {};
+        jerr = jpeg_dec_parse_header(decoder, &io, &header);
+        if (jerr == JPEG_ERR_OK) {
+            int outbuf_len = dec_cfg.scale.width * dec_cfg.scale.height * 2;
+            uint8_t *rgb565 = static_cast<uint8_t *>(jpeg_calloc_align(outbuf_len, 16));
+            if (rgb565) {
+                io.outbuf = rgb565;
+                jerr = jpeg_dec_process(decoder, &io);
+                if (jerr == JPEG_ERR_OK) {
+                    uint32_t w = dec_cfg.scale.width;
+                    uint32_t h = dec_cfg.scale.height;
+                    if (g_app_mode == AppMode::radio) {
+                        ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565), w, h,
+                                          static_cast<uint32_t>(jpeg_len), 0);
+                    } else {
+                        bsp_lcd_show_rgb565_photo(reinterpret_cast<const uint16_t *>(rgb565), w, h);
+                        bsp_lcd_set_camera_status("Photo received");
+                    }
+                }
+                jpeg_free_align(rgb565);
+            }
+        }
+        jpeg_dec_close(decoder);
+    }
+
+    // Play audio if present
+    if (opus_data && opus_len > 0) {
+        play_audio_clip(opus_data, opus_len);
+    }
+
+    heap_caps_free(raw);
     xfer->rx_reset();
 }
 

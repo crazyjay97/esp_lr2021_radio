@@ -1,0 +1,13 @@
+bade394 Pin voice tasks to CPU1
+058e01d Keep radio in TX burst until PTT drains
+cbb7dbd Use direct RAL control for FLRC voice
+ea4911e Increase Opus frame aggregation
+15a0a4f Pack Opus frames per FLRC packet
+a2f0790 Decouple voice TX from radio polling
+d5bac77 Avoid zero tick radio delays
+34ba85b Improve voice playback continuity
+10d183c Decouple voice RX from playback
+d55aa4d Fix voice frame pacing and mono capture
+64dba4d Add Opus voice over FLRC
+56de534 Move radio polling to task
+ea3b9e8 Refactor app into C++ modules

@@ -30,6 +30,9 @@ public:
     // RX side: decode reassembled JPEG to RGB565. Caller frees *out_rgb565 with jpeg_free_align.
     esp_err_t decode_to_rgb565(uint8_t **out_rgb565, uint32_t *out_w, uint32_t *out_h);
 
+    // RX side: reassemble fragments into contiguous buffer. Caller frees with heap_caps_free.
+    esp_err_t rx_reassemble(uint8_t **out_buf, size_t *out_len);
+
     // RX side: free reassembly buffer
     void rx_reset();
 

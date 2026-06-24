@@ -12,6 +12,7 @@
 #include "opus_codec.hpp"
 #include "audio_processor.hpp"
 #include "image_transfer.hpp"
+#include "audio_ringbuf.hpp"
 
 typedef void (*image_capture_cb_t)(uint16_t session_id);
 typedef void (*image_rx_complete_cb_t)(ImageTransfer *xfer);
@@ -40,6 +41,11 @@ public:
 
     ImageTransfer &image_xfer() { return image_xfer_; }
     bool image_tx_busy() const { return image_tx_active_; }
+    void pause_audio_capture() { image_tx_active_ = true; }
+    void resume_audio_capture() { image_tx_active_ = false; }
+
+    // Audio ring buffer for pre-capture retrospective recording
+    size_t snapshot_audio(int16_t *out, size_t max_samples);
 
 private:
     enum class Mode {
@@ -113,6 +119,7 @@ private:
     OpusCodec codec_;
     AudioProcessor audio_proc_;
     ImageTransfer image_xfer_;
+    AudioRingBuf audio_ringbuf_;
     QueueHandle_t voice_queue_ = nullptr;
     QueueHandle_t tx_queue_ = nullptr;
     QueueHandle_t image_tx_queue_ = nullptr;
