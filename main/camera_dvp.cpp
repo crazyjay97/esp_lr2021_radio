@@ -284,6 +284,13 @@ esp_err_t CameraUartStreamer::power_down()
     set_pwdn(true);
     gpio_reset_pin(BSP_SP0A39_RESET_GPIO);
     sensor_i2c_detach();
+    sensor_configured_ = false;
+    return ESP_OK;
+}
+
+esp_err_t CameraUartStreamer::soft_power_down()
+{
+    set_pwdn(true);
     return ESP_OK;
 }
 
@@ -304,21 +311,48 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     ESP_RETURN_ON_ERROR(init(), TAG, "init");
     ESP_RETURN_ON_ERROR(configure_camera_pins(), TAG, "camera pins");
 
-    // Release PWDN with MCLK already running from init()
-    ESP_LOGI(TAG, "releasing SP0A39 PWDN: P%d low", BSP_SP0A39_PWDN_IOEXP_PIN);
-    set_pwdn(false);
-    vTaskDelay(pdMS_TO_TICKS(200));
-    ESP_RETURN_ON_ERROR(reset_sensor(), TAG, "reset");
-    vTaskDelay(pdMS_TO_TICKS(100));
+    if (!sensor_configured_) {
+        // First capture: full cold init with MCLK already running from init()
+        ESP_LOGI(TAG, "releasing SP0A39 PWDN: P%d low", BSP_SP0A39_PWDN_IOEXP_PIN);
+        set_pwdn(false);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_err_t init_ret = reset_sensor();
+        if (init_ret != ESP_OK) { power_down(); return init_ret; }
+        vTaskDelay(pdMS_TO_TICKS(100));
 
-    ESP_RETURN_ON_ERROR(sensor_i2c_attach(), TAG, "i2c attach");
-    vTaskDelay(pdMS_TO_TICKS(500));
+        init_ret = sensor_i2c_attach();
+        if (init_ret != ESP_OK) { power_down(); return init_ret; }
+        vTaskDelay(pdMS_TO_TICKS(500));
 
-    esp_err_t ret = sensor_read_id();
-    if (ret != ESP_OK) { power_down(); return ret; }
-    ret = sensor_write_regs();
-    if (ret != ESP_OK) { power_down(); return ret; }
-    log_sensor_output_regs();
+        init_ret = sensor_read_id();
+        if (init_ret != ESP_OK) { power_down(); return init_ret; }
+        init_ret = sensor_write_regs();
+        if (init_ret != ESP_OK) { power_down(); return init_ret; }
+        log_sensor_output_regs();
+        sensor_configured_ = true;
+    } else {
+        // Fast path: skip reset and long I2C wait, but rewrite registers
+        gpio_reset_pin(BSP_SP0A39_MCLK_GPIO);
+        ledc_timer_resume(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1);
+        ledc_channel_config_t ledc_ch = {};
+        ledc_ch.speed_mode = LEDC_LOW_SPEED_MODE;
+        ledc_ch.channel = LEDC_CHANNEL_1;
+        ledc_ch.timer_sel = LEDC_TIMER_1;
+        ledc_ch.intr_type = LEDC_INTR_DISABLE;
+        ledc_ch.gpio_num = BSP_SP0A39_MCLK_GPIO;
+        ledc_ch.duty = 1;
+        ledc_ch.hpoint = 0;
+        ledc_channel_config(&ledc_ch);
+
+        ESP_LOGI(TAG, "releasing SP0A39 PWDN: P%d low (fast)", BSP_SP0A39_PWDN_IOEXP_PIN);
+        set_pwdn(false);
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        sensor_i2c_attach();
+        esp_err_t init_ret = sensor_write_regs();
+        if (init_ret != ESP_OK) { power_down(); return init_ret; }
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
 
     // Release LEDC from GPIO3, then immediately create DVP (restores XCLK)
     ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
@@ -359,7 +393,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
              (unsigned long)kFrameBytes);
 
     esp_cam_ctlr_handle_t cam_handle = nullptr;
-    ret = esp_cam_new_dvp_ctlr(&dvp_cfg, &cam_handle);
+    esp_err_t ret = esp_cam_new_dvp_ctlr(&dvp_cfg, &cam_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_cam_new_dvp_ctlr failed: %s", esp_err_to_name(ret));
         power_down();
@@ -489,6 +523,10 @@ cleanup:
         if (frame_bufs[i]) heap_caps_free(frame_bufs[i]);
     }
     esp_cam_ctlr_del(cam_handle);
-    power_down();
+    if (ret == ESP_OK) {
+        soft_power_down();
+    } else {
+        power_down();
+    }
     return ret;
 }

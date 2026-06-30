@@ -20,6 +20,8 @@ private:
     esp_err_t configure_camera_pins();
     esp_err_t set_pwdn(bool asserted);
     esp_err_t reset_sensor();
+    esp_err_t soft_power_down();
 
     bool initialized_ = false;
+    bool sensor_configured_ = false;
 };
