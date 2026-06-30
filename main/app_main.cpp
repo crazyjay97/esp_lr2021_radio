@@ -623,7 +623,7 @@ void on_image_rx_complete(ImageTransfer *xfer)
                     uint32_t h = dec_cfg.scale.height;
                     if (g_app_mode == AppMode::radio) {
                         ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565), w, h,
-                                          static_cast<uint32_t>(jpeg_len), 0);
+                                          static_cast<uint32_t>(jpeg_len), g_radio.last_transfer_ms());
                     } else {
                         bsp_lcd_show_rgb565_photo(reinterpret_cast<const uint16_t *>(rgb565), w, h);
                         bsp_lcd_set_camera_status("Photo received");

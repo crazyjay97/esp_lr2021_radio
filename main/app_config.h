@@ -209,14 +209,14 @@
 
 /* ----- Image transfer over FLRC ------------------------------------------ */
 
-#define APP_IMAGE_JPEG_QUALITY          50
+#define APP_IMAGE_JPEG_QUALITY          75
 #define APP_IMAGE_FRAGMENT_DATA_SIZE    (APP_FLRC_MAX_PAYLOAD_BYTES - 16U)
 #define APP_IMAGE_TX_INTER_PACKET_US    0U
 #define APP_IMAGE_RX_TIMEOUT_MS         3000U
 #define APP_IMAGE_RX_PROGRESS_INTERVAL_MS 100U
 #define APP_IMAGE_NACK_MAX_RETRIES      30U
 #define APP_IMAGE_NACK_MAX_INDICES      120U
-#define APP_IMAGE_MAX_JPEG_SIZE         (60U * 1024U)
+#define APP_IMAGE_MAX_JPEG_SIZE         (400U * 1024U)
 #define APP_IMAGE_EOT_RETRY_COUNT       10U
 #define APP_IMAGE_EOT_RETRY_INTERVAL_MS 30U
 #define APP_IMAGE_TASK_STACK_BYTES      16384U

@@ -1434,6 +1434,7 @@ void RadioPing::handle_image_eot()
         uint32_t prepare_ms = image_rx_start_ms_ - image_cmd_sent_ms_;
         uint32_t transfer_ms = now_ms - image_rx_start_ms_;
         uint32_t total_ms = now_ms - image_cmd_sent_ms_;
+        image_rx_transfer_ms_ = transfer_ms;
         ESP_LOGI(TAG, "image RX complete: session=%u | prepare=%lums transfer=%lums total=%lums",
                  session_id,
                  static_cast<unsigned long>(prepare_ms),

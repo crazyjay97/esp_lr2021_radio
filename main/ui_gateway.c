@@ -814,16 +814,11 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
     if (!s_lock) return;
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
 
-    /* Compute elapsed from internal timer (ignore parameter if zero) */
-    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    uint32_t real_elapsed = (s_rx_start_ms > 0) ? (now_ms - s_rx_start_ms) : elapsed_ms;
-    if (real_elapsed == 0 && elapsed_ms > 0) real_elapsed = elapsed_ms;
-
     s_link_rssi = s_rx_last_rssi;
-    s_link_elapsed_ms = real_elapsed;
+    s_link_elapsed_ms = elapsed_ms;
     s_link_jpeg_size = jpeg_size;
-    if (real_elapsed > 0) {
-        s_link_rate = jpeg_size * 1000 / real_elapsed;
+    if (elapsed_ms > 0) {
+        s_link_rate = jpeg_size * 1000 / elapsed_ms;
     } else {
         s_link_rate = 0;
     }

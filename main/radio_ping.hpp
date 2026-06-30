@@ -43,6 +43,7 @@ public:
     bool send_config(uint8_t key, uint32_t value);
 
     ImageTransfer &image_xfer() { return image_xfer_; }
+    uint32_t last_transfer_ms() const { return image_rx_transfer_ms_; }
     bool image_tx_busy() const { return image_tx_active_; }
     void pause_audio_capture() { image_tx_active_ = true; }
     void resume_audio_capture() { image_tx_active_ = false; }
@@ -172,6 +173,7 @@ private:
     uint16_t image_rx_done_session_ = 0;
     uint32_t image_cmd_sent_ms_ = 0;
     uint32_t image_rx_start_ms_ = 0;
+    uint32_t image_rx_transfer_ms_ = 0;
 
     // NACK receive state for TX side (A)
     volatile bool image_nack_received_ = false;
