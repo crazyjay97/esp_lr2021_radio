@@ -235,6 +235,14 @@ static void update_bottom(const char *l, const char *m, const char *r)
 static void destroy_body_children(void)
 {
     lv_obj_clean(s_body);
+
+    lv_obj_clear_flag(s_status_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_title_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_bottom_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(s_body, 0, BODY_Y);
+    lv_obj_set_size(s_body, SCR_W, BODY_H);
+    lv_obj_set_style_bg_color(s_body, COL_BODY_BG, 0);
+
     s_img_canvas = NULL;
     s_img_placeholder = NULL;
     s_img_time_lbl = NULL;
@@ -286,8 +294,10 @@ static lv_obj_t *create_kv_row(lv_obj_t *parent, const char *key, const char *va
 /* ─── PAGE: Image (Home) ─── */
 static void create_image_page(void)
 {
-    #define IMG_W 216
-    #define IMG_H 162
+    #undef IMG_W
+    #undef IMG_H
+    #define IMG_W 240
+    #define IMG_H 320
     const size_t canvas_pixels = IMG_W * IMG_H;
 
     if (!s_img_canvas_buf) {
@@ -299,50 +309,40 @@ static void create_image_page(void)
         }
         if (s_img_canvas_buf) {
             for (size_t i = 0; i < canvas_pixels; i++) {
-                s_img_canvas_buf[i] = lv_color_hex(0x1A2A24);
+                s_img_canvas_buf[i] = lv_color_hex(0x000000);
             }
         }
     }
 
-    if (s_img_canvas_buf) {
+    if (s_has_image && s_img_canvas_buf) {
+        lv_obj_add_flag(s_status_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_title_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_bottom_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_pos(s_body, 0, 0);
+        lv_obj_set_size(s_body, SCR_W, SCR_H);
+        lv_obj_set_style_bg_color(s_body, lv_color_black(), 0);
+
         s_img_canvas = lv_canvas_create(s_body);
         lv_canvas_set_buffer(s_img_canvas, s_img_canvas_buf, IMG_W, IMG_H,
                              LV_IMG_CF_TRUE_COLOR);
-        lv_obj_set_pos(s_img_canvas, 12, 8);
-        lv_obj_set_style_border_width(s_img_canvas, 1, 0);
-        lv_obj_set_style_border_color(s_img_canvas, lv_color_hex(0x94AA9F), 0);
-    }
+        lv_obj_set_pos(s_img_canvas, 0, 0);
+    } else {
+        lv_obj_clear_flag(s_status_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_title_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_bottom_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_pos(s_body, 0, BODY_Y);
+        lv_obj_set_size(s_body, SCR_W, BODY_H);
+        lv_obj_set_style_bg_color(s_body, COL_BODY_BG, 0);
 
-    if (!s_has_image) {
         s_img_placeholder = lv_label_create(s_body);
         lv_obj_set_style_text_font(s_img_placeholder, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(s_img_placeholder, lv_color_hex(0xA0B8AC), 0);
         lv_label_set_text(s_img_placeholder, "Waiting for node...");
-        lv_obj_set_pos(s_img_placeholder, 60, 80);
+        lv_obj_align(s_img_placeholder, LV_ALIGN_CENTER, 0, 0);
+
+        update_title("Latest", "", COL_GREEN);
+        update_bottom("K6 Back", "K5/K4 Page", "K3 Capture");
     }
-
-    /* Metadata panel */
-    lv_obj_t *panel = lv_obj_create(s_body);
-    lv_obj_remove_style_all(panel);
-    lv_obj_set_size(panel, 224, 68);
-    lv_obj_set_pos(panel, 8, 176);
-    lv_obj_set_style_bg_color(panel, COL_PANEL_BG, 0);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(panel, 1, 0);
-    lv_obj_set_style_border_color(panel, COL_PANEL_BORDER, 0);
-    lv_obj_set_style_radius(panel, 6, 0);
-    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_layout(panel, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_all(panel, 0, 0);
-    lv_obj_set_style_pad_row(panel, 0, 0);
-
-    create_kv_row(panel, "Time", "--", &s_img_time_lbl);
-    create_kv_row(panel, "Image", "--", &s_img_info_lbl);
-    create_kv_row(panel, "Link", "--", &s_img_link_lbl);
-
-    update_title("Latest", s_has_image ? "OK" : "", COL_GREEN);
-    update_bottom("K6 Back", "K5/K4 Page", "K3 Capture");
 }
 
 /* PLACEHOLDER_RX_PAGE */
@@ -824,31 +824,35 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
         s_link_rate = 0;
     }
 
-    /* Scale image using esp_image_effects bilinear filter (RGB565→BGR565 for panel) */
+    /* Scale 640x480 → 320x240, then rotate 90° CW into 240x320 canvas (+ R↔B for BGR panel) */
     if (s_img_canvas_buf && rgb565 && w > 0 && h > 0) {
+        const int16_t scale_w = 320;
+        const int16_t scale_h = 240;
         esp_imgfx_scale_cfg_t scale_cfg = {
             .in_res = { .width = (int16_t)w, .height = (int16_t)h },
             .in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB565_LE,
-            .scale_res = { .width = IMG_W, .height = IMG_H },
+            .scale_res = { .width = scale_w, .height = scale_h },
             .filter_type = ESP_IMGFX_SCALE_FILTER_TYPE_BILINEAR,
         };
         esp_imgfx_scale_handle_t scaler = NULL;
         esp_imgfx_err_t ret = esp_imgfx_scale_open(&scale_cfg, &scaler);
         if (ret == ESP_IMGFX_ERR_OK && scaler) {
-            uint32_t out_size = IMG_W * IMG_H * 2;
+            uint32_t out_size = scale_w * scale_h * 2;
             uint8_t *scale_buf = heap_caps_malloc(out_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (scale_buf) {
                 esp_imgfx_data_t in_img = { .data = (uint8_t *)rgb565, .data_len = w * h * 2 };
                 esp_imgfx_data_t out_img = { .data = scale_buf, .data_len = out_size };
                 ret = esp_imgfx_scale_process(scaler, &in_img, &out_img);
                 if (ret == ESP_IMGFX_ERR_OK) {
-                    const uint16_t *scaled = (const uint16_t *)scale_buf;
-                    for (uint32_t i = 0; i < IMG_W * IMG_H; i++) {
-                        uint16_t px = scaled[i];
-                        uint16_t r = (px >> 11) & 0x1F;
-                        uint16_t g = (px >> 5) & 0x3F;
-                        uint16_t b = px & 0x1F;
-                        s_img_canvas_buf[i].full = (b << 11) | (g << 5) | r;
+                    const uint16_t *src = (const uint16_t *)scale_buf;
+                    for (int out_y = 0; out_y < IMG_H; out_y++) {
+                        for (int out_x = 0; out_x < IMG_W; out_x++) {
+                            uint16_t px = src[(scale_h - 1 - out_x) * scale_w + out_y];
+                            uint16_t r = (px >> 11) & 0x1F;
+                            uint16_t g = (px >> 5) & 0x3F;
+                            uint16_t b = px & 0x1F;
+                            s_img_canvas_buf[out_y * IMG_W + out_x].full = (b << 11) | (g << 5) | r;
+                        }
                     }
                 }
                 heap_caps_free(scale_buf);
@@ -859,32 +863,6 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
     }
 
     show_page(UI_PAGE_IMAGE);
-
-    /* Update metadata labels */
-    if (s_img_info_lbl) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%luKB / %lux%lu",
-                 (unsigned long)(jpeg_size / 1024),
-                 (unsigned long)w, (unsigned long)h);
-        lv_label_set_text(s_img_info_lbl, buf);
-    }
-    if (s_img_link_lbl) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%d dBm / %lu.%lu KB/s",
-                 s_link_rssi,
-                 (unsigned long)(s_link_rate / 1024),
-                 (unsigned long)((s_link_rate % 1024) * 10 / 1024));
-        lv_label_set_text(s_img_link_lbl, buf);
-    }
-    if (s_img_time_lbl) {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%lu.%lus",
-                 (unsigned long)(elapsed_ms / 1000),
-                 (unsigned long)((elapsed_ms % 1000) / 100));
-        lv_label_set_text(s_img_time_lbl, buf);
-    }
-
-    lv_label_set_text(s_status_lbl_r, "Photo received");
 
     xSemaphoreGiveRecursive(s_lock);
 }
