@@ -346,12 +346,12 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
 
         ESP_LOGI(TAG, "releasing SP0A39 PWDN: P%d low (fast)", BSP_SP0A39_PWDN_IOEXP_PIN);
         set_pwdn(false);
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(10));
 
         sensor_i2c_attach();
         esp_err_t init_ret = sensor_write_regs();
         if (init_ret != ESP_OK) { power_down(); return init_ret; }
-        vTaskDelay(pdMS_TO_TICKS(150));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 
     // Release LEDC from GPIO3, then immediately create DVP (restores XCLK)
@@ -401,7 +401,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     }
 
     // DVP now outputs XCLK on GPIO3 - wait for sensor to stabilize
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(30));
 
     uint8_t *frame_bufs[kCaptureDmaBufferCount] = {};
     for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
