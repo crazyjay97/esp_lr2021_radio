@@ -884,7 +884,7 @@ void RadioPing::trigger_image_capture()
     pkt[12] = 0;
     pkt[13] = 0;
 
-    ESP_LOGI(TAG, "trigger_image_capture: sending ImageCmd session=%u", session_id);
+    // ESP_LOGI(TAG, "trigger_image_capture: sending ImageCmd session=%u", session_id);
     image_cmd_sent_ms_ = smtc_modem_hal_get_time_in_ms();
 
     // Stop RX, send cmd, return to RX
@@ -958,9 +958,9 @@ void RadioPing::image_tx_task()
             (req.jpeg_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) / APP_IMAGE_FRAGMENT_DATA_SIZE);
         uint32_t jpeg_crc32 = crc32_ieee(req.jpeg, req.jpeg_len);
 
-        ESP_LOGI(TAG, "image TX start: session=%u jpeg=%u bytes frags=%u crc32=0x%08lx",
-                 req.session_id, static_cast<unsigned>(req.jpeg_len), total_fragments,
-                 static_cast<unsigned long>(jpeg_crc32));
+        // ESP_LOGI(TAG, "image TX start: session=%u jpeg=%u bytes frags=%u crc32=0x%08lx",
+        //          req.session_id, static_cast<unsigned>(req.jpeg_len), total_fragments,
+        //          static_cast<unsigned long>(jpeg_crc32));
 
         bool was_ptt = ptt_active_;
         ptt_active_ = false;
@@ -1009,15 +1009,15 @@ void RadioPing::image_tx_task()
 
             if (image_nack_received_ || image_done_received_) {
                 r_ready = true;
-                ESP_LOGI(TAG, "image TX: R ready, starting data burst");
+                // ESP_LOGI(TAG, "image TX: R ready, starting data burst");
             } else {
-                ESP_LOGW(TAG, "image TX: ImageStart no response, retry %u/%u",
-                         start_try + 1, APP_IMAGE_EOT_RETRY_COUNT);
+            // ESP_LOGW(TAG, "image TX: ImageStart no response, retry %u/%u",
+            //          start_try + 1, APP_IMAGE_EOT_RETRY_COUNT);
             }
         }
 
         if (!r_ready) {
-            ESP_LOGW(TAG, "image TX: R not ready, aborting");
+            // ESP_LOGW(TAG, "image TX: R not ready, aborting");
             image_tx_active_ = false;
             suspended_ = false;
             ptt_active_ = was_ptt;
@@ -1046,14 +1046,14 @@ void RadioPing::image_tx_task()
             put_u16_le(&pkt[kHeaderSize + frag_len], crc);
 
             if (!send_single_packet(pkt, static_cast<uint16_t>(kHeaderSize + frag_len + 2))) {
-                ESP_LOGW(TAG, "image TX frag %u/%u failed", i, total_fragments);
+            // ESP_LOGW(TAG, "image TX frag %u/%u failed", i, total_fragments);
             }
             if (image_tx_inter_packet_us_ > 0) {
                 esp_rom_delay_us(image_tx_inter_packet_us_);
             }
         }
 
-        ESP_LOGI(TAG, "image TX: initial burst done (%u frags)", total_fragments);
+        // ESP_LOGI(TAG, "image TX: initial burst done (%u frags)", total_fragments);
 
         // Step 2-8: EOT + wait ACK + retransmit loop
         bool transfer_done = false;
@@ -1100,13 +1100,13 @@ void RadioPing::image_tx_task()
                     got_response = true;
                     break;
                 }
-                ESP_LOGW(TAG, "image TX: EOT no response, retry %u/%u",
-                         eot_try + 1, APP_IMAGE_EOT_RETRY_COUNT);
+                // ESP_LOGW(TAG, "image TX: EOT no response, retry %u/%u",
+                //          eot_try + 1, APP_IMAGE_EOT_RETRY_COUNT);
             }
 
             if (!got_response) {
-                ESP_LOGW(TAG, "image TX: no ACK after %u EOT retries, resending all frags",
-                         APP_IMAGE_EOT_RETRY_COUNT);
+                // ESP_LOGW(TAG, "image TX: no ACK after %u EOT retries, resending all frags",
+                //          APP_IMAGE_EOT_RETRY_COUNT);
                 // No ACK — resend all fragments (blind retransmit)
                 for (uint16_t i = 0; i < total_fragments; i++) {
                     size_t offset = static_cast<size_t>(i) * APP_IMAGE_FRAGMENT_DATA_SIZE;
@@ -1136,14 +1136,14 @@ void RadioPing::image_tx_task()
             }
 
             if (image_done_received_ || nack_count_ == 0) {
-                ESP_LOGI(TAG, "image TX complete: all received");
+                // ESP_LOGI(TAG, "image TX complete: all received");
                 transfer_done = true;
                 break;
             }
 
             // Retransmit missing fragments
-            ESP_LOGI(TAG, "image TX round %u: resending %u missing frags",
-                     round + 1, nack_count_);
+            // ESP_LOGI(TAG, "image TX round %u: resending %u missing frags",
+            //          round + 1, nack_count_);
             for (uint16_t n = 0; n < nack_count_; n++) {
                 uint16_t i = nack_indices_[n];
                 if (i >= total_fragments) continue;
@@ -1167,7 +1167,7 @@ void RadioPing::image_tx_task()
                 put_u16_le(&pkt[kHeaderSize + frag_len], crc);
 
                 if (!send_single_packet(pkt, static_cast<uint16_t>(kHeaderSize + frag_len + 2))) {
-                    ESP_LOGW(TAG, "image TX retransmit frag %u failed", i);
+            // ESP_LOGW(TAG, "image TX retransmit frag %u failed", i);
                 }
                 if (image_tx_inter_packet_us_ > 0) {
                     esp_rom_delay_us(image_tx_inter_packet_us_);
@@ -1178,8 +1178,8 @@ void RadioPing::image_tx_task()
         image_tx_active_ = false;
         suspended_ = false;
         ptt_active_ = was_ptt;
-        ESP_LOGI(TAG, "image TX finished: session=%u done=%d",
-                 req.session_id, transfer_done ? 1 : 0);
+        // ESP_LOGI(TAG, "image TX finished: session=%u done=%d",
+        //          req.session_id, transfer_done ? 1 : 0);
 
         if (mode_ != Mode::rx_pending && !ptt_active_) {
             schedule_rx();
@@ -1232,7 +1232,7 @@ bool RadioPing::wait_for_tx_done(uint32_t timeout_ms)
 void RadioPing::handle_image_cmd()
 {
     uint16_t session_id = get_u16_le(&rx_buf_[6]);
-    ESP_LOGI(TAG, "RX ImageCmd: session=%u", session_id);
+    // ESP_LOGI(TAG, "RX ImageCmd: session=%u", session_id);
 
     if (image_capture_cb_) {
         image_capture_cb_(session_id);
@@ -1245,8 +1245,8 @@ void RadioPing::handle_image_start()
     uint16_t total_frags = get_u16_le(&rx_buf_[8]);
     uint32_t expected_crc32 = get_u32_le(&rx_buf_[10]);
 
-    ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx",
-             session_id, total_frags, static_cast<unsigned long>(expected_crc32));
+    // ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx",
+    //          session_id, total_frags, static_cast<unsigned long>(expected_crc32));
     image_rx_start_ms_ = smtc_modem_hal_get_time_in_ms();
 
     // Prepare RX buffer
@@ -1335,8 +1335,8 @@ void RadioPing::handle_image_nack()
     }
 
     uint16_t total_received = get_u16_le(&rx_buf_[10]);
-    ESP_LOGI(TAG, "RX ImageACK: session=%u missing=%u received=%u",
-             session_id, missing_count, total_received);
+    // ESP_LOGI(TAG, "RX ImageACK: session=%u missing=%u received=%u",
+    //          session_id, missing_count, total_received);
     image_nack_received_ = true;
     if (missing_count == 0) {
         image_done_received_ = true;
@@ -1346,7 +1346,7 @@ void RadioPing::handle_image_nack()
 void RadioPing::handle_image_done()
 {
     uint16_t session_id = get_u16_le(&rx_buf_[6]);
-    ESP_LOGI(TAG, "RX ImageDone: session=%u", session_id);
+    // ESP_LOGI(TAG, "RX ImageDone: session=%u", session_id);
     image_done_received_ = true;
 }
 
@@ -1355,8 +1355,8 @@ void RadioPing::handle_image_eot()
     uint16_t session_id = get_u16_le(&rx_buf_[6]);
     uint16_t total_frags = get_u16_le(&rx_buf_[8]);
 
-    ESP_LOGI(TAG, "RX ImageEOT: session=%u received=%u/%u",
-             session_id, image_xfer_.rx_received_count(), total_frags);
+    // ESP_LOGI(TAG, "RX ImageEOT: session=%u received=%u/%u",
+    //          session_id, image_xfer_.rx_received_count(), total_frags);
 
     if (!image_rx_pending_) {
         // Already completed — still send ACK so T stops retrying
@@ -1396,17 +1396,17 @@ void RadioPing::handle_image_eot()
     if (missing_count == 0 && image_rx_expected_crc32_ != 0) {
         uint32_t actual_crc32 = image_xfer_.rx_crc32();
         if (actual_crc32 != image_rx_expected_crc32_) {
-            ESP_LOGW(TAG, "image RX crc32 mismatch: expected=0x%08lx actual=0x%08lx, requesting full resend",
-                     static_cast<unsigned long>(image_rx_expected_crc32_),
-                     static_cast<unsigned long>(actual_crc32));
+            // ESP_LOGW(TAG, "image RX crc32 mismatch: expected=0x%08lx actual=0x%08lx, requesting full resend",
+            //          static_cast<unsigned long>(image_rx_expected_crc32_),
+            //          static_cast<unsigned long>(actual_crc32));
             image_xfer_.rx_begin(session_id, total_frags);
             image_rx_pending_ = true;
             image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
             image_rx_last_progress_ms_ = 0;
             missing_count = image_xfer_.rx_get_missing(missing_indices, APP_IMAGE_NACK_MAX_INDICES);
         } else {
-            ESP_LOGI(TAG, "image RX crc32 ok: 0x%08lx",
-                     static_cast<unsigned long>(actual_crc32));
+            // ESP_LOGI(TAG, "image RX crc32 ok: 0x%08lx",
+            //          static_cast<unsigned long>(actual_crc32));
         }
     }
 
@@ -1472,9 +1472,9 @@ void RadioPing::check_image_rx_timeout()
         if (image_rx_expected_crc32_ != 0) {
             uint32_t actual_crc32 = image_xfer_.rx_crc32();
             if (actual_crc32 != image_rx_expected_crc32_) {
-                ESP_LOGW(TAG, "image RX complete timeout crc32 mismatch: expected=0x%08lx actual=0x%08lx",
-                         static_cast<unsigned long>(image_rx_expected_crc32_),
-                         static_cast<unsigned long>(actual_crc32));
+                // ESP_LOGW(TAG, "image RX complete timeout crc32 mismatch: expected=0x%08lx actual=0x%08lx",
+                //          static_cast<unsigned long>(image_rx_expected_crc32_),
+                //          static_cast<unsigned long>(actual_crc32));
                 image_xfer_.rx_begin(image_xfer_.rx_session_id(), image_xfer_.rx_total_count());
                 image_rx_last_frag_ms_ = now;
                 image_rx_last_progress_ms_ = 0;
@@ -1483,7 +1483,7 @@ void RadioPing::check_image_rx_timeout()
         }
         image_rx_pending_ = false;
         image_rx_done_session_ = image_xfer_.rx_session_id();
-        ESP_LOGI(TAG, "image RX complete (no EOT seen before timeout)");
+        // ESP_LOGI(TAG, "image RX complete (no EOT seen before timeout)");
         if (image_rx_complete_cb_) {
             image_rx_complete_cb_(&image_xfer_);
         }
@@ -1494,8 +1494,8 @@ void RadioPing::check_image_rx_timeout()
         return;
     }
 
-    ESP_LOGW(TAG, "image RX: timeout (10s no activity), giving up. %u/%u received",
-             image_xfer_.rx_received_count(), image_xfer_.rx_total_count());
+    // ESP_LOGW(TAG, "image RX: timeout (10s no activity), giving up. %u/%u received",
+    //          image_xfer_.rx_received_count(), image_xfer_.rx_total_count());
     image_rx_pending_ = false;
     image_xfer_.rx_reset();
     image_rx_nack_sent_ = 0;
