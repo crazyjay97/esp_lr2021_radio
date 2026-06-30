@@ -1419,6 +1419,7 @@ void RadioPing::handle_image_eot()
 
     uint16_t pkt_len = static_cast<uint16_t>(kHeaderSize + missing_count * 2);
     send_single_packet(pkt, pkt_len);
+    schedule_rx();
 
     if (image_rx_eot_cb_) {
         bool is_first = (image_rx_eot_count_ == 0);
@@ -1438,7 +1439,6 @@ void RadioPing::handle_image_eot()
                  static_cast<unsigned long>(prepare_ms),
                  static_cast<unsigned long>(transfer_ms),
                  static_cast<unsigned long>(total_ms));
-        schedule_rx();
         if (image_rx_complete_cb_) {
             image_rx_complete_cb_(&image_xfer_);
         }
@@ -1455,7 +1455,6 @@ void RadioPing::handle_image_eot()
             }
         }
         image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
-        schedule_rx();
     }
 }
 
