@@ -102,6 +102,8 @@ static int s_cfg_sel = 0;
 static uint32_t s_pkt_delay_us = APP_IMAGE_TX_INTER_PACKET_US;
 static ui_gw_pkt_delay_cb_t s_pkt_delay_cb = NULL;
 static bool s_cfg_pkt_delay_editing = false;
+static ui_gw_audio_clip_cb_t s_audio_clip_cb = NULL;
+static bool s_audio_clip_on = false;
 
 /* Forward declarations */
 static void create_shared_layout(void);
@@ -493,7 +495,7 @@ static void create_config_page(void)
     static const char *cfg_keys[] = {"JPEG Quality", "Resolution", "Trigger", "Interval", "Audio", "Pkt Delay"};
     char pkt_delay_str[16];
     snprintf(pkt_delay_str, sizeof(pkt_delay_str), "%luus", (unsigned long)s_pkt_delay_us);
-    const char *cfg_vals[] = {"Q=50", "VGA", "Manual", s_interval_labels[s_cfg_interval_idx], "Off", pkt_delay_str};
+    const char *cfg_vals[] = {"Q=50", "VGA", "Manual", s_interval_labels[s_cfg_interval_idx], s_audio_clip_on ? "On" : "Off", pkt_delay_str};
 
     for (int i = 0; i < 6; i++) {
         s_cfg_rows[i] = create_kv_row(panel, cfg_keys[i], cfg_vals[i], &s_cfg_val_lbls[i]);
@@ -584,6 +586,11 @@ void ui_gw_set_pkt_delay_cb(ui_gw_pkt_delay_cb_t cb)
     s_pkt_delay_cb = cb;
 }
 
+void ui_gw_set_audio_clip_cb(ui_gw_audio_clip_cb_t cb)
+{
+    s_audio_clip_cb = cb;
+}
+
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
 {
     if (!pressed) return;
@@ -660,6 +667,16 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
                 lv_label_set_text(s_status_lbl_r, "Sending...");
                 lv_refr_now(NULL);
                 bool ok = s_interval_cb ? s_interval_cb(s_interval_presets[s_cfg_interval_idx]) : false;
+                lv_label_set_text(s_status_lbl_r, ok ? "Set OK" : "Set FAIL");
+            } else if (s_cfg_sel == 4) {
+                /* Audio clip row: toggle On/Off */
+                s_audio_clip_on = !s_audio_clip_on;
+                if (s_cfg_val_lbls[4]) {
+                    lv_label_set_text(s_cfg_val_lbls[4], s_audio_clip_on ? "On" : "Off");
+                }
+                lv_label_set_text(s_status_lbl_r, "Sending...");
+                lv_refr_now(NULL);
+                bool ok = s_audio_clip_cb ? s_audio_clip_cb(s_audio_clip_on ? 1 : 0) : false;
                 lv_label_set_text(s_status_lbl_r, ok ? "Set OK" : "Set FAIL");
             } else if (s_cfg_sel == 5) {
                 /* Pkt Delay row: enter editing mode */

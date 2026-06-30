@@ -196,6 +196,8 @@
 #define APP_AUTO_CAPTURE_MIN_SEC        10U    /* 10 seconds minimum */
 #define APP_CFG_KEY_INTERVAL            0x01
 #define APP_CFG_KEY_INTER_PACKET        0x02
+#define APP_CFG_KEY_AUDIO_CLIP          0x03
+#define APP_AUDIO_CLIP_DEFAULT_ENABLE   0
 
 /* ----- Audio ring buffer (pre-capture retrospective recording) ----------- */
 

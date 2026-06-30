@@ -170,6 +170,8 @@ private:
     uint16_t image_rx_eot_count_ = 0;
     int16_t image_rx_last_rssi_ = 0;
     uint16_t image_rx_done_session_ = 0;
+    uint32_t image_cmd_sent_ms_ = 0;
+    uint32_t image_rx_start_ms_ = 0;
 
     // NACK receive state for TX side (A)
     volatile bool image_nack_received_ = false;

@@ -43,6 +43,7 @@ bool g_radio_active = false;
 esp_timer_handle_t g_auto_capture_timer = nullptr;
 esp_timer_handle_t g_countdown_timer = nullptr;
 uint32_t g_capture_interval_sec = APP_AUTO_CAPTURE_DEFAULT_SEC;
+bool g_audio_clip_enabled = APP_AUDIO_CLIP_DEFAULT_ENABLE;
 uint16_t g_auto_session_id = 0x8000;
 int64_t g_last_capture_time_us = 0;
 
@@ -200,6 +201,9 @@ void countdown_timer_cb(void *arg)
         snprintf(buf, sizeof(buf), "%lu%s | %lds", static_cast<unsigned long>(val), unit,
                  static_cast<long>(remaining));
     }
+    if (g_audio_clip_enabled) {
+        strncat(buf, " radio", sizeof(buf) - strlen(buf) - 1);
+    }
     bsp_lcd_set_camera_status(buf);
 }
 
@@ -240,6 +244,10 @@ void on_config_received(uint8_t key, uint32_t value)
         char buf[16];
         snprintf(buf, sizeof(buf), "%luus", static_cast<unsigned long>(value));
         bsp_lcd_set_camera_status(buf);
+    } else if (key == APP_CFG_KEY_AUDIO_CLIP) {
+        g_audio_clip_enabled = (value != 0);
+        update_camera_timer_status();
+        ESP_LOGI(TAG, "config: audio_clip=%s", g_audio_clip_enabled ? "on" : "off");
     }
 }
 
@@ -284,6 +292,9 @@ void image_capture_task(void *arg)
     uint32_t height = 0;
     uint32_t pixfmt = 0;
 
+    uint32_t t_cmd = static_cast<uint32_t>(esp_log_timestamp());
+    ESP_LOGI(TAG, "[TIMING] cmd received t=0ms");
+
     bsp_lcd_set_camera_status("Remote capture...");
 
     // Snapshot ring buffer before pausing I2S
@@ -324,12 +335,17 @@ void image_capture_task(void *arg)
         return;
     }
 
+    uint32_t t_cam_start = static_cast<uint32_t>(esp_log_timestamp());
+    ESP_LOGI(TAG, "[TIMING] camera init start +%lums", static_cast<unsigned long>(t_cam_start - t_cmd));
+
     esp_err_t capture_e = g_camera_uart.capture_frame(&frame, &len, &width, &height, &pixfmt);
-    ESP_LOGI(TAG, "image capture: %s %lux%lu fourcc=0x%08lx len=%u",
-             esp_err_to_name(capture_e),
+
+    uint32_t t_cam_done = static_cast<uint32_t>(esp_log_timestamp());
+    ESP_LOGI(TAG, "[TIMING] capture done +%lums (camera=%lums) %lux%lu %u bytes",
+             static_cast<unsigned long>(t_cam_done - t_cmd),
+             static_cast<unsigned long>(t_cam_done - t_cam_start),
              static_cast<unsigned long>(width),
              static_cast<unsigned long>(height),
-             static_cast<unsigned long>(pixfmt),
              static_cast<unsigned>(len));
 
     // LCD reinit and audio resume deferred until after transmission
@@ -350,8 +366,14 @@ void image_capture_task(void *arg)
     // JPEG encode
     uint8_t *jpeg = nullptr;
     size_t jpeg_len = 0;
+    uint32_t t_jpeg_start = static_cast<uint32_t>(esp_log_timestamp());
     e = g_radio.image_xfer().encode_frame(frame, len, width, height, pixfmt, &jpeg, &jpeg_len);
     heap_caps_free(frame);
+    uint32_t t_jpeg_done = static_cast<uint32_t>(esp_log_timestamp());
+    ESP_LOGI(TAG, "[TIMING] JPEG done +%lums (jpeg=%lums) %u bytes",
+             static_cast<unsigned long>(t_jpeg_done - t_cmd),
+             static_cast<unsigned long>(t_jpeg_done - t_jpeg_start),
+             static_cast<unsigned>(jpeg_len));
 
     if (e != ESP_OK || !jpeg) {
         bsp_lcd_reinit_after_camera();
@@ -369,7 +391,7 @@ void image_capture_task(void *arg)
     // Opus encode
     size_t opus_len = 0;
     uint8_t *opus_buf = nullptr;
-    if (pcm_snap && snap_samples >= APP_AUDIO_FRAME_SAMPLES) {
+    if (g_audio_clip_enabled && pcm_snap && snap_samples >= APP_AUDIO_FRAME_SAMPLES) {
         opus_buf = static_cast<uint8_t *>(
             heap_caps_malloc(APP_AUDIO_CLIP_MAX_OPUS_BYTES, MALLOC_CAP_SPIRAM));
         if (opus_buf) {
@@ -394,32 +416,47 @@ void image_capture_task(void *arg)
     }
     heap_caps_free(pcm_snap);
 
-    // Build combined blob: [4 bytes jpeg_len LE] + [jpeg] + [opus]
-    size_t blob_len = 4 + jpeg_len + opus_len;
-    uint8_t *blob = static_cast<uint8_t *>(
-        heap_caps_malloc(blob_len, MALLOC_CAP_SPIRAM));
-    if (!blob) {
-        ESP_LOGE(TAG, "blob alloc failed: %u bytes", static_cast<unsigned>(blob_len));
-        heap_caps_free(jpeg);
-        heap_caps_free(opus_buf);
-        bsp_lcd_reinit_after_camera();
-#if APP_AUDIO_FEATURES_ENABLE
-        bsp_audio_resume();
-#endif
-        bsp_lcd_set_camera_status("Alloc failed");
-        g_radio.resume_audio_capture();
-        g_capture_busy = false;
-        vTaskDelete(nullptr);
-        return;
+    uint32_t t_opus_done = static_cast<uint32_t>(esp_log_timestamp());
+    if (opus_len > 0) {
+        ESP_LOGI(TAG, "[TIMING] Opus done +%lums (opus=%lums) %u bytes",
+                 static_cast<unsigned long>(t_opus_done - t_cmd),
+                 static_cast<unsigned long>(t_opus_done - t_jpeg_done),
+                 static_cast<unsigned>(opus_len));
     }
 
-    blob[0] = static_cast<uint8_t>(jpeg_len);
-    blob[1] = static_cast<uint8_t>(jpeg_len >> 8);
-    blob[2] = static_cast<uint8_t>(jpeg_len >> 16);
-    blob[3] = static_cast<uint8_t>(jpeg_len >> 24);
-    memcpy(&blob[4], jpeg, jpeg_len);
-    if (opus_len > 0) {
+    // Build blob — combined format only when audio is present
+    uint8_t *blob;
+    size_t blob_len;
+    bool has_opus = (opus_len > 0);
+
+    if (has_opus) {
+        blob_len = 4 + jpeg_len + opus_len;
+        blob = static_cast<uint8_t *>(
+            heap_caps_malloc(blob_len, MALLOC_CAP_SPIRAM));
+        if (!blob) {
+            ESP_LOGE(TAG, "blob alloc failed: %u bytes", static_cast<unsigned>(blob_len));
+            heap_caps_free(jpeg);
+            heap_caps_free(opus_buf);
+            bsp_lcd_reinit_after_camera();
+#if APP_AUDIO_FEATURES_ENABLE
+            bsp_audio_resume();
+#endif
+            bsp_lcd_set_camera_status("Alloc failed");
+            g_radio.resume_audio_capture();
+            g_capture_busy = false;
+            vTaskDelete(nullptr);
+            return;
+        }
+        blob[0] = static_cast<uint8_t>(jpeg_len);
+        blob[1] = static_cast<uint8_t>(jpeg_len >> 8);
+        blob[2] = static_cast<uint8_t>(jpeg_len >> 16);
+        blob[3] = static_cast<uint8_t>(jpeg_len >> 24);
+        memcpy(&blob[4], jpeg, jpeg_len);
         memcpy(&blob[4 + jpeg_len], opus_buf, opus_len);
+    } else {
+        blob_len = jpeg_len;
+        blob = jpeg;
+        jpeg = nullptr;
     }
     heap_caps_free(jpeg);
     heap_caps_free(opus_buf);
@@ -428,7 +465,7 @@ void image_capture_task(void *arg)
         (blob_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) / APP_IMAGE_FRAGMENT_DATA_SIZE);
     ESP_LOGI(TAG, "sending %u pkts, blob %u bytes", total_frags, static_cast<unsigned>(blob_len));
 
-    uint16_t tx_session = session_id | APP_AUDIO_SESSION_FLAG;
+    uint16_t tx_session = has_opus ? (session_id | APP_AUDIO_SESSION_FLAG) : session_id;
     g_radio.send_image(blob, blob_len, tx_session);
 
     uint32_t wait_start = xTaskGetTickCount();
@@ -769,6 +806,12 @@ bool on_gw_pkt_delay_change(uint32_t us)
     return g_radio.send_config(APP_CFG_KEY_INTER_PACKET, us);
 }
 
+bool on_gw_audio_clip_change(uint32_t enable)
+{
+    ESP_LOGI(TAG, "UI audio clip: %s", enable ? "on" : "off");
+    return g_radio.send_config(APP_CFG_KEY_AUDIO_CLIP, enable);
+}
+
 void on_button(bsp_btn_id_t id, bool pressed, void *user)
 {
     (void)user;
@@ -965,6 +1008,7 @@ extern "C" void app_main(void)
             ui_gw_set_capture_cb(on_gw_capture);
             ui_gw_set_interval_cb(on_gw_interval_change);
             ui_gw_set_pkt_delay_cb(on_gw_pkt_delay_change);
+            ui_gw_set_audio_clip_cb(on_gw_audio_clip_change);
         }
     } else if ((e = bsp_lcd_start_camera_ui(on_lcd_capture, nullptr)) != ESP_OK) {
         ESP_LOGE(TAG, "camera ui start: %s", esp_err_to_name(e));

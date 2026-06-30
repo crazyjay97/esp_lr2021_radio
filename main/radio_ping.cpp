@@ -885,6 +885,7 @@ void RadioPing::trigger_image_capture()
     pkt[13] = 0;
 
     ESP_LOGI(TAG, "trigger_image_capture: sending ImageCmd session=%u", session_id);
+    image_cmd_sent_ms_ = smtc_modem_hal_get_time_in_ms();
 
     // Stop RX, send cmd, return to RX
     smtc_modem_hal_protect_api_call();
@@ -1246,6 +1247,7 @@ void RadioPing::handle_image_start()
 
     ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx",
              session_id, total_frags, static_cast<unsigned long>(expected_crc32));
+    image_rx_start_ms_ = smtc_modem_hal_get_time_in_ms();
 
     // Prepare RX buffer
     image_xfer_.rx_begin(session_id, total_frags);
@@ -1428,7 +1430,15 @@ void RadioPing::handle_image_eot()
     if (missing_count == 0) {
         image_rx_pending_ = false;
         image_rx_done_session_ = session_id;
-        ESP_LOGI(TAG, "image RX complete: session=%u", session_id);
+        uint32_t now_ms = smtc_modem_hal_get_time_in_ms();
+        uint32_t prepare_ms = image_rx_start_ms_ - image_cmd_sent_ms_;
+        uint32_t transfer_ms = now_ms - image_rx_start_ms_;
+        uint32_t total_ms = now_ms - image_cmd_sent_ms_;
+        ESP_LOGI(TAG, "image RX complete: session=%u | prepare=%lums transfer=%lums total=%lums",
+                 session_id,
+                 static_cast<unsigned long>(prepare_ms),
+                 static_cast<unsigned long>(transfer_ms),
+                 static_cast<unsigned long>(total_ms));
         schedule_rx();
         if (image_rx_complete_cb_) {
             image_rx_complete_cb_(&image_xfer_);
