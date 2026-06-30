@@ -886,29 +886,26 @@ void RadioPing::trigger_image_capture()
     pkt[12] = 0;
     pkt[13] = 0;
 
-    // ESP_LOGI(TAG, "trigger_image_capture: sending ImageCmd session=%u", session_id);
     image_cmd_sent_ms_ = smtc_modem_hal_get_time_in_ms();
 
-    // Stop RX, send cmd, return to RX
+    // Stop RX
     smtc_modem_hal_protect_api_call();
     if (mode_ == Mode::rx_pending) {
         (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
         (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
         mode_ = Mode::idle;
     }
-    smtc_modem_hal_start_radio_tcxo();
-    smtc_modem_hal_set_ant_switch(true);
-    ral_status_t status = ral_set_dio_irq_params(&radio_.ral, RAL_IRQ_TX_DONE);
-    if (status == RAL_STATUS_OK) status = ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
-    if (status == RAL_STATUS_OK) status = ral_set_pkt_payload(&radio_.ral, pkt, kHeaderSize);
-    if (status == RAL_STATUS_OK) status = ral_set_tx(&radio_.ral);
     smtc_modem_hal_unprotect_api_call();
 
-    if (status == RAL_STATUS_OK) {
-        mode_ = Mode::tx_pending;
-    } else {
-        ESP_LOGW(TAG, "trigger_image_capture TX failed: %d", status);
+    // Blind send 3 times with 30ms interval
+    for (int i = 0; i < 3; i++) {
+        send_single_packet(pkt, kHeaderSize);
+        if (i < 2) {
+            vTaskDelay(pdMS_TO_TICKS(30));
+        }
     }
+
+    schedule_rx();
 }
 
 void RadioPing::send_image(const uint8_t *jpeg, size_t jpeg_len, uint16_t session_id)
