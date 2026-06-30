@@ -222,6 +222,38 @@ esp_err_t CameraUartStreamer::init()
     ESP_RETURN_ON_ERROR(ledc_channel_config(&ledc_ch), TAG, "ledc channel");
     ESP_LOGI(TAG, "MCLK running on GPIO%d at %lu Hz", BSP_SP0A39_MCLK_GPIO, APP_SP0A39_MCLK_HZ);
 
+    // Pre-init sensor at boot so first capture can use the fast path
+    set_pwdn(false);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_err_t ret = reset_sensor();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "sensor pre-init reset failed: %s", esp_err_to_name(ret));
+        set_pwdn(true);
+        initialized_ = true;
+        return ESP_OK;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    ret = sensor_i2c_attach();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "sensor pre-init i2c failed: %s", esp_err_to_name(ret));
+        set_pwdn(true);
+        initialized_ = true;
+        return ESP_OK;
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    ret = sensor_read_id();
+    if (ret == ESP_OK) {
+        ret = sensor_write_regs();
+    }
+    if (ret == ESP_OK) {
+        sensor_configured_ = true;
+        ESP_LOGI(TAG, "sensor pre-initialized at boot");
+    } else {
+        ESP_LOGW(TAG, "sensor pre-init regs failed: %s", esp_err_to_name(ret));
+    }
+
     set_pwdn(true);
     initialized_ = true;
     return ESP_OK;
