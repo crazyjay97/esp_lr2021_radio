@@ -82,17 +82,26 @@ static uint32_t s_rx_start_ms = 0;
 static int16_t s_rx_last_rssi = 0;
 
 /* PAGE_LINK objects */
-static lv_obj_t *s_link_labels[7] = {NULL};
+static lv_obj_t *s_link_labels[6] = {NULL};
 static int16_t s_link_rssi = 0;
 static uint32_t s_link_rate = 0;
 static uint32_t s_link_elapsed_ms = 0;
 static uint32_t s_link_jpeg_size = 0;
 
+/* Transfer stats (updated per transfer) */
+static uint16_t s_stats_total_frags = 0;
+static uint16_t s_stats_first_missing = 0;
+static uint16_t s_stats_total_retransmitted = 0;
+static bool s_stats_first_eot_seen = false;
+
 /* PAGE_CONFIG objects */
-static lv_obj_t *s_cfg_rows[5] = {NULL};
-static lv_obj_t *s_cfg_val_lbls[5] = {NULL};
+static lv_obj_t *s_cfg_rows[6] = {NULL};
+static lv_obj_t *s_cfg_val_lbls[6] = {NULL};
 static lv_obj_t *s_cfg_btns[2] = {NULL};
 static int s_cfg_sel = 0;
+static uint32_t s_pkt_delay_us = APP_IMAGE_TX_INTER_PACKET_US;
+static ui_gw_pkt_delay_cb_t s_pkt_delay_cb = NULL;
+static bool s_cfg_pkt_delay_editing = false;
 
 /* Forward declarations */
 static void create_shared_layout(void);
@@ -234,7 +243,7 @@ static void destroy_body_children(void)
     s_rx_frag_lbl = NULL;
     s_rx_rate_lbl = NULL;
     s_rx_retry_lbl = NULL;
-    memset(s_link_labels, 0, sizeof(s_link_labels));
+    for (int i = 0; i < 6; i++) s_link_labels[i] = NULL;
     memset(s_cfg_rows, 0, sizeof(s_cfg_rows));
     memset(s_cfg_val_lbls, 0, sizeof(s_cfg_val_lbls));
     memset(s_cfg_btns, 0, sizeof(s_cfg_btns));
@@ -390,7 +399,7 @@ static void create_link_page(void)
 {
     lv_obj_t *panel = lv_obj_create(s_body);
     lv_obj_remove_style_all(panel);
-    lv_obj_set_size(panel, 224, 176);
+    lv_obj_set_size(panel, 224, 154);
     lv_obj_set_pos(panel, 8, 8);
     lv_obj_set_style_bg_color(panel, COL_PANEL_BG, 0);
     lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
@@ -404,30 +413,59 @@ static void create_link_page(void)
     lv_obj_set_style_pad_row(panel, 0, 0);
 
     static const char *keys[] = {
-        "Mode", "RSSI", "SNR/LQ", "Rate", "Loss", "Retrans", "Last TX"
-    };
-    static const char *defaults[] = {
-        "FLRC 2.6M", "-- dBm", "--", "-- KB/s", "--%", "--%", "-- s"
+        "Mode", "RSSI", "Rate", "Loss", "Retrans", "Last TX"
     };
 
-    char val[32];
-    for (int i = 0; i < 7; i++) {
-        const char *v = defaults[i];
-        if (i == 1 && s_link_rssi != 0) {
-            snprintf(val, sizeof(val), "%d dBm", s_link_rssi);
-            v = val;
-        } else if (i == 3 && s_link_rate > 0) {
-            snprintf(val, sizeof(val), "%lu.%lu KB/s",
-                     (unsigned long)(s_link_rate / 1024),
-                     (unsigned long)((s_link_rate % 1024) * 10 / 1024));
-            v = val;
-        } else if (i == 6 && s_link_elapsed_ms > 0) {
-            snprintf(val, sizeof(val), "%lu.%lu s",
-                     (unsigned long)(s_link_elapsed_ms / 1000),
-                     (unsigned long)((s_link_elapsed_ms % 1000) / 100));
-            v = val;
-        }
-        create_kv_row(panel, keys[i], v, &s_link_labels[i]);
+    char val_bufs[6][32];
+
+    /* Mode */
+    snprintf(val_bufs[0], sizeof(val_bufs[0]), "FLRC 2.6M");
+
+    /* RSSI */
+    if (s_link_rssi != 0) {
+        snprintf(val_bufs[1], sizeof(val_bufs[1]), "%d dBm", s_link_rssi);
+    } else {
+        snprintf(val_bufs[1], sizeof(val_bufs[1]), "-- dBm");
+    }
+
+    /* Rate */
+    if (s_link_rate > 0) {
+        snprintf(val_bufs[2], sizeof(val_bufs[2]), "%lu.%lu KB/s",
+                 (unsigned long)(s_link_rate / 1024),
+                 (unsigned long)((s_link_rate % 1024) * 10 / 1024));
+    } else {
+        snprintf(val_bufs[2], sizeof(val_bufs[2]), "-- KB/s");
+    }
+
+    /* Loss = first_missing / total * 100% */
+    if (s_stats_total_frags > 0 && s_stats_first_eot_seen) {
+        uint32_t loss_x10 = (uint32_t)s_stats_first_missing * 1000 / s_stats_total_frags;
+        snprintf(val_bufs[3], sizeof(val_bufs[3]), "%lu.%lu%%",
+                 (unsigned long)(loss_x10 / 10), (unsigned long)(loss_x10 % 10));
+    } else {
+        snprintf(val_bufs[3], sizeof(val_bufs[3]), "--%%");
+    }
+
+    /* Retrans = total_retransmitted / total * 100% */
+    if (s_stats_total_frags > 0 && s_stats_first_eot_seen) {
+        uint32_t ret_x10 = (uint32_t)s_stats_total_retransmitted * 1000 / s_stats_total_frags;
+        snprintf(val_bufs[4], sizeof(val_bufs[4]), "%lu.%lu%%",
+                 (unsigned long)(ret_x10 / 10), (unsigned long)(ret_x10 % 10));
+    } else {
+        snprintf(val_bufs[4], sizeof(val_bufs[4]), "--%%");
+    }
+
+    /* Last TX elapsed */
+    if (s_link_elapsed_ms > 0) {
+        snprintf(val_bufs[5], sizeof(val_bufs[5]), "%lu.%lu s",
+                 (unsigned long)(s_link_elapsed_ms / 1000),
+                 (unsigned long)((s_link_elapsed_ms % 1000) / 100));
+    } else {
+        snprintf(val_bufs[5], sizeof(val_bufs[5]), "-- s");
+    }
+
+    for (int i = 0; i < 6; i++) {
+        create_kv_row(panel, keys[i], val_bufs[i], &s_link_labels[i]);
     }
 
     update_title("Link Status", "OK", COL_GREEN);
@@ -439,7 +477,7 @@ static void create_config_page(void)
 {
     lv_obj_t *panel = lv_obj_create(s_body);
     lv_obj_remove_style_all(panel);
-    lv_obj_set_size(panel, 224, 140);
+    lv_obj_set_size(panel, 224, 168);
     lv_obj_set_pos(panel, 8, 8);
     lv_obj_set_style_bg_color(panel, COL_PANEL_BG, 0);
     lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
@@ -452,10 +490,12 @@ static void create_config_page(void)
     lv_obj_set_style_pad_all(panel, 0, 0);
     lv_obj_set_style_pad_row(panel, 0, 0);
 
-    static const char *cfg_keys[] = {"JPEG Quality", "Resolution", "Trigger", "Interval", "Audio"};
-    const char *cfg_vals[] = {"Q=50", "VGA", "Manual", s_interval_labels[s_cfg_interval_idx], "Off"};
+    static const char *cfg_keys[] = {"JPEG Quality", "Resolution", "Trigger", "Interval", "Audio", "Pkt Delay"};
+    char pkt_delay_str[16];
+    snprintf(pkt_delay_str, sizeof(pkt_delay_str), "%luus", (unsigned long)s_pkt_delay_us);
+    const char *cfg_vals[] = {"Q=50", "VGA", "Manual", s_interval_labels[s_cfg_interval_idx], "Off", pkt_delay_str};
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         s_cfg_rows[i] = create_kv_row(panel, cfg_keys[i], cfg_vals[i], &s_cfg_val_lbls[i]);
         if (i == s_cfg_sel) {
             lv_obj_set_style_bg_color(s_cfg_rows[i], COL_GREEN, 0);
@@ -467,7 +507,7 @@ static void create_config_page(void)
     lv_obj_t *btn_row = lv_obj_create(s_body);
     lv_obj_remove_style_all(btn_row);
     lv_obj_set_size(btn_row, 224, 32);
-    lv_obj_set_pos(btn_row, 8, 156);
+    lv_obj_set_pos(btn_row, 8, 184);
     lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_layout(btn_row, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
@@ -489,6 +529,7 @@ static void create_config_page(void)
         s_cfg_btns[i] = btn;
     }
 
+    s_cfg_pkt_delay_editing = false;
     update_title("Config", "CFG", COL_GREEN);
     update_bottom("K6 Back", "K5/K4 Select", "K3 Action");
 }
@@ -538,6 +579,11 @@ void ui_gw_set_interval_cb(ui_gw_interval_cb_t cb)
     s_interval_cb = cb;
 }
 
+void ui_gw_set_pkt_delay_cb(ui_gw_pkt_delay_cb_t cb)
+{
+    s_pkt_delay_cb = cb;
+}
+
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
 {
     if (!pressed) return;
@@ -546,26 +592,62 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
 
     if (s_page == UI_PAGE_CONFIG) {
-        /* Config page has its own key handling */
+        /* Pkt Delay editing mode: K4=10, K5=-10, K3=+1, K6=apply&exit */
+        if (s_cfg_pkt_delay_editing) {
+            if (key == BSP_BTN_VOL_UP) {
+                s_pkt_delay_us += 10;
+            } else if (key == BSP_BTN_USER1) {
+                if (s_pkt_delay_us >= 10) s_pkt_delay_us -= 10;
+                else s_pkt_delay_us = 0;
+            } else if (key == BSP_BTN_VOL_DN) {
+                s_pkt_delay_us += 1;
+            } else if (key == BSP_BTN_PTT) {
+                /* K6 = apply and exit editing */
+                lv_label_set_text(s_status_lbl_r, "Sending...");
+                lv_refr_now(NULL);
+                bool ok = s_pkt_delay_cb ? s_pkt_delay_cb(s_pkt_delay_us) : false;
+                lv_label_set_text(s_status_lbl_r, ok ? "Set OK" : "Set FAIL");
+                s_cfg_pkt_delay_editing = false;
+                update_bottom("K6 Back", "K5/K4 Select", "K3 Action");
+            }
+            if (key != BSP_BTN_PTT && s_cfg_val_lbls[5]) {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%luus", (unsigned long)s_pkt_delay_us);
+                lv_label_set_text(s_cfg_val_lbls[5], buf);
+            }
+            goto done;
+        }
+
+        /* Normal config page navigation */
         if (key == BSP_BTN_VOL_UP) {
             /* K4 = next item */
             if (s_cfg_rows[s_cfg_sel]) {
                 lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_TRANSP, 0);
             }
-            s_cfg_sel = (s_cfg_sel + 1) % 5;
+            s_cfg_sel = (s_cfg_sel + 1) % 6;
             if (s_cfg_rows[s_cfg_sel]) {
                 lv_obj_set_style_bg_color(s_cfg_rows[s_cfg_sel], COL_GREEN, 0);
                 lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_COVER, 0);
+            }
+            if (s_cfg_sel == 5) {
+                update_bottom("K6 Apply", "K5-10/K4+10", "K3+1");
+            } else {
+                update_bottom("K6 Back", "K5/K4 Select", "K3 Action");
             }
         } else if (key == BSP_BTN_USER1) {
             /* K5 = prev item */
             if (s_cfg_rows[s_cfg_sel]) {
                 lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_TRANSP, 0);
             }
-            s_cfg_sel = (s_cfg_sel + 4) % 5;
+            s_cfg_sel = (s_cfg_sel + 5) % 6;
             if (s_cfg_rows[s_cfg_sel]) {
                 lv_obj_set_style_bg_color(s_cfg_rows[s_cfg_sel], COL_GREEN, 0);
                 lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_COVER, 0);
+            }
+            if (s_cfg_sel == 5) {
+                update_bottom("K6 Apply", "K5-10/K4+10", "K3+1");
+            } else {
+                update_bottom("K6 Back", "K5/K4 Select", "K3 Action");
             }
         } else if (key == BSP_BTN_VOL_DN) {
             /* K3 = action on selected row */
@@ -579,11 +661,22 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
                 lv_refr_now(NULL);
                 bool ok = s_interval_cb ? s_interval_cb(s_interval_presets[s_cfg_interval_idx]) : false;
                 lv_label_set_text(s_status_lbl_r, ok ? "Set OK" : "Set FAIL");
+            } else if (s_cfg_sel == 5) {
+                /* Pkt Delay row: enter editing mode */
+                s_cfg_pkt_delay_editing = true;
+                s_pkt_delay_us += 1;
+                if (s_cfg_val_lbls[5]) {
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "%luus", (unsigned long)s_pkt_delay_us);
+                    lv_label_set_text(s_cfg_val_lbls[5], buf);
+                }
+                update_bottom("K6 Apply", "K5-10/K4+10", "K3+1");
             } else if (s_cfg_sel == 0 || s_cfg_sel == 1) {
                 /* Capture button rows — trigger capture */
                 if (s_capture_cb) {
+                    show_page(UI_PAGE_RX);
+                    update_title("Waiting...", "RX", COL_AMBER);
                     s_capture_cb();
-                    lv_label_set_text(s_status_lbl_r, "Requesting...");
                 }
             }
         } else if (key == BSP_BTN_PTT) {
@@ -610,8 +703,9 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
         /* K3 = confirm / capture */
         if (s_page == UI_PAGE_IMAGE) {
             if (s_capture_cb) {
+                show_page(UI_PAGE_RX);
+                update_title("Waiting...", "RX", COL_AMBER);
                 s_capture_cb();
-                lv_label_set_text(s_status_lbl_r, "Requesting...");
             }
         }
     } else if (key == BSP_BTN_PTT) {
@@ -633,6 +727,11 @@ void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags)
     s_rx_total = total_frags;
     s_rx_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_rx_last_rssi = 0;
+
+    s_stats_total_frags = total_frags;
+    s_stats_first_missing = 0;
+    s_stats_total_retransmitted = 0;
+    s_stats_first_eot_seen = false;
 
     if (s_page != UI_PAGE_RX) {
         show_page(UI_PAGE_RX);
@@ -689,11 +788,18 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
     if (!s_lock) return;
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
 
+    /* Compute elapsed from internal timer (ignore parameter if zero) */
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t real_elapsed = (s_rx_start_ms > 0) ? (now_ms - s_rx_start_ms) : elapsed_ms;
+    if (real_elapsed == 0 && elapsed_ms > 0) real_elapsed = elapsed_ms;
+
     s_link_rssi = s_rx_last_rssi;
-    s_link_elapsed_ms = elapsed_ms;
+    s_link_elapsed_ms = real_elapsed;
     s_link_jpeg_size = jpeg_size;
-    if (elapsed_ms > 0) {
-        s_link_rate = jpeg_size * 1000 / elapsed_ms;
+    if (real_elapsed > 0) {
+        s_link_rate = jpeg_size * 1000 / real_elapsed;
+    } else {
+        s_link_rate = 0;
     }
 
     /* Copy image to canvas buffer (swap R↔B for BGR panel) */
@@ -755,5 +861,14 @@ void ui_gw_rx_failed(const char *reason)
     lv_label_set_text(s_status_lbl_r, reason ? reason : "RX Failed");
 
     xSemaphoreGiveRecursive(s_lock);
+}
+
+void ui_gw_rx_eot_nack(uint16_t missing_count, bool is_first_eot)
+{
+    if (is_first_eot) {
+        s_stats_first_missing = missing_count;
+        s_stats_first_eot_seen = true;
+    }
+    s_stats_total_retransmitted += missing_count;
 }
 

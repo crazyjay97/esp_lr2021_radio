@@ -17,6 +17,7 @@
 typedef void (*image_capture_cb_t)(uint16_t session_id);
 typedef void (*image_rx_complete_cb_t)(ImageTransfer *xfer);
 typedef void (*image_rx_progress_cb_t)(uint16_t received, uint16_t total, int16_t rssi);
+typedef void (*image_rx_eot_cb_t)(uint16_t missing_count, bool is_first_eot);
 typedef void (*config_received_cb_t)(uint8_t key, uint32_t value);
 
 class RadioPing {
@@ -35,7 +36,9 @@ public:
     void set_image_capture_cb(image_capture_cb_t cb) { image_capture_cb_ = cb; }
     void set_image_rx_complete_cb(image_rx_complete_cb_t cb) { image_rx_complete_cb_ = cb; }
     void set_image_rx_progress_cb(image_rx_progress_cb_t cb) { image_rx_progress_cb_ = cb; }
+    void set_image_rx_eot_cb(image_rx_eot_cb_t cb) { image_rx_eot_cb_ = cb; }
     void set_config_received_cb(config_received_cb_t cb) { config_received_cb_ = cb; }
+    void set_inter_packet_us(uint32_t us) { image_tx_inter_packet_us_ = us; }
 
     bool send_config(uint8_t key, uint32_t value);
 
@@ -154,14 +157,17 @@ private:
     image_capture_cb_t image_capture_cb_ = nullptr;
     image_rx_complete_cb_t image_rx_complete_cb_ = nullptr;
     image_rx_progress_cb_t image_rx_progress_cb_ = nullptr;
+    image_rx_eot_cb_t image_rx_eot_cb_ = nullptr;
     config_received_cb_t config_received_cb_ = nullptr;
     uint16_t image_session_id_ = 1;
     volatile bool image_tx_active_ = false;
+    uint32_t image_tx_inter_packet_us_ = APP_IMAGE_TX_INTER_PACKET_US;
     uint32_t image_rx_last_frag_ms_ = 0;
     uint32_t image_rx_last_progress_ms_ = 0;
     uint32_t image_rx_expected_crc32_ = 0;
     bool image_rx_pending_ = false;
     uint16_t image_rx_nack_sent_ = 0;
+    uint16_t image_rx_eot_count_ = 0;
     int16_t image_rx_last_rssi_ = 0;
     uint16_t image_rx_done_session_ = 0;
 

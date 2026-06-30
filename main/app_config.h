@@ -195,6 +195,7 @@
 #define APP_AUTO_CAPTURE_DEFAULT_SEC    300U   /* 5 minutes */
 #define APP_AUTO_CAPTURE_MIN_SEC        10U    /* 10 seconds minimum */
 #define APP_CFG_KEY_INTERVAL            0x01
+#define APP_CFG_KEY_INTER_PACKET        0x02
 
 /* ----- Audio ring buffer (pre-capture retrospective recording) ----------- */
 
@@ -208,7 +209,7 @@
 
 #define APP_IMAGE_JPEG_QUALITY          50
 #define APP_IMAGE_FRAGMENT_DATA_SIZE    (APP_FLRC_MAX_PAYLOAD_BYTES - 16U)
-#define APP_IMAGE_TX_INTER_PACKET_MS    0U
+#define APP_IMAGE_TX_INTER_PACKET_US    0U
 #define APP_IMAGE_RX_TIMEOUT_MS         3000U
 #define APP_IMAGE_RX_PROGRESS_INTERVAL_MS 100U
 #define APP_IMAGE_NACK_MAX_RETRIES      30U

@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -1046,8 +1047,8 @@ void RadioPing::image_tx_task()
             if (!send_single_packet(pkt, static_cast<uint16_t>(kHeaderSize + frag_len + 2))) {
                 ESP_LOGW(TAG, "image TX frag %u/%u failed", i, total_fragments);
             }
-            if (APP_IMAGE_TX_INTER_PACKET_MS > 0) {
-                vTaskDelay(ms_to_ticks_min_1(APP_IMAGE_TX_INTER_PACKET_MS));
+            if (image_tx_inter_packet_us_ > 0) {
+                esp_rom_delay_us(image_tx_inter_packet_us_);
             }
         }
 
@@ -1126,8 +1127,8 @@ void RadioPing::image_tx_task()
                     put_u16_le(&pkt[kHeaderSize + frag_len], crc);
 
                     send_single_packet(pkt, static_cast<uint16_t>(kHeaderSize + frag_len + 2));
-                    if (APP_IMAGE_TX_INTER_PACKET_MS > 0) {
-                        vTaskDelay(ms_to_ticks_min_1(APP_IMAGE_TX_INTER_PACKET_MS));
+                    if (image_tx_inter_packet_us_ > 0) {
+                        esp_rom_delay_us(image_tx_inter_packet_us_);
                     }
                 }
                 continue;
@@ -1167,8 +1168,8 @@ void RadioPing::image_tx_task()
                 if (!send_single_packet(pkt, static_cast<uint16_t>(kHeaderSize + frag_len + 2))) {
                     ESP_LOGW(TAG, "image TX retransmit frag %u failed", i);
                 }
-                if (APP_IMAGE_TX_INTER_PACKET_MS > 0) {
-                    vTaskDelay(ms_to_ticks_min_1(APP_IMAGE_TX_INTER_PACKET_MS));
+                if (image_tx_inter_packet_us_ > 0) {
+                    esp_rom_delay_us(image_tx_inter_packet_us_);
                 }
             }
         }
@@ -1250,6 +1251,7 @@ void RadioPing::handle_image_start()
     image_xfer_.rx_begin(session_id, total_frags);
     image_rx_pending_ = true;
     image_rx_nack_sent_ = 0;
+    image_rx_eot_count_ = 0;
     image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
     image_rx_last_progress_ms_ = 0;
     image_rx_expected_crc32_ = expected_crc32;
@@ -1417,6 +1419,12 @@ void RadioPing::handle_image_eot()
     uint16_t pkt_len = static_cast<uint16_t>(kHeaderSize + missing_count * 2);
     send_single_packet(pkt, pkt_len);
 
+    if (image_rx_eot_cb_) {
+        bool is_first = (image_rx_eot_count_ == 0);
+        image_rx_eot_count_++;
+        image_rx_eot_cb_(missing_count, is_first);
+    }
+
     if (missing_count == 0) {
         image_rx_pending_ = false;
         image_rx_done_session_ = session_id;
@@ -1427,6 +1435,16 @@ void RadioPing::handle_image_eot()
         }
     } else {
         ESP_LOGW(TAG, "image RX: sent ACK with %u missing, waiting for retransmit", missing_count);
+        if (image_rx_eot_count_ == 1) {
+            for (uint16_t i = 0; i < missing_count; i += 16) {
+                char line[128];
+                int pos = 0;
+                for (uint16_t j = i; j < missing_count && j < i + 16; j++) {
+                    pos += snprintf(line + pos, sizeof(line) - pos, "%u ", missing_indices[j]);
+                }
+                ESP_LOGW(TAG, "  missing: %s", line);
+            }
+        }
         image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
         schedule_rx();
     }

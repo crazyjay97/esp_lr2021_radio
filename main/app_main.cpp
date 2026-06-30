@@ -234,6 +234,12 @@ void on_config_received(uint8_t key, uint32_t value)
         start_auto_capture_timer();
         update_camera_timer_status();
         ESP_LOGI(TAG, "config: interval=%lus", static_cast<unsigned long>(value));
+    } else if (key == APP_CFG_KEY_INTER_PACKET) {
+        g_radio.set_inter_packet_us(value);
+        ESP_LOGI(TAG, "config: inter_packet=%luus", static_cast<unsigned long>(value));
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%luus", static_cast<unsigned long>(value));
+        bsp_lcd_set_camera_status(buf);
     }
 }
 
@@ -326,15 +332,13 @@ void image_capture_task(void *arg)
              static_cast<unsigned long>(pixfmt),
              static_cast<unsigned>(len));
 
-    esp_err_t lcd_e = bsp_lcd_reinit_after_camera();
-    if (lcd_e != ESP_OK) {
-        ESP_LOGE(TAG, "lcd reinit after image capture: %s", esp_err_to_name(lcd_e));
-    }
-#if APP_AUDIO_FEATURES_ENABLE
-    bsp_audio_resume();
-#endif
+    // LCD reinit and audio resume deferred until after transmission
 
     if (capture_e != ESP_OK || !frame) {
+        bsp_lcd_reinit_after_camera();
+#if APP_AUDIO_FEATURES_ENABLE
+        bsp_audio_resume();
+#endif
         bsp_lcd_set_camera_status("Capture failed");
         heap_caps_free(pcm_snap);
         g_radio.resume_audio_capture();
@@ -350,6 +354,10 @@ void image_capture_task(void *arg)
     heap_caps_free(frame);
 
     if (e != ESP_OK || !jpeg) {
+        bsp_lcd_reinit_after_camera();
+#if APP_AUDIO_FEATURES_ENABLE
+        bsp_audio_resume();
+#endif
         bsp_lcd_set_camera_status("JPEG encode failed");
         heap_caps_free(pcm_snap);
         g_radio.resume_audio_capture();
@@ -394,6 +402,11 @@ void image_capture_task(void *arg)
         ESP_LOGE(TAG, "blob alloc failed: %u bytes", static_cast<unsigned>(blob_len));
         heap_caps_free(jpeg);
         heap_caps_free(opus_buf);
+        bsp_lcd_reinit_after_camera();
+#if APP_AUDIO_FEATURES_ENABLE
+        bsp_audio_resume();
+#endif
+        bsp_lcd_set_camera_status("Alloc failed");
         g_radio.resume_audio_capture();
         g_capture_busy = false;
         vTaskDelete(nullptr);
@@ -411,11 +424,9 @@ void image_capture_task(void *arg)
     heap_caps_free(jpeg);
     heap_caps_free(opus_buf);
 
-    char status[48];
     uint16_t total_frags = static_cast<uint16_t>(
         (blob_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) / APP_IMAGE_FRAGMENT_DATA_SIZE);
-    snprintf(status, sizeof(status), "Sending %u pkts...", total_frags);
-    bsp_lcd_set_camera_status(status);
+    ESP_LOGI(TAG, "sending %u pkts, blob %u bytes", total_frags, static_cast<unsigned>(blob_len));
 
     uint16_t tx_session = session_id | APP_AUDIO_SESSION_FLAG;
     g_radio.send_image(blob, blob_len, tx_session);
@@ -429,6 +440,19 @@ void image_capture_task(void *arg)
     }
 
     heap_caps_free(blob);
+
+    // Reinit LCD now that transmission is done
+    esp_err_t lcd_e = bsp_lcd_reinit_after_camera();
+    if (lcd_e != ESP_OK) {
+        ESP_LOGE(TAG, "lcd reinit after tx: %s", esp_err_to_name(lcd_e));
+    }
+#if APP_AUDIO_FEATURES_ENABLE
+    bsp_audio_resume();
+#endif
+    char status[48];
+    snprintf(status, sizeof(status), "Done %u pkts", total_frags);
+    bsp_lcd_set_camera_status(status);
+
     g_radio.resume_audio_capture();
     g_capture_busy = false;
     vTaskDelete(nullptr);
@@ -718,6 +742,13 @@ void on_image_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
     }
 }
 
+void on_image_rx_eot_nack(uint16_t missing_count, bool is_first_eot)
+{
+    if (g_app_mode == AppMode::radio) {
+        ui_gw_rx_eot_nack(missing_count, is_first_eot);
+    }
+}
+
 // Gateway UI capture callback — triggers remote photo via radio
 void on_gw_capture(void)
 {
@@ -730,6 +761,12 @@ bool on_gw_interval_change(uint32_t interval_sec)
 {
     ESP_LOGI(TAG, "UI interval change: %lus", static_cast<unsigned long>(interval_sec));
     return g_radio.send_config(APP_CFG_KEY_INTERVAL, interval_sec);
+}
+
+bool on_gw_pkt_delay_change(uint32_t us)
+{
+    ESP_LOGI(TAG, "UI pkt delay change: %luus", static_cast<unsigned long>(us));
+    return g_radio.send_config(APP_CFG_KEY_INTER_PACKET, us);
 }
 
 void on_button(bsp_btn_id_t id, bool pressed, void *user)
@@ -881,6 +918,7 @@ extern "C" void app_main(void)
             g_radio.set_image_capture_cb(on_image_capture_request);
             g_radio.set_image_rx_complete_cb(on_image_rx_complete);
             g_radio.set_image_rx_progress_cb(on_image_rx_progress);
+            g_radio.set_image_rx_eot_cb(on_image_rx_eot_nack);
             g_radio.set_config_received_cb(on_config_received);
         }
         if (g_app_mode == AppMode::radio && radio_ok) {
@@ -926,6 +964,7 @@ extern "C" void app_main(void)
         } else {
             ui_gw_set_capture_cb(on_gw_capture);
             ui_gw_set_interval_cb(on_gw_interval_change);
+            ui_gw_set_pkt_delay_cb(on_gw_pkt_delay_change);
         }
     } else if ((e = bsp_lcd_start_camera_ui(on_lcd_capture, nullptr)) != ESP_OK) {
         ESP_LOGE(TAG, "camera ui start: %s", esp_err_to_name(e));
