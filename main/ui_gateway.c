@@ -3,6 +3,7 @@
 #include "lvgl.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_imgfx_scale.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -823,20 +824,36 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
         s_link_rate = 0;
     }
 
-    /* Copy image to canvas buffer (swap R↔B for BGR panel) */
+    /* Scale image using esp_image_effects bilinear filter (RGB565→BGR565 for panel) */
     if (s_img_canvas_buf && rgb565 && w > 0 && h > 0) {
-        for (uint32_t y = 0; y < IMG_H; y++) {
-            uint32_t src_y = (y * h) / IMG_H;
-            const uint16_t *src = rgb565 + src_y * w;
-            lv_color_t *dst = s_img_canvas_buf + y * IMG_W;
-            for (uint32_t x = 0; x < IMG_W; x++) {
-                uint32_t src_x = (x * w) / IMG_W;
-                uint16_t px = src[src_x];
-                uint16_t r = (px >> 11) & 0x1F;
-                uint16_t g = (px >> 5) & 0x3F;
-                uint16_t b = px & 0x1F;
-                dst[x].full = (b << 11) | (g << 5) | r;
+        esp_imgfx_scale_cfg_t scale_cfg = {
+            .in_res = { .width = (int16_t)w, .height = (int16_t)h },
+            .in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB565_LE,
+            .scale_res = { .width = IMG_W, .height = IMG_H },
+            .filter_type = ESP_IMGFX_SCALE_FILTER_TYPE_BILINEAR,
+        };
+        esp_imgfx_scale_handle_t scaler = NULL;
+        esp_imgfx_err_t ret = esp_imgfx_scale_open(&scale_cfg, &scaler);
+        if (ret == ESP_IMGFX_ERR_OK && scaler) {
+            uint32_t out_size = IMG_W * IMG_H * 2;
+            uint8_t *scale_buf = heap_caps_malloc(out_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (scale_buf) {
+                esp_imgfx_data_t in_img = { .data = (uint8_t *)rgb565, .data_len = w * h * 2 };
+                esp_imgfx_data_t out_img = { .data = scale_buf, .data_len = out_size };
+                ret = esp_imgfx_scale_process(scaler, &in_img, &out_img);
+                if (ret == ESP_IMGFX_ERR_OK) {
+                    const uint16_t *scaled = (const uint16_t *)scale_buf;
+                    for (uint32_t i = 0; i < IMG_W * IMG_H; i++) {
+                        uint16_t px = scaled[i];
+                        uint16_t r = (px >> 11) & 0x1F;
+                        uint16_t g = (px >> 5) & 0x3F;
+                        uint16_t b = px & 0x1F;
+                        s_img_canvas_buf[i].full = (b << 11) | (g << 5) | r;
+                    }
+                }
+                heap_caps_free(scale_buf);
             }
+            esp_imgfx_scale_close(scaler);
         }
         s_has_image = true;
     }

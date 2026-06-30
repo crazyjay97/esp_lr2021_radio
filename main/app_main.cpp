@@ -597,11 +597,9 @@ void on_image_rx_complete(ImageTransfer *xfer)
                  static_cast<unsigned>(jpeg_len), static_cast<unsigned>(opus_len));
     }
 
-    // Decode and display JPEG
+    // Decode and display JPEG (full resolution, scale down in UI)
     jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
     dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
-    dec_cfg.scale.width = 240;
-    dec_cfg.scale.height = 176;
 
     jpeg_dec_handle_t decoder = nullptr;
     jpeg_error_t jerr = jpeg_dec_open(&dec_cfg, &decoder);
@@ -613,14 +611,14 @@ void on_image_rx_complete(ImageTransfer *xfer)
         jpeg_dec_header_info_t header = {};
         jerr = jpeg_dec_parse_header(decoder, &io, &header);
         if (jerr == JPEG_ERR_OK) {
-            int outbuf_len = dec_cfg.scale.width * dec_cfg.scale.height * 2;
+            int outbuf_len = header.width * header.height * 2;
             uint8_t *rgb565 = static_cast<uint8_t *>(jpeg_calloc_align(outbuf_len, 16));
             if (rgb565) {
                 io.outbuf = rgb565;
                 jerr = jpeg_dec_process(decoder, &io);
                 if (jerr == JPEG_ERR_OK) {
-                    uint32_t w = dec_cfg.scale.width;
-                    uint32_t h = dec_cfg.scale.height;
+                    uint32_t w = header.width;
+                    uint32_t h = header.height;
                     if (g_app_mode == AppMode::radio) {
                         ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565), w, h,
                                           static_cast<uint32_t>(jpeg_len), g_radio.last_transfer_ms());

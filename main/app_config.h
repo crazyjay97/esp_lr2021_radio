@@ -209,7 +209,7 @@
 
 /* ----- Image transfer over FLRC ------------------------------------------ */
 
-#define APP_IMAGE_JPEG_QUALITY          75
+#define APP_IMAGE_JPEG_QUALITY          90
 #define APP_IMAGE_FRAGMENT_DATA_SIZE    (APP_FLRC_MAX_PAYLOAD_BYTES - 16U)
 #define APP_IMAGE_TX_INTER_PACKET_US    0U
 #define APP_IMAGE_RX_TIMEOUT_MS         3000U

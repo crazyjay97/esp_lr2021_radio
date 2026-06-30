@@ -795,8 +795,10 @@ bool RadioPing::read_mono_frame(int16_t *mono, size_t samples)
         esp_err_t err = bsp_audio_read(reinterpret_cast<uint8_t *>(stereo) + got_total,
                                        target - got_total, &got);
         if (err != ESP_OK || got == 0) {
-            ESP_LOGW(TAG, "audio read failed: %s got=%u",
-                     esp_err_to_name(err), static_cast<unsigned>(got));
+            if (!image_tx_active_) {
+                //ESP_LOGW(TAG, "audio read failed: %s got=%u",
+                         //esp_err_to_name(err), static_cast<unsigned>(got));
+            }
             return false;
         }
         got_total += got;
