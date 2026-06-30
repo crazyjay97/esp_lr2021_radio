@@ -772,8 +772,9 @@ void on_lcd_capture(void *user)
 void on_image_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
 {
     if (g_app_mode == AppMode::radio) {
-        if (received <= 1) {
+        if (received == 0) {
             ui_gw_rx_begin(0, total);
+            return;
         }
         ui_gw_rx_progress(received, total, rssi);
     }

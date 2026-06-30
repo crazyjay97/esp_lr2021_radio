@@ -758,6 +758,15 @@ void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags)
     snprintf(title, sizeof(title), "Receiving #%03u", session_id);
     update_title(title, "RX", COL_AMBER);
 
+    // Show total frag count and force flush this label only
+    if (s_rx_frag_lbl) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "0 / %u", total_frags);
+        lv_label_set_text(s_rx_frag_lbl, buf);
+        lv_obj_invalidate(s_rx_frag_lbl);
+        lv_refr_now(NULL);
+    }
+
     xSemaphoreGiveRecursive(s_lock);
 }
 

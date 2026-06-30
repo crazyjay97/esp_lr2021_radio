@@ -1255,8 +1255,14 @@ void RadioPing::handle_image_start()
     image_rx_nack_sent_ = 0;
     image_rx_eot_count_ = 0;
     image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
-    image_rx_last_progress_ms_ = 0;
+    image_rx_last_progress_ms_ = smtc_modem_hal_get_time_in_ms();
     image_rx_expected_crc32_ = expected_crc32;
+
+    // Update UI first (before sending ACK), so LVGL work finishes
+    // before node starts blasting data
+    if (image_rx_progress_cb_) {
+        image_rx_progress_cb_(0, total_frags, 0);
+    }
 
     // Send ACK (ready) — missing_count=0 means "ready"
     uint8_t pkt[kHeaderSize];
@@ -1271,10 +1277,6 @@ void RadioPing::handle_image_start()
 
     // Enter RX for incoming data
     schedule_rx();
-
-    if (image_rx_progress_cb_) {
-        image_rx_progress_cb_(0, total_frags, 0);
-    }
 }
 
 void RadioPing::handle_image_data()
@@ -1307,16 +1309,6 @@ void RadioPing::handle_image_data()
     image_rx_pending_ = true;
     if (frag_index == 0) {
         image_rx_nack_sent_ = 0;
-    }
-
-    uint32_t now = smtc_modem_hal_get_time_in_ms();
-    bool report_progress =
-        image_xfer_.rx_complete() ||
-        image_rx_last_progress_ms_ == 0 ||
-        now - image_rx_last_progress_ms_ >= APP_IMAGE_RX_PROGRESS_INTERVAL_MS;
-    if (report_progress && image_rx_progress_cb_) {
-        image_rx_last_progress_ms_ = now;
-        image_rx_progress_cb_(image_xfer_.rx_received_count(), total_frags, image_rx_last_rssi_);
     }
 }
 
@@ -1382,6 +1374,13 @@ void RadioPing::handle_image_eot()
         (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
         smtc_modem_hal_unprotect_api_call();
         mode_ = Mode::idle;
+    }
+
+    // Update UI before sending NACK — node won't retransmit until it
+    // receives our reply, so LVGL work here won't cause packet loss
+    if (image_rx_progress_cb_) {
+        uint16_t total = image_xfer_.rx_total_count();
+        image_rx_progress_cb_(image_xfer_.rx_received_count(), total, image_rx_last_rssi_);
     }
 
     // Build ACK with missing indices
