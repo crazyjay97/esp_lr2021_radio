@@ -805,8 +805,13 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
         if (prev == UI_PAGE_RX) prev = UI_PAGE_IMAGE;
         show_page((ui_page_t)prev);
     } else if (key == BSP_BTN_VOL_DN) {
-        /* K3 = confirm / capture */
-        if (s_page == UI_PAGE_IMAGE) {
+        /* K3 = confirm / capture / retry */
+        if (s_page == UI_PAGE_RX) {
+            if (s_capture_cb) {
+                update_title("Waiting...", "RX", COL_AMBER);
+                s_capture_cb();
+            }
+        } else if (s_page == UI_PAGE_IMAGE) {
             if (s_capture_cb) {
                 show_page(UI_PAGE_RX);
                 update_title("Waiting...", "RX", COL_AMBER);
