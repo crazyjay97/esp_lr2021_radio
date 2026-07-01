@@ -1028,6 +1028,7 @@ extern "C" void app_main(void)
     esp_timer_create(&ptt_timer_args, &g_ptt_timer);
 
     g_audio.play_startup_chime();
+    bsp_audio_set_volume(100);
 
     ESP_LOGI(TAG, "audio config: %u Hz local record/playback",
              APP_AUDIO_SAMPLE_RATE_HZ);

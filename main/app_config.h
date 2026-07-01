@@ -201,10 +201,10 @@
 
 /* ----- Audio ring buffer (pre-capture retrospective recording) ----------- */
 
-#define APP_AUDIO_RINGBUF_SECONDS       3U
+#define APP_AUDIO_RINGBUF_SECONDS       5U
 #define APP_AUDIO_RINGBUF_SAMPLES       (APP_AUDIO_SAMPLE_RATE_HZ * APP_AUDIO_RINGBUF_SECONDS)
 #define APP_AUDIO_RINGBUF_BYTES         (APP_AUDIO_RINGBUF_SAMPLES * 2U)
-#define APP_AUDIO_CLIP_MAX_OPUS_BYTES   12000U
+#define APP_AUDIO_CLIP_MAX_OPUS_BYTES   20000U
 #define APP_AUDIO_SESSION_FLAG          0x8000U
 
 /* ----- Image transfer over FLRC ------------------------------------------ */
