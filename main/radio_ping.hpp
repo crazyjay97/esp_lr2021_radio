@@ -13,6 +13,7 @@
 #include "audio_processor.hpp"
 #include "image_transfer.hpp"
 #include "audio_ringbuf.hpp"
+#include "opus_ringbuf.hpp"
 
 typedef void (*image_capture_cb_t)(uint16_t session_id);
 typedef void (*image_rx_complete_cb_t)(ImageTransfer *xfer);
@@ -50,6 +51,7 @@ public:
 
     // Audio ring buffer for pre-capture retrospective recording
     size_t snapshot_audio(int16_t *out, size_t max_samples);
+    size_t snapshot_opus(uint8_t *out, size_t max_bytes);
 
 private:
     enum class Mode {
@@ -124,6 +126,8 @@ private:
     AudioProcessor audio_proc_;
     ImageTransfer image_xfer_;
     AudioRingBuf audio_ringbuf_;
+    OpusRingBuf opus_ringbuf_;
+    OpusCodec clip_encoder_;
     QueueHandle_t voice_queue_ = nullptr;
     QueueHandle_t tx_queue_ = nullptr;
     QueueHandle_t image_tx_queue_ = nullptr;

@@ -297,18 +297,16 @@ void image_capture_task(void *arg)
 
     bsp_lcd_set_camera_status("Remote capture...");
 
-    // Snapshot ring buffer before pausing I2S
-    int16_t *pcm_snap = static_cast<int16_t *>(
-        heap_caps_malloc(APP_AUDIO_RINGBUF_BYTES, MALLOC_CAP_SPIRAM));
-    size_t snap_samples = 0;
-    if (pcm_snap) {
-        snap_samples = g_radio.snapshot_audio(pcm_snap, APP_AUDIO_RINGBUF_SAMPLES);
-        if (snap_samples < APP_AUDIO_RINGBUF_SAMPLES) {
-            std::memset(&pcm_snap[snap_samples], 0,
-                        (APP_AUDIO_RINGBUF_SAMPLES - snap_samples) * sizeof(int16_t));
-            snap_samples = APP_AUDIO_RINGBUF_SAMPLES;
+    // Snapshot pre-encoded Opus ring buffer before pausing audio
+    uint8_t *opus_buf = nullptr;
+    size_t opus_len = 0;
+    if (g_audio_clip_enabled) {
+        opus_buf = static_cast<uint8_t *>(
+            heap_caps_malloc(APP_AUDIO_CLIP_MAX_OPUS_BYTES, MALLOC_CAP_SPIRAM));
+        if (opus_buf) {
+            opus_len = g_radio.snapshot_opus(opus_buf, APP_AUDIO_CLIP_MAX_OPUS_BYTES);
+            ESP_LOGI(TAG, "opus snapshot: %u bytes", static_cast<unsigned>(opus_len));
         }
-        ESP_LOGI(TAG, "audio snapshot: %u samples", static_cast<unsigned>(snap_samples));
     }
 
 #if APP_AUDIO_FEATURES_ENABLE
@@ -329,7 +327,7 @@ void image_capture_task(void *arg)
         bsp_audio_resume();
         g_radio.resume_audio_capture();
 #endif
-        heap_caps_free(pcm_snap);
+        heap_caps_free(opus_buf);
         g_capture_busy = false;
         vTaskDelete(nullptr);
         return;
@@ -356,7 +354,7 @@ void image_capture_task(void *arg)
         bsp_audio_resume();
 #endif
         bsp_lcd_set_camera_status("Capture failed");
-        heap_caps_free(pcm_snap);
+        heap_caps_free(opus_buf);
         g_radio.resume_audio_capture();
         g_capture_busy = false;
         vTaskDelete(nullptr);
@@ -381,7 +379,7 @@ void image_capture_task(void *arg)
         bsp_audio_resume();
 #endif
         bsp_lcd_set_camera_status("JPEG encode failed");
-        heap_caps_free(pcm_snap);
+        heap_caps_free(opus_buf);
         g_radio.resume_audio_capture();
         g_capture_busy = false;
         vTaskDelete(nullptr);
@@ -408,35 +406,8 @@ void image_capture_task(void *arg)
     ESP_LOGI(TAG, "[TIMING] JPEG TX done +%lums",
              static_cast<unsigned long>(t_jpeg_tx_done - t_cmd));
 
-    // --- Step 2: Opus encode (after JPEG transfer complete) ---
-    size_t opus_len = 0;
-    uint8_t *opus_buf = nullptr;
-    uint32_t t_opus_start = static_cast<uint32_t>(esp_log_timestamp());
-    if (g_audio_clip_enabled && pcm_snap && snap_samples >= APP_AUDIO_FRAME_SAMPLES) {
-        opus_buf = static_cast<uint8_t *>(
-            heap_caps_malloc(APP_AUDIO_CLIP_MAX_OPUS_BYTES, MALLOC_CAP_SPIRAM));
-        if (opus_buf) {
-            OpusCodec clip_codec;
-            if (clip_codec.init() == ESP_OK) {
-                size_t num_frames = snap_samples / APP_AUDIO_FRAME_SAMPLES;
-                for (size_t i = 0; i < num_frames; i++) {
-                    const int16_t *pcm_frame = &pcm_snap[i * APP_AUDIO_FRAME_SAMPLES];
-                    uint8_t enc_buf[APP_OPUS_MAX_PACKET_BYTES];
-                    int enc_len = clip_codec.encode(pcm_frame, APP_AUDIO_FRAME_SAMPLES,
-                                                   enc_buf, APP_OPUS_MAX_PACKET_BYTES);
-                    if (enc_len <= 0 || enc_len > 255) continue;
-                    if (opus_len + 1 + enc_len > APP_AUDIO_CLIP_MAX_OPUS_BYTES) break;
-                    opus_buf[opus_len++] = static_cast<uint8_t>(enc_len);
-                    memcpy(&opus_buf[opus_len], enc_buf, enc_len);
-                    opus_len += enc_len;
-                }
-            }
-        }
-    }
-    heap_caps_free(pcm_snap);
-    uint32_t t_opus_done = static_cast<uint32_t>(esp_log_timestamp());
-    ESP_LOGI(TAG, "[TIMING] Opus encode %lums, %u bytes",
-             static_cast<unsigned long>(t_opus_done - t_opus_start),
+    // --- Step 2: Send pre-encoded Opus (already snapshot at start) ---
+    ESP_LOGI(TAG, "[TIMING] Opus pre-encoded, %u bytes ready",
              static_cast<unsigned>(opus_len));
 
     // --- Step 3: Send Opus as second transfer (with audio flag) ---
@@ -459,12 +430,11 @@ void image_capture_task(void *arg)
     heap_caps_free(opus_buf);
 
     uint32_t t_all_done = static_cast<uint32_t>(esp_log_timestamp());
-    ESP_LOGI(TAG, "[TIMING] total +%lums | img_prep=%lu img_tx=%lu opus_enc=%lu audio_tx=%lums",
+    ESP_LOGI(TAG, "[TIMING] total +%lums | img_prep=%lu img_tx=%lu audio_tx=%lums",
              static_cast<unsigned long>(t_all_done - t_cmd),
              static_cast<unsigned long>(t_jpeg_done - t_cmd),
              static_cast<unsigned long>(t_jpeg_tx_done - t_jpeg_done),
-             static_cast<unsigned long>(t_opus_done - t_jpeg_tx_done),
-             static_cast<unsigned long>(t_all_done - t_opus_done));
+             static_cast<unsigned long>(t_all_done - t_jpeg_tx_done));
 
     // Reinit LCD now that transmission is done
     esp_err_t lcd_e = bsp_lcd_reinit_after_camera();

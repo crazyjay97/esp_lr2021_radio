@@ -127,6 +127,14 @@ esp_err_t RadioPing::init()
         ESP_LOGW(TAG, "audio ring buffer alloc failed (PSRAM?)");
     }
 
+    size_t opus_ring_frames = APP_AUDIO_RINGBUF_SECONDS * 1000 / APP_AUDIO_FRAME_MS;
+    if (!opus_ringbuf_.init(opus_ring_frames)) {
+        ESP_LOGW(TAG, "opus ring buffer alloc failed (PSRAM?)");
+    }
+    if (clip_encoder_.init() != ESP_OK) {
+        ESP_LOGW(TAG, "clip encoder init failed");
+    }
+
 #if !APP_RADIO_HW_INIT_ENABLE
     ESP_LOGW(TAG, "LR2021 hardware init disabled for camera isolation");
     return ESP_OK;
@@ -317,6 +325,13 @@ void RadioPing::tx_task()
         }
 
         audio_ringbuf_.write(tx_pcm_, APP_AUDIO_FRAME_SAMPLES);
+
+        uint8_t enc_buf[APP_OPUS_MAX_PACKET_BYTES];
+        int enc_len = clip_encoder_.encode(tx_pcm_, APP_AUDIO_FRAME_SAMPLES,
+                                           enc_buf, APP_OPUS_MAX_PACKET_BYTES);
+        if (enc_len > 0 && enc_len <= 255) {
+            opus_ringbuf_.write(enc_buf, static_cast<uint8_t>(enc_len));
+        }
     }
 }
 
@@ -1603,4 +1618,9 @@ void RadioPing::send_config_ack(uint8_t key, uint32_t value)
 size_t RadioPing::snapshot_audio(int16_t *out, size_t max_samples)
 {
     return audio_ringbuf_.snapshot(out, max_samples);
+}
+
+size_t RadioPing::snapshot_opus(uint8_t *out, size_t max_bytes)
+{
+    return opus_ringbuf_.snapshot(out, max_bytes);
 }
