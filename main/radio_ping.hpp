@@ -48,6 +48,7 @@ public:
     bool image_tx_busy() const { return image_tx_active_; }
     void pause_audio_capture() { image_tx_active_ = true; }
     void resume_audio_capture() { image_tx_active_ = false; }
+    void enable_opus_preenc(bool en) { opus_preenc_enabled_ = en; }
 
     // Audio ring buffer for pre-capture retrospective recording
     size_t snapshot_audio(int16_t *out, size_t max_samples);
@@ -127,7 +128,6 @@ private:
     ImageTransfer image_xfer_;
     AudioRingBuf audio_ringbuf_;
     OpusRingBuf opus_ringbuf_;
-    OpusCodec clip_encoder_;
     QueueHandle_t voice_queue_ = nullptr;
     QueueHandle_t tx_queue_ = nullptr;
     QueueHandle_t image_tx_queue_ = nullptr;
@@ -166,6 +166,7 @@ private:
     config_received_cb_t config_received_cb_ = nullptr;
     uint16_t image_session_id_ = 1;
     volatile bool image_tx_active_ = false;
+    bool opus_preenc_enabled_ = false;
     uint32_t image_tx_inter_packet_us_ = APP_IMAGE_TX_INTER_PACKET_US;
     uint32_t image_rx_last_frag_ms_ = 0;
     uint32_t image_rx_last_progress_ms_ = 0;

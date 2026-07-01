@@ -949,6 +949,7 @@ extern "C" void app_main(void)
             if ((e = g_radio.start()) != ESP_OK) {
                 ESP_LOGE(TAG, "radio task start (camera mode): %s", esp_err_to_name(e));
             }
+            g_radio.enable_opus_preenc(true);
             ESP_LOGI(TAG, "camera mode: radio initialized for image transfer");
             // Start auto-capture timer
             g_capture_interval_sec = load_capture_interval();
