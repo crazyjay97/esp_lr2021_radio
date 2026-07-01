@@ -389,7 +389,7 @@ static void create_rx_page(void)
     lv_obj_set_style_pad_row(panel, 0, 0);
 
     create_kv_row(panel, "Packets", "0 / 0", &s_rx_frag_lbl);
-    create_kv_row(panel, "Rate", "-- KB/s", &s_rx_rate_lbl);
+    create_kv_row(panel, "Rate", "-- kbps", &s_rx_rate_lbl);
     create_kv_row(panel, "Elapsed", "00:00.0", &s_rx_retry_lbl);
     create_kv_row(panel, "RSSI", "-- dBm", NULL);
 
@@ -435,11 +435,10 @@ static void create_link_page(void)
 
     /* Rate */
     if (s_link_rate > 0) {
-        snprintf(val_bufs[2], sizeof(val_bufs[2]), "%lu.%lu KB/s",
-                 (unsigned long)(s_link_rate / 1024),
-                 (unsigned long)((s_link_rate % 1024) * 10 / 1024));
+        snprintf(val_bufs[2], sizeof(val_bufs[2]), "%lu kbps",
+                 (unsigned long)(s_link_rate / 1000));
     } else {
-        snprintf(val_bufs[2], sizeof(val_bufs[2]), "-- KB/s");
+        snprintf(val_bufs[2], sizeof(val_bufs[2]), "-- kbps");
     }
 
     /* Loss = first_missing / total * 100% */
@@ -807,10 +806,8 @@ void ui_gw_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
     uint32_t elapsed_ms = (uint32_t)(esp_timer_get_time() / 1000) - s_rx_start_ms;
     if (elapsed_ms > 0 && received > 0) {
         uint32_t bytes = (uint32_t)received * APP_IMAGE_FRAGMENT_DATA_SIZE;
-        uint32_t rate_bps = bytes * 1000 / elapsed_ms;
-        snprintf(buf, sizeof(buf), "%lu.%lu KB/s",
-                 (unsigned long)(rate_bps / 1024),
-                 (unsigned long)((rate_bps % 1024) * 10 / 1024));
+        uint32_t rate_kbps = (uint32_t)((uint64_t)bytes * 8000 / elapsed_ms / 1000);
+        snprintf(buf, sizeof(buf), "%lu kbps", (unsigned long)rate_kbps);
         if (s_rx_rate_lbl) lv_label_set_text(s_rx_rate_lbl, buf);
     }
 
@@ -836,7 +833,7 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
     s_link_elapsed_ms = elapsed_ms;
     s_link_jpeg_size = jpeg_size;
     if (elapsed_ms > 0) {
-        s_link_rate = jpeg_size * 1000 / elapsed_ms;
+        s_link_rate = (uint32_t)((uint64_t)jpeg_size * 8000 / elapsed_ms);
     } else {
         s_link_rate = 0;
     }
