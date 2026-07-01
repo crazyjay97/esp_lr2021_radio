@@ -297,7 +297,12 @@ void image_capture_task(void *arg)
 
     bsp_lcd_set_camera_status("Remote capture...");
 
-    // Snapshot pre-encoded Opus ring buffer before pausing audio
+#if APP_AUDIO_FEATURES_ENABLE
+    g_radio.pause_audio_capture();
+    vTaskDelay(pdMS_TO_TICKS(APP_AUDIO_FRAME_MS + 5));
+#endif
+
+    // Snapshot pre-encoded Opus ring buffer (tx_task already stopped, no race)
     uint8_t *opus_buf = nullptr;
     size_t opus_len = 0;
     if (g_audio_clip_enabled) {
@@ -310,8 +315,6 @@ void image_capture_task(void *arg)
     }
 
 #if APP_AUDIO_FEATURES_ENABLE
-    g_radio.pause_audio_capture();
-    vTaskDelay(pdMS_TO_TICKS(APP_AUDIO_FRAME_MS + 5));
     esp_err_t audio_e = bsp_audio_suspend();
     if (audio_e != ESP_OK) {
         ESP_LOGW(TAG, "audio suspend for image capture: %s", esp_err_to_name(audio_e));
