@@ -386,12 +386,51 @@ void image_capture_task(void *arg)
         return;
     }
 
-    // --- Step 1: Send JPEG (no audio flag) ---
-    uint16_t total_frags = static_cast<uint16_t>(
-        (jpeg_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) / APP_IMAGE_FRAGMENT_DATA_SIZE);
-    ESP_LOGI(TAG, "sending JPEG: %u pkts, %u bytes", total_frags, static_cast<unsigned>(jpeg_len));
+    // --- Build blob: [4-byte jpeg_len][jpeg][opus] and send once ---
+    bool has_opus = (opus_buf && opus_len > 0);
+    uint8_t *blob;
+    size_t blob_len;
 
-    g_radio.send_image(jpeg, jpeg_len, session_id);
+    if (has_opus) {
+        blob_len = 4 + jpeg_len + opus_len;
+        blob = static_cast<uint8_t *>(
+            heap_caps_malloc(blob_len, MALLOC_CAP_SPIRAM));
+        if (!blob) {
+            ESP_LOGE(TAG, "blob alloc failed: %u bytes", static_cast<unsigned>(blob_len));
+            heap_caps_free(jpeg);
+            heap_caps_free(opus_buf);
+            bsp_lcd_reinit_after_camera();
+#if APP_AUDIO_FEATURES_ENABLE
+            bsp_audio_resume();
+#endif
+            bsp_lcd_set_camera_status("Alloc failed");
+            g_radio.resume_audio_capture();
+            g_capture_busy = false;
+            vTaskDelete(nullptr);
+            return;
+        }
+        blob[0] = static_cast<uint8_t>(jpeg_len);
+        blob[1] = static_cast<uint8_t>(jpeg_len >> 8);
+        blob[2] = static_cast<uint8_t>(jpeg_len >> 16);
+        blob[3] = static_cast<uint8_t>(jpeg_len >> 24);
+        memcpy(&blob[4], jpeg, jpeg_len);
+        memcpy(&blob[4 + jpeg_len], opus_buf, opus_len);
+    } else {
+        blob_len = jpeg_len;
+        blob = jpeg;
+        jpeg = nullptr;
+    }
+    heap_caps_free(jpeg);
+    heap_caps_free(opus_buf);
+
+    uint16_t total_frags = static_cast<uint16_t>(
+        (blob_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) / APP_IMAGE_FRAGMENT_DATA_SIZE);
+    uint16_t tx_session = has_opus ? (session_id | APP_AUDIO_SESSION_FLAG) : session_id;
+    ESP_LOGI(TAG, "sending blob: %u pkts, %u bytes (jpeg=%u opus=%u)",
+             total_frags, static_cast<unsigned>(blob_len),
+             static_cast<unsigned>(jpeg_len), static_cast<unsigned>(opus_len));
+
+    g_radio.send_image(blob, blob_len, tx_session);
 
     uint32_t wait_start = xTaskGetTickCount();
     while (xTaskGetTickCount() - wait_start < pdMS_TO_TICKS(30000)) {
@@ -400,41 +439,13 @@ void image_capture_task(void *arg)
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    heap_caps_free(jpeg);
+    heap_caps_free(blob);
 
-    uint32_t t_jpeg_tx_done = static_cast<uint32_t>(esp_log_timestamp());
-    ESP_LOGI(TAG, "[TIMING] JPEG TX done +%lums",
-             static_cast<unsigned long>(t_jpeg_tx_done - t_cmd));
-
-    // --- Step 2: Send pre-encoded Opus (already snapshot at start) ---
-    ESP_LOGI(TAG, "[TIMING] Opus pre-encoded, %u bytes ready",
-             static_cast<unsigned>(opus_len));
-
-    // --- Step 3: Send Opus as second transfer (with audio flag) ---
-    if (opus_buf && opus_len > 0) {
-        uint16_t audio_session = session_id | APP_AUDIO_SESSION_FLAG;
-        uint16_t audio_frags = static_cast<uint16_t>(
-            (opus_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) / APP_IMAGE_FRAGMENT_DATA_SIZE);
-        ESP_LOGI(TAG, "sending audio: %u pkts, %u bytes", audio_frags, static_cast<unsigned>(opus_len));
-
-        g_radio.send_image(opus_buf, opus_len, audio_session);
-
-        wait_start = xTaskGetTickCount();
-        while (xTaskGetTickCount() - wait_start < pdMS_TO_TICKS(30000)) {
-            if (!g_radio.image_tx_busy()) {
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-    }
-    heap_caps_free(opus_buf);
-
-    uint32_t t_all_done = static_cast<uint32_t>(esp_log_timestamp());
-    ESP_LOGI(TAG, "[TIMING] total +%lums | img_prep=%lu img_tx=%lu audio_tx=%lums",
-             static_cast<unsigned long>(t_all_done - t_cmd),
+    uint32_t t_tx_done = static_cast<uint32_t>(esp_log_timestamp());
+    ESP_LOGI(TAG, "[TIMING] total +%lums | img_prep=%lu tx=%lums",
+             static_cast<unsigned long>(t_tx_done - t_cmd),
              static_cast<unsigned long>(t_jpeg_done - t_cmd),
-             static_cast<unsigned long>(t_jpeg_tx_done - t_jpeg_done),
-             static_cast<unsigned long>(t_all_done - t_jpeg_tx_done));
+             static_cast<unsigned long>(t_tx_done - t_jpeg_done));
 
     // Reinit LCD now that transmission is done
     esp_err_t lcd_e = bsp_lcd_reinit_after_camera();
@@ -523,7 +534,7 @@ void on_image_rx_complete(ImageTransfer *xfer)
     if (!xfer || !xfer->rx_complete()) return;
 
     uint16_t sid = xfer->rx_session_id();
-    bool is_audio = (sid & APP_AUDIO_SESSION_FLAG) != 0;
+    bool has_audio = (sid & APP_AUDIO_SESSION_FLAG) != 0;
 
     // Reassemble the received data
     uint8_t *raw = nullptr;
@@ -535,48 +546,67 @@ void on_image_rx_complete(ImageTransfer *xfer)
         return;
     }
 
-    if (is_audio) {
-        // Pure Opus audio transfer
-        ESP_LOGI(TAG, "audio transfer received: %u bytes", static_cast<unsigned>(raw_len));
-        play_audio_clip(raw, raw_len);
-    } else {
-        // Pure JPEG image transfer
-        ESP_LOGI(TAG, "image transfer received: %u bytes", static_cast<unsigned>(raw_len));
+    const uint8_t *jpeg_data = raw;
+    size_t jpeg_len = raw_len;
+    const uint8_t *opus_data = nullptr;
+    size_t opus_len = 0;
 
-        jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
-        dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
-
-        jpeg_dec_handle_t decoder = nullptr;
-        jpeg_error_t jerr = jpeg_dec_open(&dec_cfg, &decoder);
-        if (jerr == JPEG_ERR_OK && decoder) {
-            jpeg_dec_io_t io = {};
-            io.inbuf = const_cast<unsigned char *>(raw);
-            io.inbuf_len = static_cast<int>(raw_len);
-
-            jpeg_dec_header_info_t header = {};
-            jerr = jpeg_dec_parse_header(decoder, &io, &header);
-            if (jerr == JPEG_ERR_OK) {
-                int outbuf_len = header.width * header.height * 2;
-                uint8_t *rgb565 = static_cast<uint8_t *>(jpeg_calloc_align(outbuf_len, 16));
-                if (rgb565) {
-                    io.outbuf = rgb565;
-                    jerr = jpeg_dec_process(decoder, &io);
-                    if (jerr == JPEG_ERR_OK) {
-                        uint32_t w = header.width;
-                        uint32_t h = header.height;
-                        if (g_app_mode == AppMode::radio) {
-                            ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565), w, h,
-                                              static_cast<uint32_t>(raw_len), g_radio.last_transfer_ms());
-                        } else {
-                            bsp_lcd_show_rgb565_photo(reinterpret_cast<const uint16_t *>(rgb565), w, h);
-                            bsp_lcd_set_camera_status("Photo received");
-                        }
-                    }
-                    jpeg_free_align(rgb565);
-                }
-            }
-            jpeg_dec_close(decoder);
+    if (has_audio && raw_len > 4) {
+        uint32_t jlen = static_cast<uint32_t>(raw[0])
+                      | (static_cast<uint32_t>(raw[1]) << 8)
+                      | (static_cast<uint32_t>(raw[2]) << 16)
+                      | (static_cast<uint32_t>(raw[3]) << 24);
+        if (jlen <= raw_len - 4) {
+            jpeg_data = &raw[4];
+            jpeg_len = jlen;
+            opus_data = &raw[4 + jlen];
+            opus_len = raw_len - 4 - jlen;
         }
+    }
+    ESP_LOGI(TAG, "transfer received: %u bytes (jpeg=%u opus=%u)",
+             static_cast<unsigned>(raw_len),
+             static_cast<unsigned>(jpeg_len),
+             static_cast<unsigned>(opus_len));
+
+    // Decode and display JPEG
+    jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
+    dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
+
+    jpeg_dec_handle_t decoder = nullptr;
+    jpeg_error_t jerr = jpeg_dec_open(&dec_cfg, &decoder);
+    if (jerr == JPEG_ERR_OK && decoder) {
+        jpeg_dec_io_t io = {};
+        io.inbuf = const_cast<unsigned char *>(jpeg_data);
+        io.inbuf_len = static_cast<int>(jpeg_len);
+
+        jpeg_dec_header_info_t header = {};
+        jerr = jpeg_dec_parse_header(decoder, &io, &header);
+        if (jerr == JPEG_ERR_OK) {
+            int outbuf_len = header.width * header.height * 2;
+            uint8_t *rgb565 = static_cast<uint8_t *>(jpeg_calloc_align(outbuf_len, 16));
+            if (rgb565) {
+                io.outbuf = rgb565;
+                jerr = jpeg_dec_process(decoder, &io);
+                if (jerr == JPEG_ERR_OK) {
+                    uint32_t w = header.width;
+                    uint32_t h = header.height;
+                    if (g_app_mode == AppMode::radio) {
+                        ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565), w, h,
+                                          static_cast<uint32_t>(jpeg_len), g_radio.last_transfer_ms());
+                    } else {
+                        bsp_lcd_show_rgb565_photo(reinterpret_cast<const uint16_t *>(rgb565), w, h);
+                        bsp_lcd_set_camera_status("Photo received");
+                    }
+                }
+                jpeg_free_align(rgb565);
+            }
+        }
+        jpeg_dec_close(decoder);
+    }
+
+    // Play audio if present
+    if (opus_data && opus_len > 0) {
+        play_audio_clip(opus_data, opus_len);
     }
 
     heap_caps_free(raw);
