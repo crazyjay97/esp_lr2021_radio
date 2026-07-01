@@ -182,7 +182,7 @@ bool ImageTransfer::rx_fragment(uint16_t session_id, uint16_t frag_index,
         for (uint16_t i = 0; i < rx_total_; i++) {
             rx_jpeg_size_ += rx_frag_lens_[i];
         }
-        ESP_LOGI(TAG, "rx complete: session=%u jpeg_size=%u",
+        ESP_LOGI(TAG, "rx complete: session=%u size=%u",
                  rx_session_id_, static_cast<unsigned>(rx_jpeg_size_));
         return true;
     }

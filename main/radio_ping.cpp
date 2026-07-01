@@ -1248,6 +1248,12 @@ void RadioPing::handle_image_start()
     //          session_id, total_frags, static_cast<unsigned long>(expected_crc32));
     image_rx_start_ms_ = smtc_modem_hal_get_time_in_ms();
 
+    if (session_id & APP_AUDIO_SESSION_FLAG) {
+        uint32_t opus_prepare_ms = image_rx_start_ms_ - image_rx_done_ms_;
+        ESP_LOGI(TAG, "audio RX start: opus_prepare=%lums",
+                 static_cast<unsigned long>(opus_prepare_ms));
+    }
+
     // Prepare RX buffer
     image_xfer_.rx_begin(session_id, total_frags);
     image_rx_pending_ = true;
@@ -1258,8 +1264,8 @@ void RadioPing::handle_image_start()
     image_rx_expected_crc32_ = expected_crc32;
 
     // Update UI first (before sending ACK), so LVGL work finishes
-    // before node starts blasting data
-    if (image_rx_progress_cb_) {
+    // before node starts blasting data — skip for audio transfers
+    if (image_rx_progress_cb_ && !(session_id & APP_AUDIO_SESSION_FLAG)) {
         image_rx_progress_cb_(0, total_frags, 0);
     }
 
@@ -1377,7 +1383,8 @@ void RadioPing::handle_image_eot()
 
     // Update UI before sending NACK — node won't retransmit until it
     // receives our reply, so LVGL work here won't cause packet loss
-    if (image_rx_progress_cb_) {
+    // Skip for audio transfers to keep image displayed
+    if (image_rx_progress_cb_ && !(session_id & APP_AUDIO_SESSION_FLAG)) {
         uint16_t total = image_xfer_.rx_total_count();
         image_rx_progress_cb_(image_xfer_.rx_received_count(), total, image_rx_last_rssi_);
     }
@@ -1430,15 +1437,21 @@ void RadioPing::handle_image_eot()
         image_rx_pending_ = false;
         image_rx_done_session_ = session_id;
         uint32_t now_ms = smtc_modem_hal_get_time_in_ms();
-        uint32_t prepare_ms = image_rx_start_ms_ - image_cmd_sent_ms_;
         uint32_t transfer_ms = now_ms - image_rx_start_ms_;
-        uint32_t total_ms = now_ms - image_cmd_sent_ms_;
         image_rx_transfer_ms_ = transfer_ms;
-        ESP_LOGI(TAG, "image RX complete: session=%u | prepare=%lums transfer=%lums total=%lums",
-                 session_id,
-                 static_cast<unsigned long>(prepare_ms),
-                 static_cast<unsigned long>(transfer_ms),
-                 static_cast<unsigned long>(total_ms));
+        image_rx_done_ms_ = now_ms;
+        if (session_id & APP_AUDIO_SESSION_FLAG) {
+            ESP_LOGI(TAG, "audio RX complete: session=%u | transfer=%lums",
+                     session_id, static_cast<unsigned long>(transfer_ms));
+        } else {
+            uint32_t prepare_ms = image_rx_start_ms_ - image_cmd_sent_ms_;
+            uint32_t total_ms = now_ms - image_cmd_sent_ms_;
+            ESP_LOGI(TAG, "image RX complete: session=%u | prepare=%lums transfer=%lums total=%lums",
+                     session_id,
+                     static_cast<unsigned long>(prepare_ms),
+                     static_cast<unsigned long>(transfer_ms),
+                     static_cast<unsigned long>(total_ms));
+        }
         if (image_rx_complete_cb_) {
             image_rx_complete_cb_(&image_xfer_);
         }

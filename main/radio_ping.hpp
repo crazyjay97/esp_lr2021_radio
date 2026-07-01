@@ -174,6 +174,7 @@ private:
     uint32_t image_cmd_sent_ms_ = 0;
     uint32_t image_rx_start_ms_ = 0;
     uint32_t image_rx_transfer_ms_ = 0;
+    uint32_t image_rx_done_ms_ = 0;
 
     // NACK receive state for TX side (A)
     volatile bool image_nack_received_ = false;
