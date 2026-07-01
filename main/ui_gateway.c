@@ -6,6 +6,8 @@
 #include "esp_timer.h"
 #include "esp_imgfx_scale.h"
 #include "esp_heap_caps.h"
+#include "qrcodegen.h"
+#include "wifi_manager.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <stdio.h>
@@ -105,6 +107,15 @@ static int s_cfg_sel = 0;
 static int s_volume_level = 13; /* 0~15, default 13 → 130% */
 static ui_gw_audio_clip_cb_t s_audio_clip_cb = NULL;
 static bool s_audio_clip_on = false;
+static ui_gw_wifi_prov_cb_t s_wifi_prov_cb = NULL;
+
+/* PAGE_CONFIG WiFi status panel */
+static lv_obj_t *s_cfg_wifi_lbl = NULL;
+
+/* PAGE_QR objects */
+static lv_obj_t *s_qr_canvas = NULL;
+static lv_color_t *s_qr_canvas_buf = NULL;
+static char s_qr_payload[128] = {0};
 
 /* Forward declarations */
 static void create_shared_layout(void);
@@ -113,6 +124,7 @@ static void create_image_page(void);
 static void create_rx_page(void);
 static void create_link_page(void);
 static void create_config_page(void);
+static void create_qr_page(void);
 static void destroy_body_children(void);
 static void update_title(const char *text, const char *chip, lv_color_t chip_bg);
 static void update_bottom(const char *l, const char *m, const char *r);
@@ -259,6 +271,8 @@ static void destroy_body_children(void)
     memset(s_cfg_val_lbls, 0, sizeof(s_cfg_val_lbls));
     memset(s_cfg_touch_btns, 0, sizeof(s_cfg_touch_btns));
     memset(s_cfg_touch_lbls, 0, sizeof(s_cfg_touch_lbls));
+    s_cfg_wifi_lbl = NULL;
+    s_qr_canvas = NULL;
 }
 
 /* PLACEHOLDER_PAGES */
@@ -475,6 +489,13 @@ static void create_link_page(void)
     update_bottom("K6 Back", "K5/K4 Page", "");
 }
 
+/* ─── WiFi provision button clicked callback ─── */
+static void cfg_wifi_btn_clicked_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_wifi_prov_cb) s_wifi_prov_cb();
+}
+
 /* ─── Touch button clicked callback ─── */
 static void cfg_btn_clicked_cb(lv_event_t *e)
 {
@@ -612,11 +633,106 @@ static void create_config_page(void)
         s_cfg_touch_lbls[i] = lbl;
     }
 
+    /* WiFi status button below buttons */
+    lv_obj_t *wifi_btn = lv_btn_create(s_body);
+    lv_obj_set_size(wifi_btn, 224, 36);
+    lv_obj_set_pos(wifi_btn, 8, 236);
+    lv_obj_set_style_radius(wifi_btn, 6, 0);
+    lv_obj_set_style_bg_color(wifi_btn, COL_GREEN, 0);
+    lv_obj_set_style_bg_opa(wifi_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(wifi_btn, 0, 0);
+    lv_obj_add_event_cb(wifi_btn, cfg_wifi_btn_clicked_cb, LV_EVENT_CLICKED, NULL);
+
+    s_cfg_wifi_lbl = lv_label_create(wifi_btn);
+    lv_obj_set_style_text_font(s_cfg_wifi_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_cfg_wifi_lbl, lv_color_white(), 0);
+    lv_label_set_text(s_cfg_wifi_lbl, "CONNECT WIFI");
+    lv_obj_center(s_cfg_wifi_lbl);
+
+    lv_obj_add_flag(s_body, LV_OBJ_FLAG_SCROLLABLE);
+
     update_title("Config", "CFG", COL_GREEN);
     update_bottom("K6 Back", "K5/K4 Select", "K3 Action");
 }
 
 /* PLACEHOLDER_SHOW_PAGE */
+
+/* ─── PAGE: QR Code ─── */
+static void create_qr_page(void)
+{
+    lv_obj_add_flag(s_status_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_title_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(s_body, 0, 0);
+    lv_obj_set_size(s_body, SCR_W, SCR_H - BOTTOM_H);
+    lv_obj_set_style_bg_color(s_body, lv_color_white(), 0);
+
+    #define QR_CANVAS_SIZE 200
+    if (!s_qr_canvas_buf) {
+        s_qr_canvas_buf = heap_caps_malloc(QR_CANVAS_SIZE * QR_CANVAS_SIZE * sizeof(lv_color_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_qr_canvas_buf) {
+            s_qr_canvas_buf = heap_caps_malloc(QR_CANVAS_SIZE * QR_CANVAS_SIZE * sizeof(lv_color_t),
+                                               MALLOC_CAP_8BIT);
+        }
+    }
+
+    if (s_qr_canvas_buf && s_qr_payload[0]) {
+        for (int i = 0; i < QR_CANVAS_SIZE * QR_CANVAS_SIZE; i++)
+            s_qr_canvas_buf[i] = lv_color_white();
+
+        uint8_t qr_buf[qrcodegen_BUFFER_LEN_FOR_VERSION(6)];
+        uint8_t tmp_buf[qrcodegen_BUFFER_LEN_FOR_VERSION(6)];
+        bool ok = qrcodegen_encodeText(s_qr_payload, tmp_buf, qr_buf,
+            qrcodegen_Ecc_LOW, 1, 6, qrcodegen_Mask_AUTO, true);
+        if (ok) {
+            int qr_size = qrcodegen_getSize(qr_buf);
+            int scale = QR_CANVAS_SIZE / (qr_size + 4);
+            if (scale < 1) scale = 1;
+            int offset = (QR_CANVAS_SIZE - qr_size * scale) / 2;
+            for (int y = 0; y < qr_size; y++) {
+                for (int x = 0; x < qr_size; x++) {
+                    if (qrcodegen_getModule(qr_buf, x, y)) {
+                        for (int dy = 0; dy < scale; dy++) {
+                            for (int dx = 0; dx < scale; dx++) {
+                                int px = offset + x * scale + dx;
+                                int py = offset + y * scale + dy;
+                                if (px < QR_CANVAS_SIZE && py < QR_CANVAS_SIZE)
+                                    s_qr_canvas_buf[py * QR_CANVAS_SIZE + px] = lv_color_black();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        s_qr_canvas = lv_canvas_create(s_body);
+        lv_canvas_set_buffer(s_qr_canvas, s_qr_canvas_buf, QR_CANVAS_SIZE, QR_CANVAS_SIZE,
+                             LV_IMG_CF_TRUE_COLOR);
+        lv_obj_align(s_qr_canvas, LV_ALIGN_TOP_MID, 0, 10);
+    } else {
+        lv_obj_t *lbl = lv_label_create(s_body);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(lbl, COL_MUTED, 0);
+        lv_label_set_text(lbl, "QR generation failed");
+        lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+    }
+
+    lv_obj_t *hint = lv_label_create(s_body);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(hint, COL_MUTED, 0);
+    lv_label_set_text(hint, "Scan QR or connect manually:");
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -56);
+
+    lv_obj_t *info_lbl = lv_label_create(s_body);
+    lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(info_lbl, COL_TEXT_MAIN, 0);
+    lv_label_set_text_fmt(info_lbl, "AP: %s\nPW: %s\nIP: 192.168.4.1:80",
+        wifi_mgr_get_service_name(), wifi_mgr_get_ap_password());
+    lv_obj_set_style_text_line_space(info_lbl, 2, 0);
+    lv_obj_align(info_lbl, LV_ALIGN_BOTTOM_MID, 0, -16);
+
+    update_bottom("K6 Cancel", "", "Provisioning...");
+}
 
 /* ─── Page switch ─── */
 static void show_page(ui_page_t page)
@@ -629,6 +745,7 @@ static void show_page(ui_page_t page)
     case UI_PAGE_RX:     create_rx_page();     break;
     case UI_PAGE_LINK:   create_link_page();   break;
     case UI_PAGE_CONFIG: create_config_page(); break;
+    case UI_PAGE_QR:     create_qr_page();     break;
     default: break;
     }
 }
@@ -639,7 +756,7 @@ static const ui_page_t s_swipe_order[] = {UI_PAGE_IMAGE, UI_PAGE_LINK, UI_PAGE_C
 
 static void gesture_cb(lv_event_t *e)
 {
-    if (s_page == UI_PAGE_RX) return;
+    if (s_page == UI_PAGE_RX || s_page == UI_PAGE_QR) return;
 
     lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_get_act());
     if (dir != LV_DIR_LEFT && dir != LV_DIR_RIGHT) return;
@@ -701,6 +818,13 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
     if (!s_lock) return;
 
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+
+    if (s_page == UI_PAGE_QR) {
+        if (key == BSP_BTN_PTT) {
+            show_page(UI_PAGE_CONFIG);
+        }
+        goto done;
+    }
 
     if (s_page == UI_PAGE_CONFIG) {
         /* Normal config page navigation */
@@ -978,3 +1102,55 @@ void ui_gw_rx_eot_nack(uint16_t missing_count, bool is_first_eot)
     s_stats_total_retransmitted += missing_count;
 }
 
+void ui_gw_set_wifi_prov_cb(ui_gw_wifi_prov_cb_t cb)
+{
+    s_wifi_prov_cb = cb;
+}
+
+void ui_gw_wifi_update(const char *state_str, const char *ssid, int8_t rssi)
+{
+    if (!s_lock) return;
+    xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+
+    if (s_cfg_wifi_lbl && s_page == UI_PAGE_CONFIG) {
+        char buf[64];
+        if (ssid && ssid[0]) {
+            snprintf(buf, sizeof(buf), "WiFi: %s (%d dBm)", ssid, rssi);
+        } else {
+            snprintf(buf, sizeof(buf), "WiFi: %s", state_str ? state_str : "Disconnected");
+        }
+        lv_label_set_text(s_cfg_wifi_lbl, buf);
+    }
+
+    if (s_page == UI_PAGE_QR && state_str) {
+        if (strcmp(state_str, "Connected") == 0) {
+            show_page(UI_PAGE_CONFIG);
+        }
+    }
+
+    xSemaphoreGiveRecursive(s_lock);
+}
+
+void ui_gw_show_qr(const char *payload)
+{
+    if (!s_lock) return;
+    xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+
+    strncpy(s_qr_payload, payload, sizeof(s_qr_payload) - 1);
+    s_qr_payload[sizeof(s_qr_payload) - 1] = '\0';
+    show_page(UI_PAGE_QR);
+
+    xSemaphoreGiveRecursive(s_lock);
+}
+
+void ui_gw_hide_qr(void)
+{
+    if (!s_lock) return;
+    xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+
+    if (s_page == UI_PAGE_QR) {
+        show_page(UI_PAGE_CONFIG);
+    }
+
+    xSemaphoreGiveRecursive(s_lock);
+}

@@ -4,6 +4,7 @@
 #include "radio_ping.hpp"
 #include "opus_codec.hpp"
 #include "ui_gateway.h"
+#include "wifi_manager.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -779,6 +780,35 @@ bool on_gw_audio_clip_change(uint32_t enable)
     return g_radio.send_config(APP_CFG_KEY_AUDIO_CLIP, enable);
 }
 
+void on_wifi_prov_request(void)
+{
+    ESP_LOGI(TAG, "WiFi provisioning requested");
+    esp_err_t err = wifi_mgr_start_provisioning();
+    if (err == ESP_OK) {
+        const char *name = wifi_mgr_get_service_name();
+        const char *pass = wifi_mgr_get_ap_password();
+        char payload[150];
+        snprintf(payload, sizeof(payload),
+            "{\"ver\":\"v1\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"softap\"}",
+            name, pass);
+        ui_gw_show_qr(payload);
+    } else {
+        ESP_LOGE(TAG, "start provisioning failed: %s", esp_err_to_name(err));
+    }
+}
+
+void on_wifi_state_change(wifi_mgr_state_t state)
+{
+    const char *str = "Disconnected";
+    switch (state) {
+    case WIFI_MGR_CONNECTING:    str = "Connecting..."; break;
+    case WIFI_MGR_CONNECTED:     str = "Connected"; break;
+    case WIFI_MGR_PROVISIONING:  str = "Provisioning..."; break;
+    default: break;
+    }
+    ui_gw_wifi_update(str, wifi_mgr_get_ssid(), wifi_mgr_get_rssi());
+}
+
 void on_button(bsp_btn_id_t id, bool pressed, void *user)
 {
     (void)user;
@@ -976,6 +1006,10 @@ extern "C" void app_main(void)
             ui_gw_set_capture_cb(on_gw_capture);
             ui_gw_set_interval_cb(on_gw_interval_change);
             ui_gw_set_audio_clip_cb(on_gw_audio_clip_change);
+            ui_gw_set_wifi_prov_cb(on_wifi_prov_request);
+
+            wifi_mgr_set_state_cb(on_wifi_state_change);
+            wifi_mgr_init();
         }
     } else if ((e = bsp_lcd_start_camera_ui(on_lcd_capture, nullptr)) != ESP_OK) {
         ESP_LOGE(TAG, "camera ui start: %s", esp_err_to_name(e));

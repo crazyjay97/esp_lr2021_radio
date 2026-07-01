@@ -7,6 +7,8 @@ idf_component_register(SRCS
                            "opus_codec.cpp"
                            "radio_ping.cpp"
                            "ui_gateway.c"
+                           "wifi_manager.c"
+                           "qrcodegen.c"
                            "bsp_con6.c"
                            "bsp_i2c.c"
                            "bsp_lcd.c"
@@ -27,4 +29,9 @@ idf_component_register(SRCS
                            esp_adc
                            nvs_flash
                            lvgl
-                           espressif__esp_new_jpeg)
+                           espressif__esp_new_jpeg
+                           esp_wifi
+                           esp_netif
+                           wifi_provisioning
+                           protocomm
+                           esp_http_server)

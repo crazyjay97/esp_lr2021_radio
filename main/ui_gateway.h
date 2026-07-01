@@ -14,12 +14,14 @@ typedef enum {
     UI_PAGE_RX,
     UI_PAGE_LINK,
     UI_PAGE_CONFIG,
+    UI_PAGE_QR,
     UI_PAGE_COUNT
 } ui_page_t;
 
 typedef void (*ui_gw_capture_cb_t)(void);
 typedef bool (*ui_gw_interval_cb_t)(uint32_t interval_sec);
 typedef bool (*ui_gw_audio_clip_cb_t)(uint32_t enable);
+typedef void (*ui_gw_wifi_prov_cb_t)(void);
 
 esp_err_t ui_gw_init(void);
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed);
@@ -35,6 +37,11 @@ void ui_gw_rx_eot_nack(uint16_t missing_count, bool is_first_eot);
 void ui_gw_set_capture_cb(ui_gw_capture_cb_t cb);
 void ui_gw_set_interval_cb(ui_gw_interval_cb_t cb);
 void ui_gw_set_audio_clip_cb(ui_gw_audio_clip_cb_t cb);
+void ui_gw_set_wifi_prov_cb(ui_gw_wifi_prov_cb_t cb);
+
+void ui_gw_wifi_update(const char *state_str, const char *ssid, int8_t rssi);
+void ui_gw_show_qr(const char *payload);
+void ui_gw_hide_qr(void);
 
 #ifdef __cplusplus
 }
