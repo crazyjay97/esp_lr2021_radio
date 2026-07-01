@@ -5,11 +5,13 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_event.h"
+#include "esp_http_server.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "wifi_provisioning/manager.h"
 #include "wifi_provisioning/scheme_softap.h"
 #include <string.h>
+#include <stdio.h>
 
 static const char *TAG = "wifi_mgr";
 
@@ -26,6 +28,7 @@ static int8_t s_rssi = 0;
 static esp_netif_t *s_sta_netif = NULL;
 static esp_netif_t *s_ap_netif = NULL;
 static bool s_wifi_started = false;
+static httpd_handle_t s_httpd = NULL;
 
 static void set_state(wifi_mgr_state_t st)
 {
@@ -88,9 +91,6 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         }
     } else if (base == WIFI_EVENT) {
         switch (id) {
-        case WIFI_EVENT_STA_START:
-            esp_wifi_connect();
-            break;
         case WIFI_EVENT_STA_CONNECTED: {
             wifi_event_sta_connected_t *ev = (wifi_event_sta_connected_t *)data;
             memset(s_ssid, 0, sizeof(s_ssid));
@@ -100,12 +100,22 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
             break;
         }
         case WIFI_EVENT_STA_DISCONNECTED:
-            ESP_LOGI(TAG, "STA disconnected");
-            if (s_state != WIFI_MGR_PROVISIONING) {
+            if (s_state == WIFI_MGR_CONNECTING || s_state == WIFI_MGR_CONNECTED) {
+                ESP_LOGI(TAG, "STA disconnected, reconnecting...");
                 set_state(WIFI_MGR_DISCONNECTED);
                 esp_wifi_connect();
             }
             break;
+        case WIFI_EVENT_AP_STACONNECTED: {
+            wifi_event_ap_staconnected_t *ev = (wifi_event_ap_staconnected_t *)data;
+            ESP_LOGI(TAG, "AP: station " MACSTR " join, AID=%d", MAC2STR(ev->mac), ev->aid);
+            break;
+        }
+        case WIFI_EVENT_AP_STADISCONNECTED: {
+            wifi_event_ap_stadisconnected_t *ev = (wifi_event_ap_stadisconnected_t *)data;
+            ESP_LOGI(TAG, "AP: station " MACSTR " leave, AID=%d", MAC2STR(ev->mac), ev->aid);
+            break;
+        }
         default:
             break;
         }
@@ -133,6 +143,162 @@ static void generate_service_name(void)
     snprintf(s_ap_password, sizeof(s_ap_password), "AM36%02X%02X%01X",
              mac[0], mac[1], mac[2] >> 4);
 }
+
+/* ---- Web config page ---- */
+
+static const char CONFIG_PAGE[] =
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>AM36 WiFi Setup</title>"
+    "<style>"
+    "body{font-family:sans-serif;max-width:320px;margin:40px auto;padding:0 16px}"
+    "h2{text-align:center}"
+    "input,button{width:100%;padding:10px;margin:6px 0;box-sizing:border-box;font-size:16px}"
+    "button{background:#4CAF50;color:#fff;border:none;border-radius:4px;cursor:pointer}"
+    ".msg{text-align:center;color:#333;margin-top:16px}"
+    "</style></head><body>"
+    "<h2>AM36 WiFi Config</h2>"
+    "<form action='/connect' method='post'>"
+    "<label>SSID</label><input name='ssid' required maxlength='32'>"
+    "<label>Password</label><input name='pass' type='password' maxlength='64'>"
+    "<button type='submit'>Connect</button>"
+    "</form>"
+    "<div class='msg'>Enter your home WiFi credentials</div>"
+    "</body></html>";
+
+static const char CONNECT_OK_PAGE[] =
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Connecting...</title>"
+    "<style>body{font-family:sans-serif;max-width:320px;margin:40px auto;padding:0 16px;text-align:center}</style>"
+    "</head><body>"
+    "<h2>Connecting...</h2>"
+    "<p>Device is connecting to your WiFi network. This page will become unreachable.</p>"
+    "</body></html>";
+
+static esp_err_t root_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, CONFIG_PAGE, sizeof(CONFIG_PAGE) - 1);
+    return ESP_OK;
+}
+
+static int url_decode_char(const char *src)
+{
+    int hi = 0, lo = 0;
+    if (src[0] >= '0' && src[0] <= '9') hi = src[0] - '0';
+    else if (src[0] >= 'A' && src[0] <= 'F') hi = src[0] - 'A' + 10;
+    else if (src[0] >= 'a' && src[0] <= 'f') hi = src[0] - 'a' + 10;
+    else return -1;
+    if (src[1] >= '0' && src[1] <= '9') lo = src[1] - '0';
+    else if (src[1] >= 'A' && src[1] <= 'F') lo = src[1] - 'A' + 10;
+    else if (src[1] >= 'a' && src[1] <= 'f') lo = src[1] - 'a' + 10;
+    else return -1;
+    return (hi << 4) | lo;
+}
+
+static size_t url_decode(char *dst, size_t dst_len, const char *src)
+{
+    size_t di = 0;
+    while (*src && di < dst_len - 1) {
+        if (*src == '%' && src[1] && src[2]) {
+            int c = url_decode_char(src + 1);
+            if (c >= 0) { dst[di++] = (char)c; src += 3; continue; }
+        }
+        if (*src == '+') { dst[di++] = ' '; src++; continue; }
+        dst[di++] = *src++;
+    }
+    dst[di] = '\0';
+    return di;
+}
+
+static bool parse_form_field(const char *body, const char *key, char *out, size_t out_len)
+{
+    size_t klen = strlen(key);
+    const char *p = body;
+    while ((p = strstr(p, key)) != NULL) {
+        if (p == body || *(p - 1) == '&') {
+            if (p[klen] == '=') {
+                p += klen + 1;
+                const char *end = strchr(p, '&');
+                size_t vlen = end ? (size_t)(end - p) : strlen(p);
+                char encoded[128];
+                if (vlen >= sizeof(encoded)) vlen = sizeof(encoded) - 1;
+                memcpy(encoded, p, vlen);
+                encoded[vlen] = '\0';
+                url_decode(out, out_len, encoded);
+                return true;
+            }
+        }
+        p += klen;
+    }
+    return false;
+}
+
+static esp_err_t connect_post_handler(httpd_req_t *req)
+{
+    char body[256] = {0};
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No body");
+        return ESP_FAIL;
+    }
+    body[len] = '\0';
+
+    char ssid[33] = {0};
+    char pass[65] = {0};
+    if (!parse_form_field(body, "ssid", ssid, sizeof(ssid)) || ssid[0] == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing SSID");
+        return ESP_FAIL;
+    }
+    parse_form_field(body, "pass", pass, sizeof(pass));
+
+    ESP_LOGI(TAG, "Web config: SSID=%s", ssid);
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, CONNECT_OK_PAGE, sizeof(CONNECT_OK_PAGE) - 1);
+
+    save_credentials(ssid, pass);
+
+    wifi_config_t wcfg = {};
+    strncpy((char *)wcfg.sta.ssid, ssid, sizeof(wcfg.sta.ssid) - 1);
+    strncpy((char *)wcfg.sta.password, pass, sizeof(wcfg.sta.password) - 1);
+    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+    set_state(WIFI_MGR_CONNECTING);
+    esp_wifi_connect();
+
+    return ESP_OK;
+}
+
+static esp_err_t start_httpd(void)
+{
+    if (s_httpd) return ESP_OK;
+
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.max_uri_handlers = 10;
+    cfg.stack_size = 4096;
+    cfg.lru_purge_enable = true;
+    ESP_RETURN_ON_ERROR(httpd_start(&s_httpd, &cfg), TAG, "httpd start");
+
+    const httpd_uri_t root = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = root_get_handler,
+    };
+    httpd_register_uri_handler(s_httpd, &root);
+
+    const httpd_uri_t connect_uri = {
+        .uri = "/connect",
+        .method = HTTP_POST,
+        .handler = connect_post_handler,
+    };
+    httpd_register_uri_handler(s_httpd, &connect_uri);
+
+    ESP_LOGI(TAG, "HTTP server started on port %d", cfg.server_port);
+    return ESP_OK;
+}
+
+/* ---- WiFi hardware ---- */
 
 static esp_err_t wifi_hw_start(void)
 {
@@ -194,6 +360,7 @@ esp_err_t wifi_mgr_init(void)
         strncpy((char *)wcfg.sta.ssid, ssid, sizeof(wcfg.sta.ssid) - 1);
         strncpy((char *)wcfg.sta.password, pass, sizeof(wcfg.sta.password) - 1);
         esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+        esp_wifi_connect();
         set_state(WIFI_MGR_CONNECTING);
     } else {
         ESP_LOGI(TAG, "no saved credentials, WiFi deferred");
@@ -206,10 +373,9 @@ esp_err_t wifi_mgr_init(void)
 esp_err_t wifi_mgr_start_provisioning(void)
 {
     ESP_RETURN_ON_ERROR(wifi_hw_start(), TAG, "hw start for prov");
+    ESP_RETURN_ON_ERROR(start_httpd(), TAG, "httpd");
 
-    if (!s_ap_netif) {
-        s_ap_netif = esp_netif_create_default_wifi_ap();
-    }
+    wifi_prov_scheme_softap_set_httpd_handle(&s_httpd);
 
     wifi_prov_mgr_deinit();
 
@@ -228,6 +394,12 @@ esp_err_t wifi_mgr_start_provisioning(void)
         wifi_prov_mgr_start_provisioning(security, pop, s_service_name, s_ap_password),
         TAG, "start prov");
 
+    wifi_config_t ap_cfg;
+    if (esp_wifi_get_config(WIFI_IF_AP, &ap_cfg) == ESP_OK) {
+        ap_cfg.ap.max_connection = 4;
+        esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    }
+
     set_state(WIFI_MGR_PROVISIONING);
     return ESP_OK;
 }
@@ -236,6 +408,10 @@ void wifi_mgr_stop_provisioning(void)
 {
     wifi_prov_mgr_stop_provisioning();
     wifi_prov_mgr_deinit();
+    if (s_httpd) {
+        httpd_stop(s_httpd);
+        s_httpd = NULL;
+    }
     set_state(WIFI_MGR_DISCONNECTED);
     ESP_LOGI(TAG, "provisioning stopped");
 }
