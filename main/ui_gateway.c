@@ -97,14 +97,12 @@ static uint16_t s_stats_total_retransmitted = 0;
 static bool s_stats_first_eot_seen = false;
 
 /* PAGE_CONFIG objects */
-static lv_obj_t *s_cfg_rows[7] = {NULL};
-static lv_obj_t *s_cfg_val_lbls[7] = {NULL};
-static lv_obj_t *s_cfg_btns[2] = {NULL};
+static lv_obj_t *s_cfg_rows[6] = {NULL};
+static lv_obj_t *s_cfg_val_lbls[6] = {NULL};
+static lv_obj_t *s_cfg_touch_btns[4] = {NULL};
+static lv_obj_t *s_cfg_touch_lbls[4] = {NULL};
 static int s_cfg_sel = 0;
-static uint32_t s_pkt_delay_us = APP_IMAGE_TX_INTER_PACKET_US;
-static ui_gw_pkt_delay_cb_t s_pkt_delay_cb = NULL;
 static int s_volume_level = 13; /* 0~15, default 13 → 130% */
-static bool s_cfg_pkt_delay_editing = false;
 static ui_gw_audio_clip_cb_t s_audio_clip_cb = NULL;
 static bool s_audio_clip_on = false;
 
@@ -259,7 +257,8 @@ static void destroy_body_children(void)
     for (int i = 0; i < 6; i++) s_link_labels[i] = NULL;
     memset(s_cfg_rows, 0, sizeof(s_cfg_rows));
     memset(s_cfg_val_lbls, 0, sizeof(s_cfg_val_lbls));
-    memset(s_cfg_btns, 0, sizeof(s_cfg_btns));
+    memset(s_cfg_touch_btns, 0, sizeof(s_cfg_touch_btns));
+    memset(s_cfg_touch_lbls, 0, sizeof(s_cfg_touch_lbls));
 }
 
 /* PLACEHOLDER_PAGES */
@@ -476,13 +475,72 @@ static void create_link_page(void)
     update_bottom("K6 Back", "K5/K4 Page", "");
 }
 
+/* ─── Touch button clicked callback ─── */
+static void cfg_btn_clicked_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+
+    switch (idx) {
+    case 0: /* Capture */
+        if (s_capture_cb) {
+            show_page(UI_PAGE_RX);
+            update_title("Waiting...", "RX", COL_AMBER);
+            s_capture_cb();
+        }
+        break;
+    case 1: /* Audio toggle */
+        s_audio_clip_on = !s_audio_clip_on;
+        if (s_cfg_touch_btns[1]) {
+            lv_obj_set_style_bg_color(s_cfg_touch_btns[1],
+                s_audio_clip_on ? COL_AMBER : lv_color_hex(0xEDF4EF), 0);
+            lv_obj_set_style_bg_opa(s_cfg_touch_btns[1], LV_OPA_COVER, 0);
+        }
+        if (s_cfg_touch_lbls[1]) {
+            lv_label_set_text(s_cfg_touch_lbls[1], s_audio_clip_on ? "Audio ON" : "Audio OFF");
+            lv_obj_set_style_text_color(s_cfg_touch_lbls[1],
+                s_audio_clip_on ? lv_color_white() : COL_TEXT_MAIN, 0);
+        }
+        if (s_cfg_val_lbls[4]) {
+            lv_label_set_text(s_cfg_val_lbls[4], s_audio_clip_on ? "On" : "Off");
+        }
+        if (s_audio_clip_cb) s_audio_clip_cb(s_audio_clip_on ? 1 : 0);
+        break;
+    case 2: /* Interval cycle */
+        s_cfg_interval_idx = (s_cfg_interval_idx + 1) % INTERVAL_PRESET_COUNT;
+        if (s_cfg_touch_lbls[2]) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "T: %s", s_interval_labels[s_cfg_interval_idx]);
+            lv_label_set_text(s_cfg_touch_lbls[2], buf);
+        }
+        if (s_cfg_val_lbls[3]) {
+            lv_label_set_text(s_cfg_val_lbls[3], s_interval_labels[s_cfg_interval_idx]);
+        }
+        if (s_interval_cb) s_interval_cb(s_interval_presets[s_cfg_interval_idx]);
+        break;
+    case 3: /* Volume +1 */
+        s_volume_level = (s_volume_level + 1) % 16;
+        bsp_audio_set_volume((uint8_t)(s_volume_level * 10));
+        if (s_cfg_touch_lbls[3]) {
+            char buf[12];
+            snprintf(buf, sizeof(buf), "Vol: %d", s_volume_level);
+            lv_label_set_text(s_cfg_touch_lbls[3], buf);
+        }
+        if (s_cfg_val_lbls[5]) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%d", s_volume_level);
+            lv_label_set_text(s_cfg_val_lbls[5], buf);
+        }
+        break;
+    }
+}
+
 /* ─── PAGE: Config ─── */
 static void create_config_page(void)
 {
     lv_obj_t *panel = lv_obj_create(s_body);
     lv_obj_remove_style_all(panel);
-    lv_obj_set_size(panel, 224, 192);
-    lv_obj_set_pos(panel, 8, 8);
+    lv_obj_set_size(panel, 224, 132);
+    lv_obj_set_pos(panel, 8, 4);
     lv_obj_set_style_bg_color(panel, COL_PANEL_BG, 0);
     lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(panel, 1, 0);
@@ -494,14 +552,12 @@ static void create_config_page(void)
     lv_obj_set_style_pad_all(panel, 0, 0);
     lv_obj_set_style_pad_row(panel, 0, 0);
 
-    static const char *cfg_keys[] = {"JPEG Quality", "Resolution", "Trigger", "Interval", "Audio", "Pkt Delay", "Volume"};
-    char pkt_delay_str[16];
-    snprintf(pkt_delay_str, sizeof(pkt_delay_str), "%luus", (unsigned long)s_pkt_delay_us);
+    static const char *cfg_keys[] = {"JPEG Quality", "Resolution", "Trigger", "Interval", "Audio", "Volume"};
     char vol_str[8];
     snprintf(vol_str, sizeof(vol_str), "%d", s_volume_level);
-    const char *cfg_vals[] = {"Q=50", "VGA", "Manual", s_interval_labels[s_cfg_interval_idx], s_audio_clip_on ? "On" : "Off", pkt_delay_str, vol_str};
+    const char *cfg_vals[] = {"Q=50", "VGA", "Manual", s_interval_labels[s_cfg_interval_idx], s_audio_clip_on ? "On" : "Off", vol_str};
 
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < 6; i++) {
         s_cfg_rows[i] = create_kv_row(panel, cfg_keys[i], cfg_vals[i], &s_cfg_val_lbls[i]);
         if (i == s_cfg_sel) {
             lv_obj_set_style_bg_color(s_cfg_rows[i], COL_GREEN, 0);
@@ -509,33 +565,53 @@ static void create_config_page(void)
         }
     }
 
-    /* Button row */
-    lv_obj_t *btn_row = lv_obj_create(s_body);
-    lv_obj_remove_style_all(btn_row);
-    lv_obj_set_size(btn_row, 224, 32);
-    lv_obj_set_pos(btn_row, 8, 184);
-    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_layout(btn_row, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(btn_row, 8, 0);
+    /* 4 touch buttons in 2x2 grid */
+    lv_obj_t *btn_grid = lv_obj_create(s_body);
+    lv_obj_remove_style_all(btn_grid);
+    lv_obj_set_size(btn_grid, 224, 92);
+    lv_obj_set_pos(btn_grid, 8, 140);
+    lv_obj_clear_flag(btn_grid, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_layout(btn_grid, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(btn_grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_column(btn_grid, 6, 0);
+    lv_obj_set_style_pad_row(btn_grid, 6, 0);
 
-    static const char *btn_texts[] = {"Capture", "Refresh"};
-    for (int i = 0; i < 2; i++) {
-        lv_obj_t *btn = lv_btn_create(btn_row);
-        lv_obj_set_size(btn, 104, 28);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0xEDF4EF), 0);
+    char interval_buf[16];
+    snprintf(interval_buf, sizeof(interval_buf), "T: %s", s_interval_labels[s_cfg_interval_idx]);
+    char vol_buf[12];
+    snprintf(vol_buf, sizeof(vol_buf), "Vol: %d", s_volume_level);
+    const char *btn_labels[] = {"Capture", s_audio_clip_on ? "Audio ON" : "Audio OFF", interval_buf, vol_buf};
+
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *btn = lv_btn_create(btn_grid);
+        lv_obj_set_size(btn, 109, 40);
+        lv_obj_set_style_radius(btn, 6, 0);
         lv_obj_set_style_border_width(btn, 1, 0);
         lv_obj_set_style_border_color(btn, lv_color_hex(0x9FB5AA), 0);
-        lv_obj_set_style_radius(btn, 5, 0);
+
+        if (i == 1 && s_audio_clip_on) {
+            lv_obj_set_style_bg_color(btn, COL_AMBER, 0);
+        } else {
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0xEDF4EF), 0);
+        }
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+
         lv_obj_t *lbl = lv_label_create(btn);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_10, 0);
-        lv_obj_set_style_text_color(lbl, COL_TEXT_MAIN, 0);
-        lv_label_set_text(lbl, btn_texts[i]);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        if (i == 1 && s_audio_clip_on) {
+            lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+        } else {
+            lv_obj_set_style_text_color(lbl, COL_TEXT_MAIN, 0);
+        }
+        lv_label_set_text(lbl, btn_labels[i]);
         lv_obj_center(lbl);
-        s_cfg_btns[i] = btn;
+
+        lv_obj_add_event_cb(btn, cfg_btn_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        s_cfg_touch_btns[i] = btn;
+        s_cfg_touch_lbls[i] = lbl;
     }
 
-    s_cfg_pkt_delay_editing = false;
     update_title("Config", "CFG", COL_GREEN);
     update_bottom("K6 Back", "K5/K4 Select", "K3 Action");
 }
@@ -585,11 +661,6 @@ void ui_gw_set_interval_cb(ui_gw_interval_cb_t cb)
     s_interval_cb = cb;
 }
 
-void ui_gw_set_pkt_delay_cb(ui_gw_pkt_delay_cb_t cb)
-{
-    s_pkt_delay_cb = cb;
-}
-
 void ui_gw_set_audio_clip_cb(ui_gw_audio_clip_cb_t cb)
 {
     s_audio_clip_cb = cb;
@@ -603,67 +674,29 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
 
     if (s_page == UI_PAGE_CONFIG) {
-        /* Pkt Delay editing mode: K4=10, K5=-10, K3=+1, K6=apply&exit */
-        if (s_cfg_pkt_delay_editing) {
-            if (key == BSP_BTN_VOL_UP) {
-                s_pkt_delay_us += 10;
-            } else if (key == BSP_BTN_USER1) {
-                if (s_pkt_delay_us >= 10) s_pkt_delay_us -= 10;
-                else s_pkt_delay_us = 0;
-            } else if (key == BSP_BTN_VOL_DN) {
-                s_pkt_delay_us += 1;
-            } else if (key == BSP_BTN_PTT) {
-                /* K6 = apply and exit editing */
-                lv_label_set_text(s_status_lbl_r, "Sending...");
-                lv_refr_now(NULL);
-                bool ok = s_pkt_delay_cb ? s_pkt_delay_cb(s_pkt_delay_us) : false;
-                lv_label_set_text(s_status_lbl_r, ok ? "Set OK" : "Set FAIL");
-                s_cfg_pkt_delay_editing = false;
-                update_bottom("K6 Back", "K5/K4 Select", "K3 Action");
-            }
-            if (key != BSP_BTN_PTT && s_cfg_val_lbls[5]) {
-                char buf[16];
-                snprintf(buf, sizeof(buf), "%luus", (unsigned long)s_pkt_delay_us);
-                lv_label_set_text(s_cfg_val_lbls[5], buf);
-            }
-            goto done;
-        }
-
         /* Normal config page navigation */
         if (key == BSP_BTN_VOL_UP) {
             /* K4 = next item */
             if (s_cfg_rows[s_cfg_sel]) {
                 lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_TRANSP, 0);
             }
-            s_cfg_sel = (s_cfg_sel + 1) % 7;
+            s_cfg_sel = (s_cfg_sel + 1) % 6;
             if (s_cfg_rows[s_cfg_sel]) {
                 lv_obj_set_style_bg_color(s_cfg_rows[s_cfg_sel], COL_GREEN, 0);
                 lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_COVER, 0);
             }
-            if (s_cfg_sel == 5) {
-                update_bottom("K6 Apply", "K5-10/K4+10", "K3+1");
-            } else if (s_cfg_sel == 6) {
-                update_bottom("K6 Back", "K5/K4 Select", "K3 +/-");
-            } else {
-                update_bottom("K6 Back", "K5/K4 Select", "K3 Action");
-            }
+            update_bottom("K6 Back", "K5/K4 Select", "K3 Action");
         } else if (key == BSP_BTN_USER1) {
             /* K5 = prev item */
             if (s_cfg_rows[s_cfg_sel]) {
                 lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_TRANSP, 0);
             }
-            s_cfg_sel = (s_cfg_sel + 6) % 7;
+            s_cfg_sel = (s_cfg_sel + 5) % 6;
             if (s_cfg_rows[s_cfg_sel]) {
                 lv_obj_set_style_bg_color(s_cfg_rows[s_cfg_sel], COL_GREEN, 0);
                 lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_COVER, 0);
             }
-            if (s_cfg_sel == 5) {
-                update_bottom("K6 Apply", "K5-10/K4+10", "K3+1");
-            } else if (s_cfg_sel == 6) {
-                update_bottom("K6 Back", "K5/K4 Select", "K3 +/-");
-            } else {
-                update_bottom("K6 Back", "K5/K4 Select", "K3 Action");
-            }
+            update_bottom("K6 Back", "K5/K4 Select", "K3 Action");
         } else if (key == BSP_BTN_VOL_DN) {
             /* K3 = action on selected row */
             if (s_cfg_sel == 3) {
@@ -671,6 +704,11 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
                 s_cfg_interval_idx = (s_cfg_interval_idx + 1) % INTERVAL_PRESET_COUNT;
                 if (s_cfg_val_lbls[3]) {
                     lv_label_set_text(s_cfg_val_lbls[3], s_interval_labels[s_cfg_interval_idx]);
+                }
+                if (s_cfg_touch_lbls[2]) {
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "T: %s", s_interval_labels[s_cfg_interval_idx]);
+                    lv_label_set_text(s_cfg_touch_lbls[2], buf);
                 }
                 lv_label_set_text(s_status_lbl_r, "Sending...");
                 lv_refr_now(NULL);
@@ -682,31 +720,35 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
                 if (s_cfg_val_lbls[4]) {
                     lv_label_set_text(s_cfg_val_lbls[4], s_audio_clip_on ? "On" : "Off");
                 }
+                if (s_cfg_touch_btns[1]) {
+                    lv_obj_set_style_bg_color(s_cfg_touch_btns[1],
+                        s_audio_clip_on ? COL_AMBER : lv_color_hex(0xEDF4EF), 0);
+                }
+                if (s_cfg_touch_lbls[1]) {
+                    lv_label_set_text(s_cfg_touch_lbls[1], s_audio_clip_on ? "Audio ON" : "Audio OFF");
+                    lv_obj_set_style_text_color(s_cfg_touch_lbls[1],
+                        s_audio_clip_on ? lv_color_white() : COL_TEXT_MAIN, 0);
+                }
                 lv_label_set_text(s_status_lbl_r, "Sending...");
                 lv_refr_now(NULL);
                 bool ok = s_audio_clip_cb ? s_audio_clip_cb(s_audio_clip_on ? 1 : 0) : false;
                 lv_label_set_text(s_status_lbl_r, ok ? "Set OK" : "Set FAIL");
             } else if (s_cfg_sel == 5) {
-                /* Pkt Delay row: enter editing mode */
-                s_cfg_pkt_delay_editing = true;
-                s_pkt_delay_us += 1;
-                if (s_cfg_val_lbls[5]) {
-                    char buf[16];
-                    snprintf(buf, sizeof(buf), "%luus", (unsigned long)s_pkt_delay_us);
-                    lv_label_set_text(s_cfg_val_lbls[5], buf);
-                }
-                update_bottom("K6 Apply", "K5-10/K4+10", "K3+1");
-            } else if (s_cfg_sel == 6) {
                 /* Volume row: cycle 0~15 */
                 s_volume_level = (s_volume_level + 1) % 16;
                 bsp_audio_set_volume((uint8_t)(s_volume_level * 10));
-                if (s_cfg_val_lbls[6]) {
+                if (s_cfg_val_lbls[5]) {
                     char buf[8];
                     snprintf(buf, sizeof(buf), "%d", s_volume_level);
-                    lv_label_set_text(s_cfg_val_lbls[6], buf);
+                    lv_label_set_text(s_cfg_val_lbls[5], buf);
+                }
+                if (s_cfg_touch_lbls[3]) {
+                    char buf[12];
+                    snprintf(buf, sizeof(buf), "Vol: %d", s_volume_level);
+                    lv_label_set_text(s_cfg_touch_lbls[3], buf);
                 }
             } else if (s_cfg_sel == 0 || s_cfg_sel == 1) {
-                /* Capture button rows — trigger capture */
+                /* Capture rows — trigger capture */
                 if (s_capture_cb) {
                     show_page(UI_PAGE_RX);
                     update_title("Waiting...", "RX", COL_AMBER);

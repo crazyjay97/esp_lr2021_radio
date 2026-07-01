@@ -786,6 +786,15 @@ esp_err_t bsp_lcd_start_gateway_ui(void)
     s_lvgl_disp_drv = &disp_drv_gw;
     lv_disp_drv_register(&disp_drv_gw);
 
+    esp_err_t touch_err = touch_attach();
+    if (touch_err == ESP_OK) {
+        static lv_indev_drv_t indev_drv_gw;
+        lv_indev_drv_init(&indev_drv_gw);
+        indev_drv_gw.type = LV_INDEV_TYPE_POINTER;
+        indev_drv_gw.read_cb = lvgl_touch_read_cb;
+        lv_indev_drv_register(&indev_drv_gw);
+    }
+
     extern esp_err_t ui_gw_init(void);
     ESP_RETURN_ON_ERROR(ui_gw_init(), TAG, "gateway ui");
 

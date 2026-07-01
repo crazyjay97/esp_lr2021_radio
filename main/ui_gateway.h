@@ -19,7 +19,6 @@ typedef enum {
 
 typedef void (*ui_gw_capture_cb_t)(void);
 typedef bool (*ui_gw_interval_cb_t)(uint32_t interval_sec);
-typedef bool (*ui_gw_pkt_delay_cb_t)(uint32_t us);
 typedef bool (*ui_gw_audio_clip_cb_t)(uint32_t enable);
 
 esp_err_t ui_gw_init(void);
@@ -35,7 +34,6 @@ void ui_gw_rx_eot_nack(uint16_t missing_count, bool is_first_eot);
 
 void ui_gw_set_capture_cb(ui_gw_capture_cb_t cb);
 void ui_gw_set_interval_cb(ui_gw_interval_cb_t cb);
-void ui_gw_set_pkt_delay_cb(ui_gw_pkt_delay_cb_t cb);
 void ui_gw_set_audio_clip_cb(ui_gw_audio_clip_cb_t cb);
 
 #ifdef __cplusplus

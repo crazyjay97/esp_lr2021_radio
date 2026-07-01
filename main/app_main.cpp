@@ -773,12 +773,6 @@ bool on_gw_interval_change(uint32_t interval_sec)
     return g_radio.send_config(APP_CFG_KEY_INTERVAL, interval_sec);
 }
 
-bool on_gw_pkt_delay_change(uint32_t us)
-{
-    ESP_LOGI(TAG, "UI pkt delay change: %luus", static_cast<unsigned long>(us));
-    return g_radio.send_config(APP_CFG_KEY_INTER_PACKET, us);
-}
-
 bool on_gw_audio_clip_change(uint32_t enable)
 {
     ESP_LOGI(TAG, "UI audio clip: %s", enable ? "on" : "off");
@@ -981,7 +975,6 @@ extern "C" void app_main(void)
         } else {
             ui_gw_set_capture_cb(on_gw_capture);
             ui_gw_set_interval_cb(on_gw_interval_change);
-            ui_gw_set_pkt_delay_cb(on_gw_pkt_delay_change);
             ui_gw_set_audio_clip_cb(on_gw_audio_clip_change);
         }
     } else if ((e = bsp_lcd_start_camera_ui(on_lcd_capture, nullptr)) != ESP_OK) {
