@@ -633,6 +633,33 @@ static void show_page(ui_page_t page)
     }
 }
 
+/* ─── Swipe gesture ─── */
+static const ui_page_t s_swipe_order[] = {UI_PAGE_IMAGE, UI_PAGE_LINK, UI_PAGE_CONFIG};
+#define SWIPE_PAGE_COUNT 3
+
+static void gesture_cb(lv_event_t *e)
+{
+    if (s_page == UI_PAGE_RX) return;
+
+    lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_get_act());
+    if (dir != LV_DIR_LEFT && dir != LV_DIR_RIGHT) return;
+
+    int cur = -1;
+    for (int i = 0; i < SWIPE_PAGE_COUNT; i++) {
+        if (s_swipe_order[i] == s_page) { cur = i; break; }
+    }
+    if (cur < 0) return;
+
+    int next;
+    if (dir == LV_DIR_LEFT) {
+        next = (cur + 1) % SWIPE_PAGE_COUNT;
+    } else {
+        next = (cur + SWIPE_PAGE_COUNT - 1) % SWIPE_PAGE_COUNT;
+    }
+
+    show_page(s_swipe_order[next]);
+}
+
 /* ─── Public API ─── */
 esp_err_t ui_gw_init(void)
 {
@@ -644,6 +671,8 @@ esp_err_t ui_gw_init(void)
 
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
     create_shared_layout();
+    lv_obj_add_event_cb(s_scr, gesture_cb, LV_EVENT_GESTURE, NULL);
+    lv_obj_clear_flag(s_scr, LV_OBJ_FLAG_GESTURE_BUBBLE);
     show_page(UI_PAGE_IMAGE);
     xSemaphoreGiveRecursive(s_lock);
 
