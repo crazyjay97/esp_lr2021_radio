@@ -358,9 +358,9 @@ esp_err_t bsp_audio_resume(void)
 
 esp_err_t bsp_audio_set_volume(uint8_t percent)
 {
-    if (percent > 100) percent = 100;
-    /* Reg 0x32 is linear-ish 0..0xBF ≈ mute..0 dB. */
-    uint8_t v = (percent == 0) ? 0 : (uint8_t)(((uint32_t)percent * 256 / 100) - 1);
+    if (percent > 150) percent = 150;
+    /* Reg 0x32: 0=mute, 0xBF≈0dB (100%), above 0xBF is positive gain. */
+    uint8_t v = (percent == 0) ? 0 : (uint8_t)(((uint32_t)percent * 256 / 150) - 1);
     return es_write(ES8311_DAC_REG32, v);
 }
 

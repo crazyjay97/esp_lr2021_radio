@@ -1,5 +1,6 @@
 #include "ui_gateway.h"
 #include "app_config.h"
+#include "bsp.h"
 #include "lvgl.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -96,12 +97,13 @@ static uint16_t s_stats_total_retransmitted = 0;
 static bool s_stats_first_eot_seen = false;
 
 /* PAGE_CONFIG objects */
-static lv_obj_t *s_cfg_rows[6] = {NULL};
-static lv_obj_t *s_cfg_val_lbls[6] = {NULL};
+static lv_obj_t *s_cfg_rows[7] = {NULL};
+static lv_obj_t *s_cfg_val_lbls[7] = {NULL};
 static lv_obj_t *s_cfg_btns[2] = {NULL};
 static int s_cfg_sel = 0;
 static uint32_t s_pkt_delay_us = APP_IMAGE_TX_INTER_PACKET_US;
 static ui_gw_pkt_delay_cb_t s_pkt_delay_cb = NULL;
+static int s_volume_level = 7; /* 0~15, default 7 → 70% */
 static bool s_cfg_pkt_delay_editing = false;
 static ui_gw_audio_clip_cb_t s_audio_clip_cb = NULL;
 static bool s_audio_clip_on = false;
@@ -480,7 +482,7 @@ static void create_config_page(void)
 {
     lv_obj_t *panel = lv_obj_create(s_body);
     lv_obj_remove_style_all(panel);
-    lv_obj_set_size(panel, 224, 168);
+    lv_obj_set_size(panel, 224, 192);
     lv_obj_set_pos(panel, 8, 8);
     lv_obj_set_style_bg_color(panel, COL_PANEL_BG, 0);
     lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
@@ -493,12 +495,14 @@ static void create_config_page(void)
     lv_obj_set_style_pad_all(panel, 0, 0);
     lv_obj_set_style_pad_row(panel, 0, 0);
 
-    static const char *cfg_keys[] = {"JPEG Quality", "Resolution", "Trigger", "Interval", "Audio", "Pkt Delay"};
+    static const char *cfg_keys[] = {"JPEG Quality", "Resolution", "Trigger", "Interval", "Audio", "Pkt Delay", "Volume"};
     char pkt_delay_str[16];
     snprintf(pkt_delay_str, sizeof(pkt_delay_str), "%luus", (unsigned long)s_pkt_delay_us);
-    const char *cfg_vals[] = {"Q=50", "VGA", "Manual", s_interval_labels[s_cfg_interval_idx], s_audio_clip_on ? "On" : "Off", pkt_delay_str};
+    char vol_str[8];
+    snprintf(vol_str, sizeof(vol_str), "%d", s_volume_level);
+    const char *cfg_vals[] = {"Q=50", "VGA", "Manual", s_interval_labels[s_cfg_interval_idx], s_audio_clip_on ? "On" : "Off", pkt_delay_str, vol_str};
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
         s_cfg_rows[i] = create_kv_row(panel, cfg_keys[i], cfg_vals[i], &s_cfg_val_lbls[i]);
         if (i == s_cfg_sel) {
             lv_obj_set_style_bg_color(s_cfg_rows[i], COL_GREEN, 0);
@@ -632,13 +636,15 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
             if (s_cfg_rows[s_cfg_sel]) {
                 lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_TRANSP, 0);
             }
-            s_cfg_sel = (s_cfg_sel + 1) % 6;
+            s_cfg_sel = (s_cfg_sel + 1) % 7;
             if (s_cfg_rows[s_cfg_sel]) {
                 lv_obj_set_style_bg_color(s_cfg_rows[s_cfg_sel], COL_GREEN, 0);
                 lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_COVER, 0);
             }
             if (s_cfg_sel == 5) {
                 update_bottom("K6 Apply", "K5-10/K4+10", "K3+1");
+            } else if (s_cfg_sel == 6) {
+                update_bottom("K6 Back", "K5/K4 Select", "K3 +/-");
             } else {
                 update_bottom("K6 Back", "K5/K4 Select", "K3 Action");
             }
@@ -647,13 +653,15 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
             if (s_cfg_rows[s_cfg_sel]) {
                 lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_TRANSP, 0);
             }
-            s_cfg_sel = (s_cfg_sel + 5) % 6;
+            s_cfg_sel = (s_cfg_sel + 6) % 7;
             if (s_cfg_rows[s_cfg_sel]) {
                 lv_obj_set_style_bg_color(s_cfg_rows[s_cfg_sel], COL_GREEN, 0);
                 lv_obj_set_style_bg_opa(s_cfg_rows[s_cfg_sel], LV_OPA_COVER, 0);
             }
             if (s_cfg_sel == 5) {
                 update_bottom("K6 Apply", "K5-10/K4+10", "K3+1");
+            } else if (s_cfg_sel == 6) {
+                update_bottom("K6 Back", "K5/K4 Select", "K3 +/-");
             } else {
                 update_bottom("K6 Back", "K5/K4 Select", "K3 Action");
             }
@@ -689,6 +697,15 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
                     lv_label_set_text(s_cfg_val_lbls[5], buf);
                 }
                 update_bottom("K6 Apply", "K5-10/K4+10", "K3+1");
+            } else if (s_cfg_sel == 6) {
+                /* Volume row: cycle 0~15 */
+                s_volume_level = (s_volume_level + 1) % 16;
+                bsp_audio_set_volume((uint8_t)(s_volume_level * 10));
+                if (s_cfg_val_lbls[6]) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "%d", s_volume_level);
+                    lv_label_set_text(s_cfg_val_lbls[6], buf);
+                }
             } else if (s_cfg_sel == 0 || s_cfg_sel == 1) {
                 /* Capture button rows — trigger capture */
                 if (s_capture_cb) {
