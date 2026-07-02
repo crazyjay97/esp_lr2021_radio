@@ -11,12 +11,13 @@ extern "C" {
 #endif
 
 #define IMAGE_STORE_MAX_SLOTS   20
-#define IMAGE_STORE_MAX_BYTES   (4U * 1024U * 1024U)
+#define IMAGE_STORE_MAX_BYTES   (6U * 1024U * 1024U)
 
 typedef struct {
     uint32_t timestamp;
     uint32_t jpeg_len;
     uint32_t opus_len;
+    uint32_t pcm_len;
     uint16_t session_id;
     bool     valid;
 } image_meta_t;

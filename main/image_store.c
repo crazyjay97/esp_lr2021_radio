@@ -4,6 +4,9 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_sntp.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "opus.h"
 #include <string.h>
 #include <stdio.h>
@@ -16,6 +19,7 @@ typedef struct {
     image_meta_t meta;
     uint8_t     *jpeg;
     uint8_t     *opus;
+    uint8_t     *pcm;
 } image_slot_t;
 
 static image_slot_t s_slots[IMAGE_STORE_MAX_SLOTS];
@@ -24,6 +28,9 @@ static int s_count = 0;
 static size_t s_total_bytes = 0;
 static volatile bool s_abort = false;
 static bool s_sntp_started = false;
+
+static SemaphoreHandle_t s_decode_sem = NULL;
+static TaskHandle_t s_decode_task = NULL;
 
 /* ---- SNTP ---- */
 
@@ -49,6 +56,103 @@ void image_store_start_sntp(void)
     ESP_LOGI(TAG, "SNTP started");
 }
 
+/* ---- Background PCM decode ---- */
+
+static void decode_slot_pcm(image_slot_t *slot)
+{
+    if (!slot->opus || slot->meta.opus_len == 0) return;
+    if (slot->pcm) return;
+
+    const uint8_t *opus_data = slot->opus;
+    size_t opus_len = slot->meta.opus_len;
+
+    size_t pos = 0, num_frames = 0;
+    while (pos < opus_len) {
+        uint8_t flen = opus_data[pos++];
+        if (flen == 0 || pos + flen > opus_len) break;
+        pos += flen;
+        num_frames++;
+    }
+    if (num_frames == 0) return;
+
+    uint32_t pcm_samples = num_frames * APP_AUDIO_FRAME_SAMPLES;
+    size_t pcm_bytes = pcm_samples * 2;
+
+    uint8_t *pcm_buf = (uint8_t *)heap_caps_malloc(pcm_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pcm_buf) {
+        ESP_LOGW(TAG, "PCM alloc failed: %u bytes", (unsigned)pcm_bytes);
+        return;
+    }
+
+    int err_code = 0;
+    OpusDecoder *dec = opus_decoder_create(APP_AUDIO_SAMPLE_RATE_HZ, 1, &err_code);
+    if (!dec) {
+        heap_caps_free(pcm_buf);
+        return;
+    }
+
+    int16_t *samples = (int16_t *)pcm_buf;
+    pos = 0;
+    size_t soff = 0;
+    while (pos < opus_len && soff < pcm_samples) {
+        uint8_t flen = opus_data[pos++];
+        if (flen == 0 || pos + flen > opus_len) break;
+        int got = opus_decode(dec, &opus_data[pos], flen, &samples[soff], APP_AUDIO_FRAME_SAMPLES, 0);
+        pos += flen;
+        if (got > 0) soff += got;
+    }
+    opus_decoder_destroy(dec);
+
+    /* Normalize to 90% full scale */
+    int16_t peak = 0;
+    for (size_t i = 0; i < soff; i++) {
+        int16_t v = samples[i] < 0 ? -samples[i] : samples[i];
+        if (v > peak) peak = v;
+    }
+    if (peak > 0 && peak < 29490) {
+        int32_t gain = 29490 * 256 / peak;
+        for (size_t i = 0; i < soff; i++) {
+            int32_t s = ((int32_t)samples[i] * gain) >> 8;
+            if (s > 32767) s = 32767;
+            if (s < -32768) s = -32768;
+            samples[i] = (int16_t)s;
+        }
+    }
+
+    size_t actual_pcm_bytes = soff * 2;
+    slot->pcm = pcm_buf;
+    slot->meta.pcm_len = actual_pcm_bytes;
+    s_total_bytes += actual_pcm_bytes;
+
+    /* Free opus data - no longer needed */
+    s_total_bytes -= slot->meta.opus_len;
+    heap_caps_free(slot->opus);
+    slot->opus = NULL;
+    slot->meta.opus_len = 0;
+
+    ESP_LOGI(TAG, "PCM decoded: %u samples, peak=%d, %uKB", (unsigned)soff, peak, (unsigned)(actual_pcm_bytes / 1024));
+}
+
+static void decode_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        xSemaphoreTake(s_decode_sem, portMAX_DELAY);
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        for (int i = 0; i < IMAGE_STORE_MAX_SLOTS; i++) {
+            image_slot_t *slot = &s_slots[i];
+            if (slot->meta.valid && slot->opus && !slot->pcm) {
+                int64_t t0 = esp_timer_get_time();
+                decode_slot_pcm(slot);
+                uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+                ESP_LOGI(TAG, "bg decode slot %d: %lu ms", i, (unsigned long)ms);
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+        }
+    }
+}
+
 /* ---- Storage ---- */
 
 esp_err_t image_store_init(void)
@@ -58,6 +162,14 @@ esp_err_t image_store_init(void)
     s_count = 0;
     s_total_bytes = 0;
     s_abort = false;
+
+    if (!s_decode_sem) {
+        s_decode_sem = xSemaphoreCreateBinary();
+    }
+    if (!s_decode_task) {
+        xTaskCreatePinnedToCore(decode_task, "pcm_dec", 8192, NULL, 1, &s_decode_task, 1);
+    }
+
     ESP_LOGI(TAG, "initialized (%d slots, %uKB max)",
              IMAGE_STORE_MAX_SLOTS, IMAGE_STORE_MAX_BYTES / 1024);
     return ESP_OK;
@@ -76,9 +188,15 @@ static void free_slot(int idx)
         heap_caps_free(s->opus);
         s->opus = NULL;
     }
+    if (s->pcm) {
+        s_total_bytes -= s->meta.pcm_len;
+        heap_caps_free(s->pcm);
+        s->pcm = NULL;
+    }
     s->meta.valid = false;
     s->meta.jpeg_len = 0;
     s->meta.opus_len = 0;
+    s->meta.pcm_len = 0;
 }
 
 esp_err_t image_store_save(const uint8_t *jpeg, size_t jpeg_len,
@@ -122,8 +240,10 @@ esp_err_t image_store_save(const uint8_t *jpeg, size_t jpeg_len,
     image_slot_t *slot = &s_slots[s_head];
     slot->jpeg = jbuf;
     slot->opus = obuf;
+    slot->pcm = NULL;
     slot->meta.jpeg_len = jpeg_len;
     slot->meta.opus_len = opus_len;
+    slot->meta.pcm_len = 0;
     slot->meta.session_id = session_id;
     slot->meta.timestamp = (uint32_t)time(NULL);
     slot->meta.valid = true;
@@ -136,6 +256,11 @@ esp_err_t image_store_save(const uint8_t *jpeg, size_t jpeg_len,
     ESP_LOGI(TAG, "saved image #%d: jpeg=%u opus=%u total_used=%uKB",
              s_count, (unsigned)jpeg_len, (unsigned)opus_len,
              (unsigned)(s_total_bytes / 1024));
+
+    if (obuf && s_decode_sem) {
+        xSemaphoreGive(s_decode_sem);
+    }
+
     return ESP_OK;
 }
 
@@ -215,12 +340,13 @@ static esp_err_t handler_api_images(httpd_req_t *req)
     for (int i = 0; i < count; i++) {
         const image_meta_t *m = image_store_get_meta(i);
         if (!m || !m->valid) continue;
+        int has_audio = (m->pcm_len > 0 || m->opus_len > 0) ? 1 : 0;
         int n = snprintf(buf, sizeof(buf),
-            "%s{\"id\":%d,\"jpeg\":%lu,\"opus\":%lu,\"ts\":%lu}",
+            "%s{\"id\":%d,\"jpeg\":%lu,\"audio\":%d,\"ts\":%lu}",
             (i > 0) ? "," : "",
             i,
             (unsigned long)m->jpeg_len,
-            (unsigned long)m->opus_len,
+            has_audio,
             (unsigned long)m->timestamp);
         httpd_resp_send_chunk(req, buf, n);
     }
@@ -246,51 +372,14 @@ static esp_err_t handler_img(httpd_req_t *req)
     return send_jpeg_chunked(req, data, len);
 }
 
-static esp_err_t handler_audio(httpd_req_t *req)
+static void write_wav_header(uint8_t *h, uint32_t pcm_bytes)
 {
-    const char *num = req->uri + 7;  /* skip "/audio/" */
-    int idx = atoi(num);
-
-    size_t opus_len = 0;
-    const uint8_t *opus_data = image_store_get_opus(idx, &opus_len);
-    if (!opus_data) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Audio not found");
-        return ESP_FAIL;
-    }
-
-    /* Count frames */
-    size_t pos = 0, num_frames = 0;
-    while (pos < opus_len) {
-        uint8_t flen = opus_data[pos++];
-        if (flen == 0 || pos + flen > opus_len) break;
-        pos += flen;
-        num_frames++;
-    }
-    if (num_frames == 0) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No frames");
-        return ESP_FAIL;
-    }
-
-    uint32_t pcm_samples = num_frames * APP_AUDIO_FRAME_SAMPLES;
-    uint32_t pcm_bytes = pcm_samples * 2;
-    size_t wav_size = 44 + pcm_bytes;
-
-    uint8_t *wav_buf = (uint8_t *)heap_caps_malloc(wav_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!wav_buf) {
-        ESP_LOGE(TAG, "WAV alloc failed (%u)", (unsigned)wav_size);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
-        return ESP_FAIL;
-    }
-
-    /* WAV header */
-    uint32_t file_sz = 36 + pcm_bytes;
+    uint32_t file_size = 36 + pcm_bytes;
     uint32_t sr = APP_AUDIO_SAMPLE_RATE_HZ;
     uint32_t brate = sr * 2;
-    uint8_t *h = wav_buf;
     memcpy(h, "RIFF", 4);
-    h[4]=file_sz; h[5]=file_sz>>8; h[6]=file_sz>>16; h[7]=file_sz>>24;
-    memcpy(h+8, "WAVE", 4);
-    memcpy(h+12, "fmt ", 4);
+    h[4]=file_size; h[5]=file_size>>8; h[6]=file_size>>16; h[7]=file_size>>24;
+    memcpy(h+8, "WAVEfmt ", 8);
     h[16]=16; h[17]=0; h[18]=0; h[19]=0;
     h[20]=1; h[21]=0;
     h[22]=1; h[23]=0;
@@ -300,8 +389,81 @@ static esp_err_t handler_audio(httpd_req_t *req)
     h[34]=16; h[35]=0;
     memcpy(h+36, "data", 4);
     h[40]=pcm_bytes; h[41]=pcm_bytes>>8; h[42]=pcm_bytes>>16; h[43]=pcm_bytes>>24;
+}
 
-    /* Decode */
+static esp_err_t handler_audio(httpd_req_t *req)
+{
+    const char *num = req->uri + 7;  /* skip "/audio/" */
+    int idx = atoi(num);
+    int phys = logical_to_physical(idx);
+    if (phys < 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
+        return ESP_FAIL;
+    }
+
+    image_slot_t *slot = &s_slots[phys];
+
+    /* Pre-decoded PCM available - fast path */
+    if (slot->pcm && slot->meta.pcm_len > 0) {
+        uint32_t pcm_bytes = slot->meta.pcm_len;
+        uint8_t wav_hdr[44];
+        write_wav_header(wav_hdr, pcm_bytes);
+
+        s_abort = false;
+        httpd_resp_set_type(req, "audio/wav");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+        esp_err_t err = httpd_resp_send_chunk(req, (const char *)wav_hdr, 44);
+        if (err != ESP_OK) return err;
+
+        size_t sent = 0;
+        while (sent < pcm_bytes) {
+            if (s_abort) {
+                httpd_resp_send_chunk(req, NULL, 0);
+                return ESP_OK;
+            }
+            size_t chunk = (pcm_bytes - sent > CHUNK_SIZE) ? CHUNK_SIZE : (pcm_bytes - sent);
+            err = httpd_resp_send_chunk(req, (const char *)&slot->pcm[sent], chunk);
+            if (err != ESP_OK) return err;
+            sent += chunk;
+        }
+        httpd_resp_send_chunk(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    /* Fallback: decode on the fly if PCM not ready yet */
+    size_t opus_len = 0;
+    const uint8_t *opus_data = slot->opus;
+    if (!opus_data) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Audio not found");
+        return ESP_FAIL;
+    }
+    opus_len = slot->meta.opus_len;
+
+    size_t pos = 0, num_frames = 0;
+    while (pos < opus_len) {
+        uint8_t flen = opus_data[pos++];
+        if (flen == 0 || pos + flen > opus_len) break;
+        pos += flen;
+        num_frames++;
+    }
+    if (num_frames == 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No frames");
+        return ESP_FAIL;
+    }
+
+    uint32_t pcm_samples = num_frames * APP_AUDIO_FRAME_SAMPLES;
+    size_t pcm_bytes = pcm_samples * 2;
+    size_t wav_size = 44 + pcm_bytes;
+
+    uint8_t *wav_buf = (uint8_t *)heap_caps_malloc(wav_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!wav_buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    write_wav_header(wav_buf, pcm_bytes);
+
     int err_code = 0;
     OpusDecoder *dec = opus_decoder_create(APP_AUDIO_SAMPLE_RATE_HZ, 1, &err_code);
     if (!dec) {
@@ -322,9 +484,24 @@ static esp_err_t handler_audio(httpd_req_t *req)
     }
     opus_decoder_destroy(dec);
 
-    /* Send */
+    int16_t peak = 0;
+    for (size_t i = 0; i < soff; i++) {
+        int16_t v = pcm[i] < 0 ? -pcm[i] : pcm[i];
+        if (v > peak) peak = v;
+    }
+    if (peak > 0 && peak < 29490) {
+        int32_t gain = 29490 * 256 / peak;
+        for (size_t i = 0; i < soff; i++) {
+            int32_t s = ((int32_t)pcm[i] * gain) >> 8;
+            if (s > 32767) s = 32767;
+            if (s < -32768) s = -32768;
+            pcm[i] = (int16_t)s;
+        }
+    }
+
     s_abort = false;
     httpd_resp_set_type(req, "audio/wav");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     size_t sent = 0;
     while (sent < wav_size) {
         if (s_abort) {
@@ -399,8 +576,8 @@ static const char GALLERY_HTML[] =
     "if(idx<0)idx=imgList.length-1;if(idx>=imgList.length)idx=0;"
     "curIdx=idx;var m=imgList[idx];"
     "ovimg.src='/img/'+m.id;ovdl.href='/img/'+m.id;"
-    "if(m.opus>0){ovaudio.src='/audio/'+m.id;ovaudio.style.display='block'}"
-    "else{ovaudio.pause();ovaudio.style.display='none';ovaudio.src=''}}"
+    "ovaudio.pause();ovaudio.style.display='none';ovaudio.src='';"
+    "if(m.audio){ovaudio.src='/audio/'+m.id;ovaudio.style.display='block'}}"
     "function openOv(idx){showImg(idx);ov.classList.add('show')}"
     "function closeOv(){ov.classList.remove('show');ovimg.src='';ovaudio.pause();ovaudio.src=''}"
     "function navImg(dir){showImg(curIdx+dir)}"
@@ -422,7 +599,7 @@ static const char GALLERY_HTML[] =
     "d.onclick=function(){openOv(idx)};"
     "var sz=m.jpeg>1024?(m.jpeg/1024).toFixed(1)+'KB':m.jpeg+'B';"
     "var tm=fmtT(m.ts);"
-    "var badge=m.opus>0?'<span class=\"badge\">AUDIO</span>':'';"
+    "var badge=m.audio?'<span class=\"badge\">AUDIO</span>':'';"
     "d.innerHTML='<img src=\"/img/'+m.id+'\" loading=\"lazy\"><div class=\"info\"><span>'+tm+' &middot; '+sz+'</span>'+badge+'</div>';"
     "grid.appendChild(d)})(i)}})}"
     "load();setInterval(load,8000);"
