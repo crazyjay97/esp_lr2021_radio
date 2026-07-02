@@ -830,6 +830,7 @@ void on_wifi_state_change(wifi_mgr_state_t state)
         if (h) {
             image_store_register_httpd(h);
         }
+        image_store_start_sntp();
     }
 }
 

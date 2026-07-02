@@ -3,10 +3,12 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_sntp.h"
 #include "opus.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 static const char *TAG = "img_store";
 
@@ -21,6 +23,33 @@ static int s_head = 0;
 static int s_count = 0;
 static size_t s_total_bytes = 0;
 static volatile bool s_abort = false;
+static bool s_sntp_started = false;
+
+/* ---- SNTP ---- */
+
+static void sntp_sync_cb(struct timeval *tv)
+{
+    struct tm t;
+    localtime_r(&tv->tv_sec, &t);
+    ESP_LOGI(TAG, "SNTP synced: %04d-%02d-%02d %02d:%02d:%02d",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+             t.tm_hour, t.tm_min, t.tm_sec);
+}
+
+void image_store_start_sntp(void)
+{
+    if (s_sntp_started) return;
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_set_time_sync_notification_cb(sntp_sync_cb);
+    esp_sntp_init();
+    s_sntp_started = true;
+    ESP_LOGI(TAG, "SNTP started");
+}
+
+/* ---- Storage ---- */
 
 esp_err_t image_store_init(void)
 {
@@ -96,8 +125,9 @@ esp_err_t image_store_save(const uint8_t *jpeg, size_t jpeg_len,
     slot->meta.jpeg_len = jpeg_len;
     slot->meta.opus_len = opus_len;
     slot->meta.session_id = session_id;
-    slot->meta.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    slot->meta.timestamp = (uint32_t)time(NULL);
     slot->meta.valid = true;
+    image_store_start_sntp();
 
     s_total_bytes += jpeg_len + opus_len;
     s_head = (s_head + 1) % IMAGE_STORE_MAX_SLOTS;
@@ -191,7 +221,7 @@ static esp_err_t handler_api_images(httpd_req_t *req)
             i,
             (unsigned long)m->jpeg_len,
             (unsigned long)m->opus_len,
-            (unsigned long)m->timestamp_ms);
+            (unsigned long)m->timestamp);
         httpd_resp_send_chunk(req, buf, n);
     }
 
@@ -350,6 +380,9 @@ static const char GALLERY_HTML[] =
     "var ovaudio=document.getElementById('ovaudio');"
     "var ovdl=document.getElementById('ovdl');"
     "var empty=document.getElementById('empty');"
+    "function fmtT(ts){if(ts<1600000000)return'--:--';"
+    "var d=new Date(ts*1000);return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',hour12:false})"
+    "+' '+d.toLocaleDateString([],{month:'short',day:'numeric'})}"
     "function openOv(id,hasAudio){"
     "ovimg.src='/img/'+id;ovdl.href='/img/'+id;"
     "if(hasAudio){ovaudio.src='/audio/'+id;ovaudio.style.display='block'}"
@@ -367,7 +400,8 @@ static const char GALLERY_HTML[] =
     "d.setAttribute('data-id',m.id);d.setAttribute('data-audio',m.opus>0?'1':'0');"
     "d.onclick=function(){var el=this;openOv(el.getAttribute('data-id'),el.getAttribute('data-audio')==='1')};"
     "var sz=m.jpeg>1024?(m.jpeg/1024).toFixed(1)+'KB':m.jpeg+'B';"
-    "d.innerHTML='<img src=\"/img/'+m.id+'\" loading=\"lazy\"><div class=\"info\">'+sz+(m.opus>0?' | Audio':'')+'</div>';"
+    "var tm=fmtT(m.ts);"
+    "d.innerHTML='<img src=\"/img/'+m.id+'\" loading=\"lazy\"><div class=\"info\">'+tm+' '+sz+(m.opus>0?' | Audio':'')+'</div>';"
     "grid.appendChild(d)}})}"
     "load();setInterval(load,5000);"
     "</script></body></html>";

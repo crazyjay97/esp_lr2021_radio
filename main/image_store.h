@@ -14,7 +14,7 @@ extern "C" {
 #define IMAGE_STORE_MAX_BYTES   (4U * 1024U * 1024U)
 
 typedef struct {
-    uint32_t timestamp_ms;
+    uint32_t timestamp;
     uint32_t jpeg_len;
     uint32_t opus_len;
     uint16_t session_id;
@@ -22,6 +22,7 @@ typedef struct {
 } image_meta_t;
 
 esp_err_t image_store_init(void);
+void      image_store_start_sntp(void);
 
 esp_err_t image_store_save(const uint8_t *jpeg, size_t jpeg_len,
                            const uint8_t *opus, size_t opus_len,
