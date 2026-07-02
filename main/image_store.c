@@ -1,7 +1,9 @@
 #include "image_store.h"
+#include "app_config.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "opus.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -216,33 +218,97 @@ static esp_err_t handler_img(httpd_req_t *req)
 
 static esp_err_t handler_audio(httpd_req_t *req)
 {
-    int idx = -1;
-    const char *uri = req->uri;
-    const char *num = uri + 7;  /* skip "/audio/" */
-    idx = atoi(num);
+    const char *num = req->uri + 7;  /* skip "/audio/" */
+    int idx = atoi(num);
 
-    size_t len = 0;
-    const uint8_t *data = image_store_get_opus(idx, &len);
-    if (!data) {
+    size_t opus_len = 0;
+    const uint8_t *opus_data = image_store_get_opus(idx, &opus_len);
+    if (!opus_data) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Audio not found");
         return ESP_FAIL;
     }
 
-    s_abort = false;
-    httpd_resp_set_type(req, "audio/ogg");
+    /* Count frames */
+    size_t pos = 0, num_frames = 0;
+    while (pos < opus_len) {
+        uint8_t flen = opus_data[pos++];
+        if (flen == 0 || pos + flen > opus_len) break;
+        pos += flen;
+        num_frames++;
+    }
+    if (num_frames == 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No frames");
+        return ESP_FAIL;
+    }
 
+    uint32_t pcm_samples = num_frames * APP_AUDIO_FRAME_SAMPLES;
+    uint32_t pcm_bytes = pcm_samples * 2;
+    size_t wav_size = 44 + pcm_bytes;
+
+    uint8_t *wav_buf = (uint8_t *)heap_caps_malloc(wav_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!wav_buf) {
+        ESP_LOGE(TAG, "WAV alloc failed (%u)", (unsigned)wav_size);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    /* WAV header */
+    uint32_t file_sz = 36 + pcm_bytes;
+    uint32_t sr = APP_AUDIO_SAMPLE_RATE_HZ;
+    uint32_t brate = sr * 2;
+    uint8_t *h = wav_buf;
+    memcpy(h, "RIFF", 4);
+    h[4]=file_sz; h[5]=file_sz>>8; h[6]=file_sz>>16; h[7]=file_sz>>24;
+    memcpy(h+8, "WAVE", 4);
+    memcpy(h+12, "fmt ", 4);
+    h[16]=16; h[17]=0; h[18]=0; h[19]=0;
+    h[20]=1; h[21]=0;
+    h[22]=1; h[23]=0;
+    h[24]=sr; h[25]=sr>>8; h[26]=sr>>16; h[27]=sr>>24;
+    h[28]=brate; h[29]=brate>>8; h[30]=brate>>16; h[31]=brate>>24;
+    h[32]=2; h[33]=0;
+    h[34]=16; h[35]=0;
+    memcpy(h+36, "data", 4);
+    h[40]=pcm_bytes; h[41]=pcm_bytes>>8; h[42]=pcm_bytes>>16; h[43]=pcm_bytes>>24;
+
+    /* Decode */
+    int err_code = 0;
+    OpusDecoder *dec = opus_decoder_create(APP_AUDIO_SAMPLE_RATE_HZ, 1, &err_code);
+    if (!dec) {
+        heap_caps_free(wav_buf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Decoder err");
+        return ESP_FAIL;
+    }
+
+    int16_t *pcm = (int16_t *)(wav_buf + 44);
+    pos = 0;
+    size_t soff = 0;
+    while (pos < opus_len && soff < pcm_samples) {
+        uint8_t flen = opus_data[pos++];
+        if (flen == 0 || pos + flen > opus_len) break;
+        int got = opus_decode(dec, &opus_data[pos], flen, &pcm[soff], APP_AUDIO_FRAME_SAMPLES, 0);
+        pos += flen;
+        if (got > 0) soff += got;
+    }
+    opus_decoder_destroy(dec);
+
+    /* Send */
+    s_abort = false;
+    httpd_resp_set_type(req, "audio/wav");
     size_t sent = 0;
-    while (sent < len) {
+    while (sent < wav_size) {
         if (s_abort) {
             httpd_resp_send_chunk(req, NULL, 0);
+            heap_caps_free(wav_buf);
             return ESP_OK;
         }
-        size_t chunk = (len - sent > CHUNK_SIZE) ? CHUNK_SIZE : (len - sent);
-        esp_err_t err = httpd_resp_send_chunk(req, (const char *)&data[sent], chunk);
-        if (err != ESP_OK) return err;
+        size_t chunk = (wav_size - sent > CHUNK_SIZE) ? CHUNK_SIZE : (wav_size - sent);
+        esp_err_t err = httpd_resp_send_chunk(req, (const char *)&wav_buf[sent], chunk);
+        if (err != ESP_OK) { heap_caps_free(wav_buf); return err; }
         sent += chunk;
     }
     httpd_resp_send_chunk(req, NULL, 0);
+    heap_caps_free(wav_buf);
     return ESP_OK;
 }
 
