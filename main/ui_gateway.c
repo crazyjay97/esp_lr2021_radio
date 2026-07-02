@@ -120,7 +120,7 @@ static int8_t s_wifi_rssi = 0;
 /* PAGE_QR objects */
 static lv_obj_t *s_qr_canvas = NULL;
 static lv_color_t *s_qr_canvas_buf = NULL;
-static char s_qr_payload[128] = {0};
+static char s_qr_payload[200] = {0};
 
 /* Forward declarations */
 static void create_shared_layout(void);

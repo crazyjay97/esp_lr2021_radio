@@ -792,10 +792,10 @@ void on_wifi_prov_request(void)
     if (err == ESP_OK) {
         const char *name = wifi_mgr_get_service_name();
         const char *pass = wifi_mgr_get_ap_password();
-        char payload[150];
+        char payload[200];
         snprintf(payload, sizeof(payload),
-            "{\"ver\":\"v1\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"softap\"}",
-            name, pass);
+            "{\"ver\":\"v1\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"softap\",\"password\":\"%s\"}",
+            name, pass, pass);
         ui_gw_show_qr(payload);
     } else {
         ESP_LOGE(TAG, "start provisioning failed: %s", esp_err_to_name(err));
