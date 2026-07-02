@@ -940,8 +940,14 @@ extern "C" void app_main(void)
     if ((e = bsp_led_init()) != ESP_OK) {
         ESP_LOGE(TAG, "led init: %s", esp_err_to_name(e));
     }
-    if ((e = bsp_audio_init(APP_AUDIO_SAMPLE_RATE_HZ)) != ESP_OK) {
-        ESP_LOGE(TAG, "audio init: %s", esp_err_to_name(e));
+    if (g_app_mode == AppMode::radio) {
+        if ((e = bsp_audio_init_playback_only(APP_AUDIO_SAMPLE_RATE_HZ)) != ESP_OK) {
+            ESP_LOGE(TAG, "audio init (playback): %s", esp_err_to_name(e));
+        }
+    } else {
+        if ((e = bsp_audio_init(APP_AUDIO_SAMPLE_RATE_HZ)) != ESP_OK) {
+            ESP_LOGE(TAG, "audio init: %s", esp_err_to_name(e));
+        }
     }
     if ((e = g_audio.init()) != ESP_OK) {
         ESP_LOGE(TAG, "audio diagnostics init: %s", esp_err_to_name(e));
@@ -949,12 +955,18 @@ extern "C" void app_main(void)
 #if APP_RADIO_FEATURES_ENABLE
     {
         bool radio_ok = true;
-        if ((e = g_radio.init()) != ESP_OK) {
-            ESP_LOGE(TAG, "radio init: %s", esp_err_to_name(e));
-            radio_ok = false;
+        if (g_app_mode == AppMode::radio) {
+            if ((e = g_radio.init_gateway()) != ESP_OK) {
+                ESP_LOGE(TAG, "radio init (gateway): %s", esp_err_to_name(e));
+                radio_ok = false;
+            }
+        } else {
+            if ((e = g_radio.init()) != ESP_OK) {
+                ESP_LOGE(TAG, "radio init: %s", esp_err_to_name(e));
+                radio_ok = false;
+            }
         }
         if (radio_ok) {
-            // Register image transfer callbacks on both modes
             g_radio.set_image_capture_cb(on_image_capture_request);
             g_radio.set_image_rx_complete_cb(on_image_rx_complete);
             g_radio.set_image_rx_progress_cb(on_image_rx_progress);
@@ -963,8 +975,8 @@ extern "C" void app_main(void)
         }
         if (g_app_mode == AppMode::radio && radio_ok) {
 #if APP_RADIO_TASKS_ENABLE
-            if ((e = g_radio.start()) != ESP_OK) {
-                ESP_LOGE(TAG, "radio task start: %s", esp_err_to_name(e));
+            if ((e = g_radio.start_gateway()) != ESP_OK) {
+                ESP_LOGE(TAG, "radio task start (gateway): %s", esp_err_to_name(e));
             } else {
                 g_radio_active = true;
             }
@@ -972,13 +984,11 @@ extern "C" void app_main(void)
             ESP_LOGW(TAG, "radio initialized but tasks/RX disabled for camera isolation");
 #endif
         } else if (g_app_mode == AppMode::camera && radio_ok) {
-            // Camera mode: start all radio tasks (voice tasks idle, image TX active)
             if ((e = g_radio.start()) != ESP_OK) {
                 ESP_LOGE(TAG, "radio task start (camera mode): %s", esp_err_to_name(e));
             }
             g_radio.enable_opus_preenc(true);
             ESP_LOGI(TAG, "camera mode: radio initialized for image transfer");
-            // Start auto-capture timer
             g_capture_interval_sec = load_capture_interval();
             start_auto_capture_timer();
             update_camera_timer_status();
@@ -989,14 +999,16 @@ extern "C" void app_main(void)
     ESP_LOGW(TAG, "radio feature disabled for camera/audio isolation");
 #endif
 #endif
-    if ((e = g_camera_uart.init()) != ESP_OK) {
-        ESP_LOGE(TAG, "camera init: %s", esp_err_to_name(e));
-    }
+    if (g_app_mode == AppMode::camera) {
+        if ((e = g_camera_uart.init()) != ESP_OK) {
+            ESP_LOGE(TAG, "camera init: %s", esp_err_to_name(e));
+        }
 #if APP_CAMERA_UART_ENABLE
-    if ((e = g_camera_uart.start()) != ESP_OK) {
-        ESP_LOGE(TAG, "camera uart start: %s", esp_err_to_name(e));
-    }
+        if ((e = g_camera_uart.start()) != ESP_OK) {
+            ESP_LOGE(TAG, "camera uart start: %s", esp_err_to_name(e));
+        }
 #endif
+    }
     if ((e = bsp_lcd_init()) != ESP_OK) {
         ESP_LOGE(TAG, "lcd init: %s", esp_err_to_name(e));
     } else if (g_app_mode == AppMode::radio) {

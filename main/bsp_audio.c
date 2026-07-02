@@ -241,13 +241,46 @@ static esp_err_t i2s_init(uint32_t sample_rate_hz)
     return ESP_OK;
 }
 
+static esp_err_t i2s_init_tx_only(uint32_t sample_rate_hz)
+{
+    if (s_tx != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_tx, NULL), TAG, "chan tx-only");
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = {
+            .sample_rate_hz = sample_rate_hz,
+            .clk_src        = I2S_CLK_SRC_DEFAULT,
+            .mclk_multiple  = I2S_MCLK_MULTIPLE_256,
+        },
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                        I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = BSP_I2S0_MCLK_GPIO,
+            .bclk = BSP_I2S0_BCLK_GPIO,
+            .ws   = BSP_I2S0_LRCK_GPIO,
+            .dout = BSP_I2S0_DIN_GPIO,
+            .din  = (gpio_num_t)-1,
+            .invert_flags = { 0 },
+        },
+    };
+    std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_tx, &std_cfg), TAG, "std tx");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx), TAG, "en tx");
+    s_i2s_enabled = true;
+    return ESP_OK;
+}
+
 static esp_err_t i2s_deinit(void)
 {
     esp_err_t ret = ESP_OK;
 
     if (s_i2s_enabled) {
-        esp_err_t err_rx = i2s_channel_disable(s_rx);
-        esp_err_t err_tx = i2s_channel_disable(s_tx);
+        esp_err_t err_rx = (s_rx != NULL) ? i2s_channel_disable(s_rx) : ESP_OK;
+        esp_err_t err_tx = (s_tx != NULL) ? i2s_channel_disable(s_tx) : ESP_OK;
         if (err_rx != ESP_OK) {
             ESP_LOGW(TAG, "I2S RX disable failed: %s", esp_err_to_name(err_rx));
             ret = err_rx;
@@ -327,6 +360,41 @@ esp_err_t bsp_audio_init(uint32_t sample_rate_hz)
     return ESP_OK;
 }
 
+esp_err_t bsp_audio_init_playback_only(uint32_t sample_rate_hz)
+{
+    if (s_audio_ready) return ESP_OK;
+
+    ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c");
+    s_sample_rate_hz = sample_rate_hz;
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = BSP_I2C_ADDR_ES8311,
+        .scl_speed_hz    = BSP_I2C0_FREQ_HZ,
+    };
+    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bsp_i2c_bus(), &dev_cfg, &s_codec),
+                        TAG, "add es8311");
+
+    uint8_t probe;
+    esp_err_t err = es_read(ES8311_RESET_REG00, &probe);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ES8311 not responding on I2C addr 0x%02X (%s)",
+                 BSP_I2C_ADDR_ES8311, esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "ES8311 responded: REG00=0x%02X", probe);
+
+    ESP_RETURN_ON_ERROR(i2s_init_tx_only(sample_rate_hz), TAG, "i2s tx-only");
+    ESP_RETURN_ON_ERROR(es8311_program_regs(), TAG, "es8311 regs");
+
+    bsp_audio_set_volume(70);
+    bsp_audio_pa_enable(false);
+
+    s_audio_ready = true;
+    ESP_LOGI(TAG, "ES8311 + I2S (playback-only) up, Fs=%" PRIu32 " Hz", sample_rate_hz);
+    return ESP_OK;
+}
+
 esp_err_t bsp_audio_pa_enable(bool on)
 {
     return bsp_ioexp_set_pin(BSP_IO_EXP_PA_MUTE_PIN, on);
@@ -383,6 +451,6 @@ esp_err_t bsp_audio_write(const void *buf, size_t bytes, size_t *out_written)
 esp_err_t bsp_audio_read(void *buf, size_t bytes, size_t *out_read)
 {
     if (!s_audio_ready) return ESP_ERR_INVALID_STATE;
-    if (!s_i2s_enabled) return ESP_ERR_INVALID_STATE;
+    if (!s_i2s_enabled || s_rx == NULL) return ESP_ERR_INVALID_STATE;
     return i2s_channel_read(s_rx, buf, bytes, out_read, portMAX_DELAY);
 }

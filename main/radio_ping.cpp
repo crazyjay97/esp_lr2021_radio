@@ -166,6 +166,70 @@ esp_err_t RadioPing::init()
     return ESP_OK;
 }
 
+esp_err_t RadioPing::init_gateway()
+{
+    instance_ = this;
+
+    esp_err_t err = codec_.init_decoder_only();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    voice_queue_ = xQueueCreate(APP_VOICE_RX_QUEUE_LEN, sizeof(VoicePacket));
+    if (voice_queue_ == nullptr) {
+        ESP_LOGE(TAG, "voice queue alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+#if !APP_RADIO_HW_INIT_ENABLE
+    ESP_LOGW(TAG, "LR2021 hardware init disabled");
+    return ESP_OK;
+#endif
+
+    smtc_modem_hal_protect_api_call();
+    ral_status_t status = ral_reset(&radio_.ral);
+    if (status == RAL_STATUS_OK) status = ral_init(&radio_.ral);
+    if (status == RAL_STATUS_OK) {
+        status = ral_set_rx_tx_fallback_mode(&radio_.ral, RAL_FALLBACK_STDBY_XOSC);
+    }
+    if (status == RAL_STATUS_OK) status = ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+    if (status == RAL_STATUS_OK && !configure_flrc()) status = RAL_STATUS_ERROR;
+    if (status == RAL_STATUS_OK) {
+        status = ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+    }
+    smtc_modem_hal_irq_config_radio_irq(&RadioPing::irq_callback, this);
+    smtc_modem_hal_unprotect_api_call();
+
+    if (status != RAL_STATUS_OK) {
+        ESP_LOGE(TAG, "direct RAL init failed: %d", status);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "LR2021 gateway mode (RX-only): FLRC rf=%lu Hz br=%lu bps bw=%lu Hz",
+             APP_FLRC_FREQUENCY_HZ, APP_FLRC_BITRATE_BPS, APP_FLRC_BANDWIDTH_HZ);
+#if APP_RADIO_AUTO_RX_ENABLE
+    schedule_rx();
+#endif
+    return ESP_OK;
+}
+
+esp_err_t RadioPing::start_gateway()
+{
+    BaseType_t ok = xTaskCreatePinnedToCore(task_trampoline, "radio_ping",
+                                            APP_RADIO_TASK_STACK_BYTES, this,
+                                            APP_RADIO_TASK_PRIORITY, &task_handle_,
+                                            APP_RADIO_TASK_CORE);
+    if (ok != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ok = xTaskCreatePinnedToCore(play_task_trampoline, "voice_play",
+                                 APP_VOICE_PLAY_TASK_STACK_BYTES, this,
+                                 APP_VOICE_PLAY_TASK_PRIORITY, nullptr,
+                                 APP_VOICE_PLAY_TASK_CORE);
+    return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
 esp_err_t RadioPing::start()
 {
     BaseType_t ok = xTaskCreatePinnedToCore(task_trampoline, "radio_ping",

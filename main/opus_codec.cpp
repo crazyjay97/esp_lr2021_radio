@@ -49,9 +49,23 @@ esp_err_t OpusCodec::init()
     return ESP_OK;
 }
 
+esp_err_t OpusCodec::init_decoder_only()
+{
+    int err = OPUS_OK;
+    decoder_ = opus_decoder_create(APP_AUDIO_SAMPLE_RATE_HZ, APP_AUDIO_CHANNELS, &err);
+    if (err != OPUS_OK || decoder_ == nullptr) {
+        ESP_LOGE(TAG, "opus_decoder_create failed: %d", err);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Opus decoder-only: %u Hz mono %u ms",
+             APP_AUDIO_SAMPLE_RATE_HZ, APP_AUDIO_FRAME_MS);
+    return ESP_OK;
+}
+
 int OpusCodec::encode(const int16_t *pcm, int frame_samples, uint8_t *out, size_t out_capacity)
 {
-    if (!ready()) return OPUS_INVALID_STATE;
+    if (!can_encode()) return OPUS_INVALID_STATE;
     return opus_encode(encoder_, pcm, frame_samples, out, static_cast<opus_int32>(out_capacity));
 }
 

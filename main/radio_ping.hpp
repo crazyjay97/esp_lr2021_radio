@@ -24,7 +24,9 @@ typedef void (*config_received_cb_t)(uint8_t key, uint32_t value);
 class RadioPing {
 public:
     esp_err_t init();
+    esp_err_t init_gateway();
     esp_err_t start();
+    esp_err_t start_gateway();
     void handle_button(bsp_btn_id_t id, bool pressed);
     void suspend();
     void resume();

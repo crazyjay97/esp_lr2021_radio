@@ -13,7 +13,9 @@ public:
     ~OpusCodec();
 
     esp_err_t init();
-    bool ready() const { return encoder_ != nullptr && decoder_ != nullptr; }
+    esp_err_t init_decoder_only();
+    bool ready() const { return decoder_ != nullptr; }
+    bool can_encode() const { return encoder_ != nullptr; }
 
     int encode(const int16_t *pcm, int frame_samples, uint8_t *out, size_t out_capacity);
     int decode(const uint8_t *packet, size_t packet_len, int16_t *pcm, int frame_samples);
