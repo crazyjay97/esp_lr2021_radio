@@ -108,9 +108,14 @@ static int s_volume_level = 13; /* 0~15, default 13 → 130% */
 static ui_gw_audio_clip_cb_t s_audio_clip_cb = NULL;
 static bool s_audio_clip_on = false;
 static ui_gw_wifi_prov_cb_t s_wifi_prov_cb = NULL;
+static ui_gw_wifi_disconnect_cb_t s_wifi_disconnect_cb = NULL;
 
 /* PAGE_CONFIG WiFi status panel */
+static lv_obj_t *s_cfg_wifi_btn = NULL;
 static lv_obj_t *s_cfg_wifi_lbl = NULL;
+static bool s_wifi_connected = false;
+static char s_wifi_ssid[33] = {0};
+static int8_t s_wifi_rssi = 0;
 
 /* PAGE_QR objects */
 static lv_obj_t *s_qr_canvas = NULL;
@@ -272,6 +277,7 @@ static void destroy_body_children(void)
     memset(s_cfg_touch_btns, 0, sizeof(s_cfg_touch_btns));
     memset(s_cfg_touch_lbls, 0, sizeof(s_cfg_touch_lbls));
     s_cfg_wifi_lbl = NULL;
+    s_cfg_wifi_btn = NULL;
     s_qr_canvas = NULL;
 }
 
@@ -493,7 +499,11 @@ static void create_link_page(void)
 static void cfg_wifi_btn_clicked_cb(lv_event_t *e)
 {
     (void)e;
-    if (s_wifi_prov_cb) s_wifi_prov_cb();
+    if (s_wifi_connected) {
+        if (s_wifi_disconnect_cb) s_wifi_disconnect_cb();
+    } else {
+        if (s_wifi_prov_cb) s_wifi_prov_cb();
+    }
 }
 
 /* ─── Touch button clicked callback ─── */
@@ -638,16 +648,26 @@ static void create_config_page(void)
     lv_obj_set_size(wifi_btn, 224, 36);
     lv_obj_set_pos(wifi_btn, 8, 236);
     lv_obj_set_style_radius(wifi_btn, 6, 0);
-    lv_obj_set_style_bg_color(wifi_btn, COL_GREEN, 0);
     lv_obj_set_style_bg_opa(wifi_btn, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(wifi_btn, 0, 0);
+    lv_obj_clear_flag(wifi_btn, LV_OBJ_FLAG_CLICK_FOCUSABLE);
     lv_obj_add_event_cb(wifi_btn, cfg_wifi_btn_clicked_cb, LV_EVENT_CLICKED, NULL);
+    s_cfg_wifi_btn = wifi_btn;
 
     s_cfg_wifi_lbl = lv_label_create(wifi_btn);
     lv_obj_set_style_text_font(s_cfg_wifi_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_cfg_wifi_lbl, lv_color_white(), 0);
-    lv_label_set_text(s_cfg_wifi_lbl, "CONNECT WIFI");
     lv_obj_center(s_cfg_wifi_lbl);
+
+    if (s_wifi_connected && s_wifi_ssid[0]) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s (%d dBm) [DISCONNECT]", s_wifi_ssid, s_wifi_rssi);
+        lv_label_set_text(s_cfg_wifi_lbl, buf);
+        lv_obj_set_style_bg_color(wifi_btn, COL_AMBER, 0);
+    } else {
+        lv_label_set_text(s_cfg_wifi_lbl, "CONNECT WIFI");
+        lv_obj_set_style_bg_color(wifi_btn, COL_GREEN, 0);
+    }
 
     lv_obj_add_flag(s_body, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -920,6 +940,7 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
         if (s_page == UI_PAGE_RX) goto done;
         ui_page_t next = (ui_page_t)((s_page + 1) % UI_PAGE_COUNT);
         if (next == UI_PAGE_RX) next = UI_PAGE_LINK;
+        if (next == UI_PAGE_QR) next = UI_PAGE_IMAGE;
         show_page(next);
     } else if (key == BSP_BTN_USER1) {
         /* K5 = prev page */
@@ -927,6 +948,7 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
         int prev = (int)s_page - 1;
         if (prev < 0) prev = UI_PAGE_COUNT - 1;
         if (prev == UI_PAGE_RX) prev = UI_PAGE_IMAGE;
+        if (prev == UI_PAGE_QR) prev = UI_PAGE_CONFIG;
         show_page((ui_page_t)prev);
     } else if (key == BSP_BTN_VOL_DN) {
         /* K3 = confirm / capture / retry */
@@ -1107,25 +1129,42 @@ void ui_gw_set_wifi_prov_cb(ui_gw_wifi_prov_cb_t cb)
     s_wifi_prov_cb = cb;
 }
 
+void ui_gw_set_wifi_disconnect_cb(ui_gw_wifi_disconnect_cb_t cb)
+{
+    s_wifi_disconnect_cb = cb;
+}
+
 void ui_gw_wifi_update(const char *state_str, const char *ssid, int8_t rssi)
 {
     if (!s_lock) return;
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
 
-    if (s_cfg_wifi_lbl && s_page == UI_PAGE_CONFIG) {
-        char buf[64];
-        if (ssid && ssid[0]) {
-            snprintf(buf, sizeof(buf), "WiFi: %s (%d dBm)", ssid, rssi);
+    s_wifi_connected = (state_str && strcmp(state_str, "Connected") == 0);
+    if (ssid) {
+        strncpy(s_wifi_ssid, ssid, sizeof(s_wifi_ssid) - 1);
+        s_wifi_ssid[sizeof(s_wifi_ssid) - 1] = '\0';
+    } else {
+        s_wifi_ssid[0] = '\0';
+    }
+    s_wifi_rssi = rssi;
+
+    if (s_cfg_wifi_lbl && s_cfg_wifi_btn) {
+        if (s_wifi_connected && s_wifi_ssid[0]) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%s (%d dBm) [DISCONNECT]", s_wifi_ssid, rssi);
+            lv_label_set_text(s_cfg_wifi_lbl, buf);
+            lv_obj_set_style_bg_color(s_cfg_wifi_btn, COL_AMBER, 0);
+        } else if (state_str && strcmp(state_str, "Connecting...") == 0) {
+            lv_label_set_text(s_cfg_wifi_lbl, "WiFi: Connecting...");
+            lv_obj_set_style_bg_color(s_cfg_wifi_btn, COL_GREEN, 0);
         } else {
-            snprintf(buf, sizeof(buf), "WiFi: %s", state_str ? state_str : "Disconnected");
+            lv_label_set_text(s_cfg_wifi_lbl, "CONNECT WIFI");
+            lv_obj_set_style_bg_color(s_cfg_wifi_btn, COL_GREEN, 0);
         }
-        lv_label_set_text(s_cfg_wifi_lbl, buf);
     }
 
-    if (s_page == UI_PAGE_QR && state_str) {
-        if (strcmp(state_str, "Connected") == 0) {
-            show_page(UI_PAGE_CONFIG);
-        }
+    if (s_page == UI_PAGE_QR && s_wifi_connected) {
+        show_page(UI_PAGE_CONFIG);
     }
 
     xSemaphoreGiveRecursive(s_lock);

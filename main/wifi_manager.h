@@ -20,6 +20,7 @@ typedef void (*wifi_mgr_state_cb_t)(wifi_mgr_state_t state);
 esp_err_t wifi_mgr_init(void);
 esp_err_t wifi_mgr_start_provisioning(void);
 void      wifi_mgr_stop_provisioning(void);
+void      wifi_mgr_disconnect(void);
 
 wifi_mgr_state_t wifi_mgr_get_state(void);
 const char *wifi_mgr_get_ssid(void);

@@ -416,6 +416,19 @@ void wifi_mgr_stop_provisioning(void)
     ESP_LOGI(TAG, "provisioning stopped");
 }
 
+void wifi_mgr_disconnect(void)
+{
+    if (s_state == WIFI_MGR_PROVISIONING) {
+        wifi_mgr_stop_provisioning();
+    }
+    set_state(WIFI_MGR_DISCONNECTED);
+    s_ssid[0] = '\0';
+    if (s_wifi_started) {
+        esp_wifi_disconnect();
+    }
+    ESP_LOGI(TAG, "WiFi disconnected");
+}
+
 wifi_mgr_state_t wifi_mgr_get_state(void)
 {
     if (s_state == WIFI_MGR_CONNECTED) update_rssi();

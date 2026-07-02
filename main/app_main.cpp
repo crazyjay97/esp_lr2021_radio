@@ -782,6 +782,11 @@ bool on_gw_audio_clip_change(uint32_t enable)
 
 void on_wifi_prov_request(void)
 {
+    if (wifi_mgr_get_state() == WIFI_MGR_CONNECTED ||
+        wifi_mgr_get_state() == WIFI_MGR_PROVISIONING) {
+        ESP_LOGW(TAG, "WiFi already active, ignoring prov request");
+        return;
+    }
     ESP_LOGI(TAG, "WiFi provisioning requested");
     esp_err_t err = wifi_mgr_start_provisioning();
     if (err == ESP_OK) {
@@ -795,6 +800,12 @@ void on_wifi_prov_request(void)
     } else {
         ESP_LOGE(TAG, "start provisioning failed: %s", esp_err_to_name(err));
     }
+}
+
+void on_wifi_disconnect_request(void)
+{
+    ESP_LOGI(TAG, "WiFi disconnect requested");
+    wifi_mgr_disconnect();
 }
 
 void on_wifi_state_change(wifi_mgr_state_t state)
@@ -1019,6 +1030,7 @@ extern "C" void app_main(void)
             ui_gw_set_interval_cb(on_gw_interval_change);
             ui_gw_set_audio_clip_cb(on_gw_audio_clip_change);
             ui_gw_set_wifi_prov_cb(on_wifi_prov_request);
+            ui_gw_set_wifi_disconnect_cb(on_wifi_disconnect_request);
 
             wifi_mgr_set_state_cb(on_wifi_state_change);
             wifi_mgr_init();
