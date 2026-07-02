@@ -28,6 +28,10 @@ int8_t     wifi_mgr_get_rssi(void);
 const char *wifi_mgr_get_service_name(void);
 const char *wifi_mgr_get_ap_password(void);
 
+#include "esp_http_server.h"
+httpd_handle_t wifi_mgr_get_httpd(void);
+esp_err_t      wifi_mgr_ensure_httpd(void);
+
 void wifi_mgr_set_state_cb(wifi_mgr_state_cb_t cb);
 
 #ifdef __cplusplus

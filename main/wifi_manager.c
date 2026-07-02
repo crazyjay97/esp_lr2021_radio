@@ -278,6 +278,7 @@ static esp_err_t start_httpd(void)
     cfg.max_uri_handlers = 10;
     cfg.stack_size = 4096;
     cfg.lru_purge_enable = true;
+    cfg.uri_match_fn = httpd_uri_match_wildcard;
     ESP_RETURN_ON_ERROR(httpd_start(&s_httpd, &cfg), TAG, "httpd start");
 
     const httpd_uri_t root = {
@@ -458,4 +459,14 @@ const char *wifi_mgr_get_ap_password(void)
 void wifi_mgr_set_state_cb(wifi_mgr_state_cb_t cb)
 {
     s_state_cb = cb;
+}
+
+httpd_handle_t wifi_mgr_get_httpd(void)
+{
+    return s_httpd;
+}
+
+esp_err_t wifi_mgr_ensure_httpd(void)
+{
+    return start_httpd();
 }

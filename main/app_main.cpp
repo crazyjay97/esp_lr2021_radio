@@ -5,6 +5,7 @@
 #include "opus_codec.hpp"
 #include "ui_gateway.h"
 #include "wifi_manager.h"
+#include "image_store.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -608,6 +609,9 @@ void on_image_rx_complete(ImageTransfer *xfer)
         jpeg_dec_close(decoder);
     }
 
+    // Save to image store for HTTP gallery
+    image_store_save(jpeg_data, jpeg_len, opus_data, opus_len, sid);
+
     // Play audio if present
     if (opus_data && opus_len > 0) {
         play_audio_clip(opus_data, opus_len);
@@ -764,6 +768,7 @@ void on_image_rx_eot_nack(uint16_t missing_count, bool is_first_eot)
 void on_gw_capture(void)
 {
     ESP_LOGI(TAG, "UI capture: trigger remote photo");
+    image_store_abort_transfer();
     g_radio.trigger_image_capture();
 }
 
@@ -818,6 +823,14 @@ void on_wifi_state_change(wifi_mgr_state_t state)
     default: break;
     }
     ui_gw_wifi_update(str, wifi_mgr_get_ssid(), wifi_mgr_get_rssi());
+
+    if (state == WIFI_MGR_CONNECTED) {
+        wifi_mgr_ensure_httpd();
+        httpd_handle_t h = wifi_mgr_get_httpd();
+        if (h) {
+            image_store_register_httpd(h);
+        }
+    }
 }
 
 void on_button(bsp_btn_id_t id, bool pressed, void *user)
@@ -1034,6 +1047,7 @@ extern "C" void app_main(void)
 
             wifi_mgr_set_state_cb(on_wifi_state_change);
             wifi_mgr_init();
+            image_store_init();
         }
     } else if ((e = bsp_lcd_start_camera_ui(on_lcd_capture, nullptr)) != ESP_OK) {
         ESP_LOGE(TAG, "camera ui start: %s", esp_err_to_name(e));
