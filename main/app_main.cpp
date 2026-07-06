@@ -13,6 +13,7 @@
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "driver/gpio.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_jpeg_common.h"
@@ -227,6 +228,20 @@ void start_countdown_timer()
     };
     esp_timer_create(&args, &g_countdown_timer);
     esp_timer_start_periodic(g_countdown_timer, 1000000ULL);
+}
+
+static void IRAM_ATTR pir_isr_handler(void *arg)
+{
+    static_cast<RadioPing *>(arg)->pir_trigger();
+}
+
+void pir_arm_timer_cb(void *arg)
+{
+    gpio_intr_disable(APP_PIR_GPIO);
+    gpio_isr_handler_add(APP_PIR_GPIO, pir_isr_handler, arg);
+    gpio_set_intr_type(APP_PIR_GPIO, GPIO_INTR_POSEDGE);
+    gpio_intr_enable(APP_PIR_GPIO);
+    ESP_LOGI(TAG, "PIR: GPIO%d rising edge armed", APP_PIR_GPIO);
 }
 
 void on_config_received(uint8_t key, uint32_t value)
@@ -1027,6 +1042,29 @@ extern "C" void app_main(void)
             start_auto_capture_timer();
             update_camera_timer_status();
             start_countdown_timer();
+
+            // PIR sensor on GPIO12: delay 5s then arm rising edge
+            // (allow residual touch IC signals to settle after power-on)
+            gpio_config_t pir_cfg = {
+                .pin_bit_mask = 1ULL << APP_PIR_GPIO,
+                .mode = GPIO_MODE_INPUT,
+                .pull_up_en = GPIO_PULLUP_DISABLE,
+                .pull_down_en = GPIO_PULLDOWN_ENABLE,
+                .intr_type = GPIO_INTR_DISABLE,
+            };
+            gpio_config(&pir_cfg);
+            gpio_install_isr_service(0); // OK if already installed
+            ESP_LOGI(TAG, "PIR: GPIO%d configured, arming in 5s...", APP_PIR_GPIO);
+            const esp_timer_create_args_t pir_arm_args = {
+                .callback = pir_arm_timer_cb,
+                .arg = &g_radio,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "pir_arm",
+                .skip_unhandled_events = true,
+            };
+            esp_timer_handle_t pir_arm_timer = nullptr;
+            esp_timer_create(&pir_arm_args, &pir_arm_timer);
+            esp_timer_start_once(pir_arm_timer, 5000000ULL); // 5s
         }
     }
 #else

@@ -4,6 +4,7 @@
 #include <cstddef>
 
 #include "esp_err.h"
+#include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "app_config.h"
@@ -52,6 +53,7 @@ public:
     void resume_audio_capture() { image_tx_active_ = false; }
     void enable_opus_preenc(bool en) { opus_preenc_enabled_ = en; }
     void set_sound_trigger_level(uint32_t level) { sound_trigger_level_ = level; }
+    void IRAM_ATTR pir_trigger() { pir_triggered_ = true; }
 
     // Audio ring buffer for pre-capture retrospective recording
     size_t snapshot_audio(int16_t *out, size_t max_samples);
@@ -193,8 +195,9 @@ private:
     // Config ACK state
     volatile bool config_ack_received_ = false;
 
-    // Sound trigger state
+    // Sound/PIR trigger state (shared cooldown)
     uint32_t sound_trigger_level_ = 0;
-    int64_t last_sound_trigger_us_ = 0;
+    int64_t last_trigger_us_ = 0;
     uint16_t sound_trigger_session_id_ = 0xC000;
+    volatile bool pir_triggered_ = false;
 };
