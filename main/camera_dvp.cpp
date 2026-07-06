@@ -433,7 +433,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     }
 
     // DVP now outputs XCLK on GPIO3 - wait for sensor to stabilize
-    vTaskDelay(pdMS_TO_TICKS(80));
+    vTaskDelay(pdMS_TO_TICKS(100));
 
     uint8_t *frame_bufs[kCaptureDmaBufferCount] = {};
     for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
