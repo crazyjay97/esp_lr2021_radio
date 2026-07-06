@@ -1,8 +1,10 @@
 #include "radio_ping.hpp"
 
 #include <cstring>
+#include <cmath>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -386,6 +388,28 @@ void RadioPing::tx_task()
         }
 
         audio_ringbuf_.write(tx_pcm_, APP_AUDIO_FRAME_SAMPLES);
+
+        if (sound_trigger_level_ > 0) {
+            int64_t sum_sq = 0;
+            for (size_t i = 0; i < APP_AUDIO_FRAME_SAMPLES; i++) {
+                int32_t s = tx_pcm_[i];
+                sum_sq += s * s;
+            }
+            uint16_t rms = (uint16_t)sqrtf((float)sum_sq / APP_AUDIO_FRAME_SAMPLES);
+            uint16_t thresh = (sound_trigger_level_ == 1) ? APP_SOUND_TRIGGER_THRESH_LOW :
+                              (sound_trigger_level_ == 2) ? APP_SOUND_TRIGGER_THRESH_MED :
+                                                           APP_SOUND_TRIGGER_THRESH_HIGH;
+            if (rms >= thresh) {
+                int64_t now = esp_timer_get_time();
+                if ((now - last_sound_trigger_us_) >= (int64_t)APP_SOUND_TRIGGER_COOLDOWN_SEC * 1000000LL) {
+                    last_sound_trigger_us_ = now;
+                    ESP_LOGI(TAG, "sound trigger! rms=%u thresh=%u", rms, thresh);
+                    if (image_capture_cb_) {
+                        image_capture_cb_(sound_trigger_session_id_++);
+                    }
+                }
+            }
+        }
 
         if (opus_preenc_enabled_) {
             uint8_t enc_buf[APP_OPUS_MAX_PACKET_BYTES];

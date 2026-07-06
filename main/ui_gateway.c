@@ -101,12 +101,15 @@ static bool s_stats_first_eot_seen = false;
 /* PAGE_CONFIG objects */
 static lv_obj_t *s_cfg_rows[6] = {NULL};
 static lv_obj_t *s_cfg_val_lbls[6] = {NULL};
-static lv_obj_t *s_cfg_touch_btns[4] = {NULL};
-static lv_obj_t *s_cfg_touch_lbls[4] = {NULL};
+static lv_obj_t *s_cfg_touch_btns[5] = {NULL};
+static lv_obj_t *s_cfg_touch_lbls[5] = {NULL};
 static int s_cfg_sel = 0;
 static int s_volume_level = 13; /* 0~15, default 13 → 130% */
 static ui_gw_audio_clip_cb_t s_audio_clip_cb = NULL;
 static bool s_audio_clip_on = false;
+static ui_gw_sound_trigger_cb_t s_sound_trigger_cb = NULL;
+static int s_sound_trigger_idx = 0;
+static const char *s_trigger_labels[] = {"Off", "Low", "Med", "High"};
 static ui_gw_wifi_prov_cb_t s_wifi_prov_cb = NULL;
 static ui_gw_wifi_disconnect_cb_t s_wifi_disconnect_cb = NULL;
 
@@ -562,6 +565,24 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
             lv_label_set_text(s_cfg_val_lbls[5], buf);
         }
         break;
+    case 4: /* Sound trigger cycle */
+        s_sound_trigger_idx = (s_sound_trigger_idx + 1) % 4;
+        if (s_cfg_touch_lbls[4]) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "Snd: %s", s_trigger_labels[s_sound_trigger_idx]);
+            lv_label_set_text(s_cfg_touch_lbls[4], buf);
+        }
+        if (s_cfg_touch_btns[4]) {
+            lv_obj_set_style_bg_color(s_cfg_touch_btns[4],
+                s_sound_trigger_idx > 0 ? COL_AMBER : lv_color_hex(0xEDF4EF), 0);
+            lv_obj_set_style_text_color(s_cfg_touch_lbls[4],
+                s_sound_trigger_idx > 0 ? lv_color_white() : COL_TEXT_MAIN, 0);
+        }
+        if (s_cfg_val_lbls[2]) {
+            lv_label_set_text(s_cfg_val_lbls[2], s_trigger_labels[s_sound_trigger_idx]);
+        }
+        if (s_sound_trigger_cb) s_sound_trigger_cb((uint32_t)s_sound_trigger_idx);
+        break;
     }
 }
 
@@ -586,7 +607,7 @@ static void create_config_page(void)
     static const char *cfg_keys[] = {"JPEG Quality", "Resolution", "Trigger", "Interval", "Audio", "Volume"};
     char vol_str[8];
     snprintf(vol_str, sizeof(vol_str), "%d", s_volume_level);
-    const char *cfg_vals[] = {"Q=50", "VGA", "Manual", s_interval_labels[s_cfg_interval_idx], s_audio_clip_on ? "On" : "Off", vol_str};
+    const char *cfg_vals[] = {"Q=50", "VGA", s_trigger_labels[s_sound_trigger_idx], s_interval_labels[s_cfg_interval_idx], s_audio_clip_on ? "On" : "Off", vol_str};
 
     for (int i = 0; i < 6; i++) {
         s_cfg_rows[i] = create_kv_row(panel, cfg_keys[i], cfg_vals[i], &s_cfg_val_lbls[i]);
@@ -596,10 +617,10 @@ static void create_config_page(void)
         }
     }
 
-    /* 4 touch buttons in 2x2 grid */
+    /* 5 touch buttons in 2-col wrap grid */
     lv_obj_t *btn_grid = lv_obj_create(s_body);
     lv_obj_remove_style_all(btn_grid);
-    lv_obj_set_size(btn_grid, 224, 92);
+    lv_obj_set_size(btn_grid, 224, 138);
     lv_obj_set_pos(btn_grid, 8, 140);
     lv_obj_clear_flag(btn_grid, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_layout(btn_grid, LV_LAYOUT_FLEX);
@@ -611,9 +632,11 @@ static void create_config_page(void)
     snprintf(interval_buf, sizeof(interval_buf), "T: %s", s_interval_labels[s_cfg_interval_idx]);
     char vol_buf[12];
     snprintf(vol_buf, sizeof(vol_buf), "Vol: %d", s_volume_level);
-    const char *btn_labels[] = {"Capture", s_audio_clip_on ? "Audio ON" : "Audio OFF", interval_buf, vol_buf};
+    char snd_buf[16];
+    snprintf(snd_buf, sizeof(snd_buf), "Snd: %s", s_trigger_labels[s_sound_trigger_idx]);
+    const char *btn_labels[] = {"Capture", s_audio_clip_on ? "Audio ON" : "Audio OFF", interval_buf, vol_buf, snd_buf};
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         lv_obj_t *btn = lv_btn_create(btn_grid);
         lv_obj_set_size(btn, 109, 40);
         lv_obj_set_style_radius(btn, 6, 0);
@@ -622,6 +645,8 @@ static void create_config_page(void)
 
         if (i == 1 && s_audio_clip_on) {
             lv_obj_set_style_bg_color(btn, COL_AMBER, 0);
+        } else if (i == 4 && s_sound_trigger_idx > 0) {
+            lv_obj_set_style_bg_color(btn, COL_AMBER, 0);
         } else {
             lv_obj_set_style_bg_color(btn, lv_color_hex(0xEDF4EF), 0);
         }
@@ -629,7 +654,7 @@ static void create_config_page(void)
 
         lv_obj_t *lbl = lv_label_create(btn);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-        if (i == 1 && s_audio_clip_on) {
+        if ((i == 1 && s_audio_clip_on) || (i == 4 && s_sound_trigger_idx > 0)) {
             lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
         } else {
             lv_obj_set_style_text_color(lbl, COL_TEXT_MAIN, 0);
@@ -646,7 +671,7 @@ static void create_config_page(void)
     /* WiFi status button below buttons */
     lv_obj_t *wifi_btn = lv_btn_create(s_body);
     lv_obj_set_size(wifi_btn, 224, 36);
-    lv_obj_set_pos(wifi_btn, 8, 236);
+    lv_obj_set_pos(wifi_btn, 8, 282);
     lv_obj_set_style_radius(wifi_btn, 6, 0);
     lv_obj_set_style_bg_opa(wifi_btn, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(wifi_btn, 0, 0);
@@ -830,6 +855,11 @@ void ui_gw_set_interval_cb(ui_gw_interval_cb_t cb)
 void ui_gw_set_audio_clip_cb(ui_gw_audio_clip_cb_t cb)
 {
     s_audio_clip_cb = cb;
+}
+
+void ui_gw_set_sound_trigger_cb(ui_gw_sound_trigger_cb_t cb)
+{
+    s_sound_trigger_cb = cb;
 }
 
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed)

@@ -250,6 +250,9 @@ void on_config_received(uint8_t key, uint32_t value)
         g_audio_clip_enabled = (value != 0);
         update_camera_timer_status();
         ESP_LOGI(TAG, "config: audio_clip=%s", g_audio_clip_enabled ? "on" : "off");
+    } else if (key == APP_CFG_KEY_SOUND_TRIGGER) {
+        g_radio.set_sound_trigger_level(value);
+        ESP_LOGI(TAG, "config: sound_trigger=%lu", static_cast<unsigned long>(value));
     }
 }
 
@@ -785,6 +788,12 @@ bool on_gw_audio_clip_change(uint32_t enable)
     return g_radio.send_config(APP_CFG_KEY_AUDIO_CLIP, enable);
 }
 
+bool on_gw_sound_trigger_change(uint32_t level)
+{
+    ESP_LOGI(TAG, "UI sound trigger: %lu", static_cast<unsigned long>(level));
+    return g_radio.send_config(APP_CFG_KEY_SOUND_TRIGGER, level);
+}
+
 void on_wifi_prov_request(void)
 {
     if (wifi_mgr_get_state() == WIFI_MGR_CONNECTED ||
@@ -1043,6 +1052,7 @@ extern "C" void app_main(void)
             ui_gw_set_capture_cb(on_gw_capture);
             ui_gw_set_interval_cb(on_gw_interval_change);
             ui_gw_set_audio_clip_cb(on_gw_audio_clip_change);
+            ui_gw_set_sound_trigger_cb(on_gw_sound_trigger_change);
             ui_gw_set_wifi_prov_cb(on_wifi_prov_request);
             ui_gw_set_wifi_disconnect_cb(on_wifi_disconnect_request);
 
