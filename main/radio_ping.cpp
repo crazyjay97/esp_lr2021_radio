@@ -413,12 +413,14 @@ void RadioPing::tx_task()
 
         if (pir_triggered_) {
             pir_triggered_ = false;
-            int64_t now = esp_timer_get_time();
-            if ((now - last_trigger_us_) >= (int64_t)APP_TRIGGER_COOLDOWN_SEC * 1000000LL) {
-                last_trigger_us_ = now;
-                ESP_LOGI(TAG, "PIR trigger!");
-                if (image_capture_cb_) {
-                    image_capture_cb_(sound_trigger_session_id_++);
+            if (pir_enabled_) {
+                int64_t now = esp_timer_get_time();
+                if ((now - last_trigger_us_) >= (int64_t)APP_TRIGGER_COOLDOWN_SEC * 1000000LL) {
+                    last_trigger_us_ = now;
+                    ESP_LOGI(TAG, "PIR trigger!");
+                    if (image_capture_cb_) {
+                        image_capture_cb_(sound_trigger_session_id_++);
+                    }
                 }
             }
         }

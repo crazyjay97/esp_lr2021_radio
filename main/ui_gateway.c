@@ -101,8 +101,8 @@ static bool s_stats_first_eot_seen = false;
 /* PAGE_CONFIG objects */
 static lv_obj_t *s_cfg_rows[6] = {NULL};
 static lv_obj_t *s_cfg_val_lbls[6] = {NULL};
-static lv_obj_t *s_cfg_touch_btns[5] = {NULL};
-static lv_obj_t *s_cfg_touch_lbls[5] = {NULL};
+static lv_obj_t *s_cfg_touch_btns[6] = {NULL};
+static lv_obj_t *s_cfg_touch_lbls[6] = {NULL};
 static int s_cfg_sel = 0;
 static int s_volume_level = 13; /* 0~15, default 13 → 130% */
 static ui_gw_audio_clip_cb_t s_audio_clip_cb = NULL;
@@ -110,6 +110,8 @@ static bool s_audio_clip_on = false;
 static ui_gw_sound_trigger_cb_t s_sound_trigger_cb = NULL;
 static int s_sound_trigger_idx = 0;
 static const char *s_trigger_labels[] = {"Off", "Low", "Med", "High"};
+static ui_gw_pir_trigger_cb_t s_pir_trigger_cb = NULL;
+static bool s_pir_on = false;
 static ui_gw_wifi_prov_cb_t s_wifi_prov_cb = NULL;
 static ui_gw_wifi_disconnect_cb_t s_wifi_disconnect_cb = NULL;
 
@@ -583,6 +585,19 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
         }
         if (s_sound_trigger_cb) s_sound_trigger_cb((uint32_t)s_sound_trigger_idx);
         break;
+    case 5: /* PIR trigger toggle */
+        s_pir_on = !s_pir_on;
+        if (s_cfg_touch_btns[5]) {
+            lv_obj_set_style_bg_color(s_cfg_touch_btns[5],
+                s_pir_on ? COL_AMBER : lv_color_hex(0xEDF4EF), 0);
+        }
+        if (s_cfg_touch_lbls[5]) {
+            lv_label_set_text(s_cfg_touch_lbls[5], s_pir_on ? "PIR ON" : "PIR OFF");
+            lv_obj_set_style_text_color(s_cfg_touch_lbls[5],
+                s_pir_on ? lv_color_white() : COL_TEXT_MAIN, 0);
+        }
+        if (s_pir_trigger_cb) s_pir_trigger_cb(s_pir_on ? 1 : 0);
+        break;
     }
 }
 
@@ -634,9 +649,9 @@ static void create_config_page(void)
     snprintf(vol_buf, sizeof(vol_buf), "Vol: %d", s_volume_level);
     char snd_buf[16];
     snprintf(snd_buf, sizeof(snd_buf), "Snd: %s", s_trigger_labels[s_sound_trigger_idx]);
-    const char *btn_labels[] = {"Capture", s_audio_clip_on ? "Audio ON" : "Audio OFF", interval_buf, vol_buf, snd_buf};
+    const char *btn_labels[] = {"Capture", s_audio_clip_on ? "Audio ON" : "Audio OFF", interval_buf, vol_buf, snd_buf, s_pir_on ? "PIR ON" : "PIR OFF"};
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         lv_obj_t *btn = lv_btn_create(btn_grid);
         lv_obj_set_size(btn, 109, 40);
         lv_obj_set_style_radius(btn, 6, 0);
@@ -647,6 +662,8 @@ static void create_config_page(void)
             lv_obj_set_style_bg_color(btn, COL_AMBER, 0);
         } else if (i == 4 && s_sound_trigger_idx > 0) {
             lv_obj_set_style_bg_color(btn, COL_AMBER, 0);
+        } else if (i == 5 && s_pir_on) {
+            lv_obj_set_style_bg_color(btn, COL_AMBER, 0);
         } else {
             lv_obj_set_style_bg_color(btn, lv_color_hex(0xEDF4EF), 0);
         }
@@ -654,7 +671,7 @@ static void create_config_page(void)
 
         lv_obj_t *lbl = lv_label_create(btn);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-        if ((i == 1 && s_audio_clip_on) || (i == 4 && s_sound_trigger_idx > 0)) {
+        if ((i == 1 && s_audio_clip_on) || (i == 4 && s_sound_trigger_idx > 0) || (i == 5 && s_pir_on)) {
             lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
         } else {
             lv_obj_set_style_text_color(lbl, COL_TEXT_MAIN, 0);
@@ -860,6 +877,11 @@ void ui_gw_set_audio_clip_cb(ui_gw_audio_clip_cb_t cb)
 void ui_gw_set_sound_trigger_cb(ui_gw_sound_trigger_cb_t cb)
 {
     s_sound_trigger_cb = cb;
+}
+
+void ui_gw_set_pir_trigger_cb(ui_gw_pir_trigger_cb_t cb)
+{
+    s_pir_trigger_cb = cb;
 }
 
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed)

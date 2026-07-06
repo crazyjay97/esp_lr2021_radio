@@ -268,6 +268,9 @@ void on_config_received(uint8_t key, uint32_t value)
     } else if (key == APP_CFG_KEY_SOUND_TRIGGER) {
         g_radio.set_sound_trigger_level(value);
         ESP_LOGI(TAG, "config: sound_trigger=%lu", static_cast<unsigned long>(value));
+    } else if (key == APP_CFG_KEY_PIR_TRIGGER) {
+        g_radio.set_pir_enabled(value != 0);
+        ESP_LOGI(TAG, "config: pir_trigger=%s", value ? "on" : "off");
     }
 }
 
@@ -809,6 +812,12 @@ bool on_gw_sound_trigger_change(uint32_t level)
     return g_radio.send_config(APP_CFG_KEY_SOUND_TRIGGER, level);
 }
 
+bool on_gw_pir_trigger_change(uint32_t enable)
+{
+    ESP_LOGI(TAG, "UI PIR trigger: %s", enable ? "on" : "off");
+    return g_radio.send_config(APP_CFG_KEY_PIR_TRIGGER, enable);
+}
+
 void on_wifi_prov_request(void)
 {
     if (wifi_mgr_get_state() == WIFI_MGR_CONNECTED ||
@@ -1091,6 +1100,7 @@ extern "C" void app_main(void)
             ui_gw_set_interval_cb(on_gw_interval_change);
             ui_gw_set_audio_clip_cb(on_gw_audio_clip_change);
             ui_gw_set_sound_trigger_cb(on_gw_sound_trigger_change);
+            ui_gw_set_pir_trigger_cb(on_gw_pir_trigger_change);
             ui_gw_set_wifi_prov_cb(on_wifi_prov_request);
             ui_gw_set_wifi_disconnect_cb(on_wifi_disconnect_request);
 
