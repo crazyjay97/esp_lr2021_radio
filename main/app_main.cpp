@@ -1159,27 +1159,27 @@ extern "C" void app_main(void)
         }
 #endif
     }
-    if ((e = bsp_lcd_init()) != ESP_OK) {
-        ESP_LOGE(TAG, "lcd init: %s", esp_err_to_name(e));
-    } else if (g_app_mode == AppMode::radio) {
-        if ((e = bsp_lcd_start_gateway_ui()) != ESP_OK) {
-            ESP_LOGE(TAG, "gateway ui start: %s", esp_err_to_name(e));
-        } else {
-            ui_gw_set_capture_cb(on_gw_capture);
-            ui_gw_set_interval_cb(on_gw_interval_change);
-            ui_gw_set_audio_clip_cb(on_gw_audio_clip_change);
-            ui_gw_set_sound_trigger_cb(on_gw_sound_trigger_change);
-            ui_gw_set_pir_trigger_cb(on_gw_pir_trigger_change);
-            ui_gw_set_voice_alarm_cb(on_gw_voice_alarm_change);
-            ui_gw_set_wifi_prov_cb(on_wifi_prov_request);
-            ui_gw_set_wifi_disconnect_cb(on_wifi_disconnect_request);
+    if (g_app_mode != AppMode::camera) {
+        if ((e = bsp_lcd_init()) != ESP_OK) {
+            ESP_LOGE(TAG, "lcd init: %s", esp_err_to_name(e));
+        } else if (g_app_mode == AppMode::radio) {
+            if ((e = bsp_lcd_start_gateway_ui()) != ESP_OK) {
+                ESP_LOGE(TAG, "gateway ui start: %s", esp_err_to_name(e));
+            } else {
+                ui_gw_set_capture_cb(on_gw_capture);
+                ui_gw_set_interval_cb(on_gw_interval_change);
+                ui_gw_set_audio_clip_cb(on_gw_audio_clip_change);
+                ui_gw_set_sound_trigger_cb(on_gw_sound_trigger_change);
+                ui_gw_set_pir_trigger_cb(on_gw_pir_trigger_change);
+                ui_gw_set_voice_alarm_cb(on_gw_voice_alarm_change);
+                ui_gw_set_wifi_prov_cb(on_wifi_prov_request);
+                ui_gw_set_wifi_disconnect_cb(on_wifi_disconnect_request);
 
-            wifi_mgr_set_state_cb(on_wifi_state_change);
-            wifi_mgr_init();
-            image_store_init();
+                wifi_mgr_set_state_cb(on_wifi_state_change);
+                wifi_mgr_init();
+                image_store_init();
+            }
         }
-    } else if ((e = bsp_lcd_start_camera_ui(on_lcd_capture, nullptr)) != ESP_OK) {
-        ESP_LOGE(TAG, "camera ui start: %s", esp_err_to_name(e));
     }
 #if APP_AUDIO_FEATURES_ENABLE
     if ((e = bsp_button_init(on_button, nullptr)) != ESP_OK) {

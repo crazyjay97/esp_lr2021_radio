@@ -4,6 +4,9 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "esp_cam_ctlr.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 class CameraUartStreamer {
 public:
@@ -21,8 +24,14 @@ private:
     esp_err_t set_pwdn(bool asserted);
     esp_err_t reset_sensor();
     esp_err_t soft_power_down();
+    esp_err_t ensure_dvp_ready();
 
     bool initialized_ = false;
     bool sensor_configured_ = false;
     bool sensor_awake_ = false;
+    bool dvp_ready_ = false;
+
+    esp_cam_ctlr_handle_t cam_handle_ = nullptr;
+    uint8_t *frame_bufs_[4] = {};
+    SemaphoreHandle_t capture_sem_ = nullptr;
 };

@@ -9,7 +9,6 @@
 #include "board_config.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
-#include "driver/ledc.h"
 #include "esp_cam_ctlr.h"
 #include "esp_cam_ctlr_dvp.h"
 #include "esp_check.h"
@@ -44,13 +43,16 @@ constexpr uint32_t kOutputPixelformat = kFourccGrey;
 struct dvp_cb_ctx {
     uint8_t *buffers[kCaptureDmaBufferCount];
     size_t buflen;
-    size_t received;
-    int frame_count;
+    volatile size_t received;
+    volatile int frame_count;
     size_t next_buffer;
-    size_t last_received;
-    uint8_t *captured_buffer;
+    volatile size_t last_received;
+    volatile uint8_t *captured_buffer;
     SemaphoreHandle_t done_sem;
+    volatile int capture_target;
 };
+
+static dvp_cb_ctx s_dvp_ctx;
 
 static bool IRAM_ATTR on_get_new_trans(esp_cam_ctlr_handle_t handle,
                                        esp_cam_ctlr_trans_t *trans, void *user_data)
@@ -69,11 +71,12 @@ static bool IRAM_ATTR on_trans_finished(esp_cam_ctlr_handle_t handle,
                                         esp_cam_ctlr_trans_t *trans, void *user_data)
 {
     dvp_cb_ctx *ctx = static_cast<dvp_cb_ctx *>(user_data);
-    ctx->frame_count++;
+    ctx->frame_count = ctx->frame_count + 1;
     ctx->last_received = trans->received_size;
-    if (ctx->frame_count >= 2) {
+    if (ctx->capture_target > 0 && ctx->frame_count >= ctx->capture_target) {
         ctx->received = trans->received_size;
         ctx->captured_buffer = static_cast<uint8_t *>(trans->buffer);
+        ctx->capture_target = 0;
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         xSemaphoreGiveFromISR(ctx->done_sem, &xHigherPriorityTaskWoken);
         return xHigherPriorityTaskWoken == pdTRUE;
@@ -202,33 +205,23 @@ esp_err_t CameraUartStreamer::init()
     if (initialized_) return ESP_OK;
     ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c init");
 
-    // Start MCLK output immediately - SP0A39 needs clock to respond to I2C
-    ledc_timer_config_t ledc_timer = {};
-    ledc_timer.speed_mode = LEDC_LOW_SPEED_MODE;
-    ledc_timer.timer_num = LEDC_TIMER_1;
-    ledc_timer.duty_resolution = LEDC_TIMER_1_BIT;
-    ledc_timer.freq_hz = APP_SP0A39_MCLK_HZ;
-    ledc_timer.clk_cfg = LEDC_AUTO_CLK;
-    ESP_RETURN_ON_ERROR(ledc_timer_config(&ledc_timer), TAG, "ledc timer");
+    // Configure DVP data pins
+    configure_camera_pins();
 
-    ledc_channel_config_t ledc_ch = {};
-    ledc_ch.speed_mode = LEDC_LOW_SPEED_MODE;
-    ledc_ch.channel = LEDC_CHANNEL_1;
-    ledc_ch.timer_sel = LEDC_TIMER_1;
-    ledc_ch.intr_type = LEDC_INTR_DISABLE;
-    ledc_ch.gpio_num = BSP_SP0A39_MCLK_GPIO;
-    ledc_ch.duty = 1;
-    ledc_ch.hpoint = 0;
-    ESP_RETURN_ON_ERROR(ledc_channel_config(&ledc_ch), TAG, "ledc channel");
-    ESP_LOGI(TAG, "MCLK running on GPIO%d at %lu Hz", BSP_SP0A39_MCLK_GPIO, APP_SP0A39_MCLK_HZ);
+    // Create DVP controller first — it provides XCLK to the sensor
+    esp_err_t ret = ensure_dvp_ready();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "DVP create failed: %s", esp_err_to_name(ret));
+        initialized_ = true;
+        return ESP_OK;
+    }
 
-    // Pre-init sensor at boot so first capture can use the fast path
+    // Now sensor has XCLK, wake it and configure registers
     set_pwdn(false);
     vTaskDelay(pdMS_TO_TICKS(200));
-    esp_err_t ret = reset_sensor();
+    ret = reset_sensor();
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "sensor pre-init reset failed: %s", esp_err_to_name(ret));
-        set_pwdn(true);
+        ESP_LOGW(TAG, "sensor reset failed: %s", esp_err_to_name(ret));
         initialized_ = true;
         return ESP_OK;
     }
@@ -236,8 +229,7 @@ esp_err_t CameraUartStreamer::init()
 
     ret = sensor_i2c_attach();
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "sensor pre-init i2c failed: %s", esp_err_to_name(ret));
-        set_pwdn(true);
+        ESP_LOGW(TAG, "sensor i2c failed: %s", esp_err_to_name(ret));
         initialized_ = true;
         return ESP_OK;
     }
@@ -249,12 +241,21 @@ esp_err_t CameraUartStreamer::init()
     }
     if (ret == ESP_OK) {
         sensor_configured_ = true;
-        ESP_LOGI(TAG, "sensor pre-initialized at boot");
+        sensor_awake_ = true;
+        ESP_LOGI(TAG, "sensor initialized, DVP ready");
     } else {
-        ESP_LOGW(TAG, "sensor pre-init regs failed: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "sensor regs failed: %s", esp_err_to_name(ret));
     }
 
-    set_pwdn(true);
+    // Sensor configured — now start DVP permanently
+    s_dvp_ctx.capture_target = 0;
+    ret = esp_cam_ctlr_start(cam_handle_);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_cam_ctlr_start failed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "DVP running permanently");
+    }
+
     initialized_ = true;
     return ESP_OK;
 }
@@ -313,6 +314,15 @@ esp_err_t CameraUartStreamer::configure_camera_pins()
 
 esp_err_t CameraUartStreamer::power_down()
 {
+    if (dvp_ready_ && cam_handle_) {
+        esp_cam_ctlr_disable(cam_handle_);
+        esp_cam_ctlr_del(cam_handle_);
+        cam_handle_ = nullptr;
+        for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
+            if (frame_bufs_[i]) { heap_caps_free(frame_bufs_[i]); frame_bufs_[i] = nullptr; }
+        }
+        dvp_ready_ = false;
+    }
     set_pwdn(true);
     gpio_reset_pin(BSP_SP0A39_RESET_GPIO);
     sensor_i2c_detach();
@@ -327,75 +337,9 @@ esp_err_t CameraUartStreamer::soft_power_down()
     return ESP_OK;
 }
 
-esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
-                                            size_t *out_len,
-                                            uint32_t *out_width,
-                                            uint32_t *out_height,
-                                            uint32_t *out_pixelformat)
+esp_err_t CameraUartStreamer::ensure_dvp_ready()
 {
-    ESP_RETURN_ON_FALSE(out_data && out_len && out_width && out_height && out_pixelformat,
-                        ESP_ERR_INVALID_ARG, TAG, "invalid args");
-    *out_data = nullptr;
-    *out_len = 0;
-    *out_width = 0;
-    *out_height = 0;
-    *out_pixelformat = 0;
-
-    ESP_RETURN_ON_ERROR(init(), TAG, "init");
-    ESP_RETURN_ON_ERROR(configure_camera_pins(), TAG, "camera pins");
-
-    if (!sensor_configured_) {
-        // First capture: full cold init with MCLK already running from init()
-        ESP_LOGI(TAG, "releasing SP0A39 PWDN: P%d low", BSP_SP0A39_PWDN_IOEXP_PIN);
-        set_pwdn(false);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        esp_err_t init_ret = reset_sensor();
-        if (init_ret != ESP_OK) { power_down(); return init_ret; }
-        vTaskDelay(pdMS_TO_TICKS(100));
-
-        init_ret = sensor_i2c_attach();
-        if (init_ret != ESP_OK) { power_down(); return init_ret; }
-        vTaskDelay(pdMS_TO_TICKS(500));
-
-        init_ret = sensor_read_id();
-        if (init_ret != ESP_OK) { power_down(); return init_ret; }
-        init_ret = sensor_write_regs();
-        if (init_ret != ESP_OK) { power_down(); return init_ret; }
-        log_sensor_output_regs();
-        sensor_configured_ = true;
-        sensor_awake_ = true;
-    } else if (!sensor_awake_) {
-        // Sensor was powered down after a failure, do fast reinit
-        gpio_reset_pin(BSP_SP0A39_MCLK_GPIO);
-        ledc_timer_resume(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1);
-        ledc_channel_config_t ledc_ch = {};
-        ledc_ch.speed_mode = LEDC_LOW_SPEED_MODE;
-        ledc_ch.channel = LEDC_CHANNEL_1;
-        ledc_ch.timer_sel = LEDC_TIMER_1;
-        ledc_ch.intr_type = LEDC_INTR_DISABLE;
-        ledc_ch.gpio_num = BSP_SP0A39_MCLK_GPIO;
-        ledc_ch.duty = 1;
-        ledc_ch.hpoint = 0;
-        ledc_channel_config(&ledc_ch);
-
-        ESP_LOGI(TAG, "releasing SP0A39 PWDN: P%d low (fast)", BSP_SP0A39_PWDN_IOEXP_PIN);
-        set_pwdn(false);
-        vTaskDelay(pdMS_TO_TICKS(10));
-
-        sensor_i2c_attach();
-        esp_err_t init_ret = sensor_write_regs();
-        if (init_ret != ESP_OK) { power_down(); return init_ret; }
-        vTaskDelay(pdMS_TO_TICKS(100));
-        sensor_awake_ = true;
-    } else {
-        // Sensor still powered and configured — nothing to do
-        ESP_LOGI(TAG, "sensor already awake, skipping reinit");
-    }
-
-    // Release LEDC from GPIO3, then immediately create DVP (restores XCLK)
-    ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
-    ledc_timer_pause(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1);
-    gpio_reset_pin(BSP_SP0A39_MCLK_GPIO);
+    if (dvp_ready_ && cam_handle_) return ESP_OK;
 
     esp_cam_ctlr_dvp_pin_config_t pins = {};
     pins.data_width = CAM_CTLR_DATA_WIDTH_8;
@@ -422,160 +366,126 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     dvp_cfg.xclk_freq = APP_SP0A39_MCLK_HZ;
     dvp_cfg.dma_burst_size = 64;
     dvp_cfg.bk_buffer_dis = 1;
-    ESP_LOGI(TAG, "DVP capture format: %s, capture=%lux%lu, logical=%ux%u, buffer=%lu bytes",
-             APP_CAMERA_COLOR_ENABLE ? "YUV422 VYUY" : "GRAY8",
-             (unsigned long)kDvpCaptureWidth,
-             (unsigned long)APP_CAMERA_SENSOR_HEIGHT,
-             APP_CAMERA_SENSOR_WIDTH,
-             APP_CAMERA_SENSOR_HEIGHT,
-             (unsigned long)kFrameBytes);
 
-    esp_cam_ctlr_handle_t cam_handle = nullptr;
-    esp_err_t ret = esp_cam_new_dvp_ctlr(&dvp_cfg, &cam_handle);
+    esp_err_t ret = esp_cam_new_dvp_ctlr(&dvp_cfg, &cam_handle_);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_cam_new_dvp_ctlr failed: %s", esp_err_to_name(ret));
-        power_down();
         return ret;
     }
 
-    // DVP now outputs XCLK on GPIO3 - wait for sensor to stabilize
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    uint8_t *frame_bufs[kCaptureDmaBufferCount] = {};
     for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
-        frame_bufs[i] = static_cast<uint8_t *>(
-            esp_cam_ctlr_alloc_buffer(cam_handle, kFrameBytes,
+        frame_bufs_[i] = static_cast<uint8_t *>(
+            esp_cam_ctlr_alloc_buffer(cam_handle_, kFrameBytes,
                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA));
-        if (!frame_bufs[i]) {
-            ESP_LOGE(TAG, "frame buffer alloc failed: %u x %lu bytes",
-                     (unsigned)kCaptureDmaBufferCount, (unsigned long)kFrameBytes);
+        if (!frame_bufs_[i]) {
+            ESP_LOGE(TAG, "frame buffer alloc failed");
             for (size_t j = 0; j < kCaptureDmaBufferCount; ++j) {
-                if (frame_bufs[j]) heap_caps_free(frame_bufs[j]);
+                if (frame_bufs_[j]) { heap_caps_free(frame_bufs_[j]); frame_bufs_[j] = nullptr; }
             }
-            esp_cam_ctlr_del(cam_handle);
-            power_down();
+            esp_cam_ctlr_del(cam_handle_);
+            cam_handle_ = nullptr;
             return ESP_ERR_NO_MEM;
         }
     }
-    uint8_t *stable_frame = nullptr;
 
-    dvp_cb_ctx ctx = {};
+    // Set up persistent context
     for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
-        ctx.buffers[i] = frame_bufs[i];
+        s_dvp_ctx.buffers[i] = frame_bufs_[i];
     }
-    ctx.buflen = kFrameBytes;
-    ctx.received = 0;
-    ctx.frame_count = 0;
-    ctx.next_buffer = 0;
-    ctx.last_received = 0;
-    ctx.captured_buffer = nullptr;
-    ctx.done_sem = xSemaphoreCreateBinary();
-    if (!ctx.done_sem) {
-        ESP_LOGE(TAG, "capture semaphore alloc failed");
-        for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
-            heap_caps_free(frame_bufs[i]);
-        }
-        esp_cam_ctlr_del(cam_handle);
-        power_down();
-        return ESP_ERR_NO_MEM;
-    }
+    s_dvp_ctx.buflen = kFrameBytes;
 
+    if (!capture_sem_) {
+        capture_sem_ = xSemaphoreCreateBinary();
+    }
+    s_dvp_ctx.done_sem = capture_sem_;
+
+    // Register callbacks once (before enable)
     esp_cam_ctlr_evt_cbs_t cbs = {};
     cbs.on_get_new_trans = on_get_new_trans;
     cbs.on_trans_finished = on_trans_finished;
-    ret = esp_cam_ctlr_register_event_callbacks(cam_handle, &cbs, &ctx);
+    ret = esp_cam_ctlr_register_event_callbacks(cam_handle_, &cbs, &s_dvp_ctx);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "register cbs failed: %s", esp_err_to_name(ret));
-        vSemaphoreDelete(ctx.done_sem);
         for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
-            heap_caps_free(frame_bufs[i]);
+            if (frame_bufs_[i]) { heap_caps_free(frame_bufs_[i]); frame_bufs_[i] = nullptr; }
         }
-        esp_cam_ctlr_del(cam_handle);
-        power_down();
+        esp_cam_ctlr_del(cam_handle_);
+        cam_handle_ = nullptr;
         return ret;
     }
 
-    ret = esp_cam_ctlr_enable(cam_handle);
+    ret = esp_cam_ctlr_enable(cam_handle_);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_cam_ctlr_enable failed: %s", esp_err_to_name(ret));
-        vSemaphoreDelete(ctx.done_sem);
         for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
-            heap_caps_free(frame_bufs[i]);
+            if (frame_bufs_[i]) { heap_caps_free(frame_bufs_[i]); frame_bufs_[i] = nullptr; }
         }
-        esp_cam_ctlr_del(cam_handle);
-        power_down();
+        esp_cam_ctlr_del(cam_handle_);
+        cam_handle_ = nullptr;
         return ret;
     }
 
-    bool got_frame = false;
-    bool cam_running = false;
-    ret = esp_cam_ctlr_start(cam_handle);
-    if (ret != ESP_OK) goto cleanup;
-    cam_running = true;
+    dvp_ready_ = true;
+    ESP_LOGI(TAG, "DVP controller ready, XCLK on GPIO%d", BSP_SP0A39_MCLK_GPIO);
+    return ESP_OK;
+}
 
-    log_gpio_diagnostics();
+esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
+                                            size_t *out_len,
+                                            uint32_t *out_width,
+                                            uint32_t *out_height,
+                                            uint32_t *out_pixelformat)
+{
+    ESP_RETURN_ON_FALSE(out_data && out_len && out_width && out_height && out_pixelformat,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid args");
+    *out_data = nullptr;
+    *out_len = 0;
+    *out_width = 0;
+    *out_height = 0;
+    *out_pixelformat = 0;
 
-    got_frame = xSemaphoreTake(ctx.done_sem, pdMS_TO_TICKS(5000)) == pdTRUE;
-    esp_cam_ctlr_stop(cam_handle);
-    esp_cam_ctlr_disable(cam_handle);
-    cam_running = false;
+    ESP_RETURN_ON_ERROR(init(), TAG, "init");
+    if (!dvp_ready_) {
+        ESP_LOGE(TAG, "DVP not ready");
+        return ESP_ERR_INVALID_STATE;
+    }
 
-    if (got_frame && ctx.received >= kFrameBytes) {
-        ESP_LOGI(TAG, "captured frame: %u bytes (skipped %d), copying stable PSRAM frame",
-                 (unsigned)ctx.received, ctx.frame_count - 1);
-        stable_frame = static_cast<uint8_t *>(
+    // Arm capture: skip a few frames for stable AE/AWB
+    s_dvp_ctx.received = 0;
+    s_dvp_ctx.captured_buffer = nullptr;
+    xQueueReset(capture_sem_);
+    s_dvp_ctx.frame_count = 0;
+    s_dvp_ctx.capture_target = 5;
+
+    bool got_frame = xSemaphoreTake(capture_sem_, pdMS_TO_TICKS(5000)) == pdTRUE;
+
+    if (got_frame && s_dvp_ctx.received >= kFrameBytes) {
+        const uint8_t *p = (const uint8_t *)s_dvp_ctx.captured_buffer;
+        ESP_LOGI(TAG, "captured frame: %u bytes (skipped %d) first16: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                 (unsigned)s_dvp_ctx.received, s_dvp_ctx.frame_count - 1,
+                 p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
+                 p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
+        uint8_t *copy = static_cast<uint8_t *>(
             heap_caps_malloc(kFrameBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!stable_frame) {
-            stable_frame = static_cast<uint8_t *>(
+        if (!copy) {
+            copy = static_cast<uint8_t *>(
                 heap_caps_malloc(kFrameBytes, MALLOC_CAP_8BIT));
         }
-        if (stable_frame) {
-            memcpy(stable_frame, ctx.captured_buffer, kFrameBytes);
-            *out_data = stable_frame;
+        if (copy) {
+            memcpy(copy, (const void *)s_dvp_ctx.captured_buffer, kFrameBytes);
+            *out_data = copy;
             *out_len = kFrameBytes;
             *out_width = APP_CAMERA_SENSOR_WIDTH;
             *out_height = APP_CAMERA_SENSOR_HEIGHT;
             *out_pixelformat = kOutputPixelformat;
-            stable_frame = nullptr;
-        } else {
-            ESP_LOGE(TAG, "stable frame alloc failed: %lu bytes",
-                     (unsigned long)kFrameBytes);
-            ret = ESP_ERR_NO_MEM;
+            return ESP_OK;
         }
-    } else {
-        log_gpio_diagnostics();
-        ESP_LOGE(TAG, "capture failed: got=%d frames=%d last=%u received=%u expected=%u",
-                 got_frame ? 1 : 0, ctx.frame_count, (unsigned)ctx.last_received,
-                 (unsigned)ctx.received, (unsigned)kFrameBytes);
-        ret = got_frame ? ESP_ERR_INVALID_SIZE : ESP_ERR_TIMEOUT;
+        ESP_LOGE(TAG, "frame copy alloc failed");
+        return ESP_ERR_NO_MEM;
     }
 
-cleanup:
-    if (cam_running) {
-        esp_cam_ctlr_stop(cam_handle);
-        esp_cam_ctlr_disable(cam_handle);
-    }
-    vSemaphoreDelete(ctx.done_sem);
-    if (stable_frame) heap_caps_free(stable_frame);
-    for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
-        if (frame_bufs[i]) heap_caps_free(frame_bufs[i]);
-    }
-    esp_cam_ctlr_del(cam_handle);
-    if (ret == ESP_OK) {
-        // Keep sensor powered, restore LEDC MCLK (DVP released the GPIO)
-        gpio_reset_pin(BSP_SP0A39_MCLK_GPIO);
-        ledc_timer_resume(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1);
-        ledc_channel_config_t ledc_ch = {};
-        ledc_ch.speed_mode = LEDC_LOW_SPEED_MODE;
-        ledc_ch.channel = LEDC_CHANNEL_1;
-        ledc_ch.timer_sel = LEDC_TIMER_1;
-        ledc_ch.intr_type = LEDC_INTR_DISABLE;
-        ledc_ch.gpio_num = BSP_SP0A39_MCLK_GPIO;
-        ledc_ch.duty = 1;
-        ledc_ch.hpoint = 0;
-        ledc_channel_config(&ledc_ch);
-    } else {
-        power_down();
-    }
-    return ret;
+    ESP_LOGE(TAG, "capture failed: got=%d frames=%d last=%u received=%u expected=%u",
+             got_frame ? 1 : 0, s_dvp_ctx.frame_count, (unsigned)s_dvp_ctx.last_received,
+             (unsigned)s_dvp_ctx.received, (unsigned)kFrameBytes);
+    return got_frame ? ESP_ERR_INVALID_SIZE : ESP_ERR_TIMEOUT;
 }
