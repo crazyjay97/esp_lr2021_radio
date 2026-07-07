@@ -199,6 +199,7 @@
 #define APP_CFG_KEY_AUDIO_CLIP          0x03
 #define APP_CFG_KEY_SOUND_TRIGGER       0x04
 #define APP_CFG_KEY_PIR_TRIGGER         0x05
+#define APP_CFG_KEY_VOICE_ALARM         0x06
 #define APP_AUDIO_CLIP_DEFAULT_ENABLE   0
 
 #define APP_TRIGGER_COOLDOWN_SEC        15U

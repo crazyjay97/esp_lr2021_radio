@@ -101,8 +101,8 @@ static bool s_stats_first_eot_seen = false;
 /* PAGE_CONFIG objects */
 static lv_obj_t *s_cfg_rows[6] = {NULL};
 static lv_obj_t *s_cfg_val_lbls[6] = {NULL};
-static lv_obj_t *s_cfg_touch_btns[6] = {NULL};
-static lv_obj_t *s_cfg_touch_lbls[6] = {NULL};
+static lv_obj_t *s_cfg_touch_btns[7] = {NULL};
+static lv_obj_t *s_cfg_touch_lbls[7] = {NULL};
 static int s_cfg_sel = 0;
 static int s_volume_level = 13; /* 0~15, default 13 → 130% */
 static ui_gw_audio_clip_cb_t s_audio_clip_cb = NULL;
@@ -112,6 +112,8 @@ static int s_sound_trigger_idx = 0;
 static const char *s_trigger_labels[] = {"Off", "Low", "Med", "High"};
 static ui_gw_pir_trigger_cb_t s_pir_trigger_cb = NULL;
 static bool s_pir_on = false;
+static ui_gw_voice_alarm_cb_t s_voice_alarm_cb = NULL;
+static bool s_alarm_on = false;
 static ui_gw_wifi_prov_cb_t s_wifi_prov_cb = NULL;
 static ui_gw_wifi_disconnect_cb_t s_wifi_disconnect_cb = NULL;
 
@@ -598,6 +600,19 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
         }
         if (s_pir_trigger_cb) s_pir_trigger_cb(s_pir_on ? 1 : 0);
         break;
+    case 6: /* Voice alarm toggle */
+        s_alarm_on = !s_alarm_on;
+        if (s_cfg_touch_btns[6]) {
+            lv_obj_set_style_bg_color(s_cfg_touch_btns[6],
+                s_alarm_on ? COL_AMBER : lv_color_hex(0xEDF4EF), 0);
+        }
+        if (s_cfg_touch_lbls[6]) {
+            lv_label_set_text(s_cfg_touch_lbls[6], s_alarm_on ? "Alarm ON" : "Alarm OFF");
+            lv_obj_set_style_text_color(s_cfg_touch_lbls[6],
+                s_alarm_on ? lv_color_white() : COL_TEXT_MAIN, 0);
+        }
+        if (s_voice_alarm_cb) s_voice_alarm_cb(s_alarm_on ? 1 : 0);
+        break;
     }
 }
 
@@ -632,16 +647,16 @@ static void create_config_page(void)
         }
     }
 
-    /* 5 touch buttons in 2-col wrap grid */
+    /* 7 touch buttons in 2-col wrap grid */
     lv_obj_t *btn_grid = lv_obj_create(s_body);
     lv_obj_remove_style_all(btn_grid);
-    lv_obj_set_size(btn_grid, 224, 138);
+    lv_obj_set_size(btn_grid, 224, 142);
     lv_obj_set_pos(btn_grid, 8, 140);
     lv_obj_clear_flag(btn_grid, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_layout(btn_grid, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(btn_grid, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_style_pad_column(btn_grid, 6, 0);
-    lv_obj_set_style_pad_row(btn_grid, 6, 0);
+    lv_obj_set_style_pad_row(btn_grid, 4, 0);
 
     char interval_buf[16];
     snprintf(interval_buf, sizeof(interval_buf), "T: %s", s_interval_labels[s_cfg_interval_idx]);
@@ -649,11 +664,11 @@ static void create_config_page(void)
     snprintf(vol_buf, sizeof(vol_buf), "Vol: %d", s_volume_level);
     char snd_buf[16];
     snprintf(snd_buf, sizeof(snd_buf), "Snd: %s", s_trigger_labels[s_sound_trigger_idx]);
-    const char *btn_labels[] = {"Capture", s_audio_clip_on ? "Audio ON" : "Audio OFF", interval_buf, vol_buf, snd_buf, s_pir_on ? "PIR ON" : "PIR OFF"};
+    const char *btn_labels[] = {"Capture", s_audio_clip_on ? "Audio ON" : "Audio OFF", interval_buf, vol_buf, snd_buf, s_pir_on ? "PIR ON" : "PIR OFF", s_alarm_on ? "Alarm ON" : "Alarm OFF"};
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
         lv_obj_t *btn = lv_btn_create(btn_grid);
-        lv_obj_set_size(btn, 109, 40);
+        lv_obj_set_size(btn, 109, 32);
         lv_obj_set_style_radius(btn, 6, 0);
         lv_obj_set_style_border_width(btn, 1, 0);
         lv_obj_set_style_border_color(btn, lv_color_hex(0x9FB5AA), 0);
@@ -664,6 +679,8 @@ static void create_config_page(void)
             lv_obj_set_style_bg_color(btn, COL_AMBER, 0);
         } else if (i == 5 && s_pir_on) {
             lv_obj_set_style_bg_color(btn, COL_AMBER, 0);
+        } else if (i == 6 && s_alarm_on) {
+            lv_obj_set_style_bg_color(btn, COL_AMBER, 0);
         } else {
             lv_obj_set_style_bg_color(btn, lv_color_hex(0xEDF4EF), 0);
         }
@@ -671,7 +688,7 @@ static void create_config_page(void)
 
         lv_obj_t *lbl = lv_label_create(btn);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-        if ((i == 1 && s_audio_clip_on) || (i == 4 && s_sound_trigger_idx > 0) || (i == 5 && s_pir_on)) {
+        if ((i == 1 && s_audio_clip_on) || (i == 4 && s_sound_trigger_idx > 0) || (i == 5 && s_pir_on) || (i == 6 && s_alarm_on)) {
             lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
         } else {
             lv_obj_set_style_text_color(lbl, COL_TEXT_MAIN, 0);
@@ -882,6 +899,11 @@ void ui_gw_set_sound_trigger_cb(ui_gw_sound_trigger_cb_t cb)
 void ui_gw_set_pir_trigger_cb(ui_gw_pir_trigger_cb_t cb)
 {
     s_pir_trigger_cb = cb;
+}
+
+void ui_gw_set_voice_alarm_cb(ui_gw_voice_alarm_cb_t cb)
+{
+    s_voice_alarm_cb = cb;
 }
 
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed)

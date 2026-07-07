@@ -51,6 +51,7 @@ esp_timer_handle_t g_auto_capture_timer = nullptr;
 esp_timer_handle_t g_countdown_timer = nullptr;
 uint32_t g_capture_interval_sec = APP_AUTO_CAPTURE_DEFAULT_SEC;
 bool g_audio_clip_enabled = APP_AUDIO_CLIP_DEFAULT_ENABLE;
+volatile bool g_voice_alarm_enabled = false;
 uint16_t g_auto_session_id = 0x8000;
 int64_t g_last_capture_time_us = 0;
 
@@ -275,6 +276,9 @@ void on_config_received(uint8_t key, uint32_t value)
     } else if (key == APP_CFG_KEY_PIR_TRIGGER) {
         g_radio.set_pir_enabled(value != 0);
         ESP_LOGI(TAG, "config: pir_trigger=%s", value ? "on" : "off");
+    } else if (key == APP_CFG_KEY_VOICE_ALARM) {
+        g_voice_alarm_enabled = (value != 0);
+        ESP_LOGI(TAG, "config: voice_alarm=%s", value ? "on" : "off");
     }
 }
 
@@ -494,7 +498,7 @@ void image_capture_task(void *arg)
     g_radio.resume_audio_capture();
 
 #if APP_VOICE_ALARM_ENABLE
-    if (session_id >= 0xC000) {
+    if (g_voice_alarm_enabled && session_id >= 0xC000) {
         ESP_LOGI(TAG, "trigger capture done, playing voice alarm");
         uint8_t prev_vol = APP_VOICE_ALARM_VOLUME_PERCENT;
         bsp_audio_set_volume(prev_vol);
@@ -835,6 +839,12 @@ bool on_gw_pir_trigger_change(uint32_t enable)
     return g_radio.send_config(APP_CFG_KEY_PIR_TRIGGER, enable);
 }
 
+bool on_gw_voice_alarm_change(uint32_t enable)
+{
+    ESP_LOGI(TAG, "UI voice alarm: %s", enable ? "on" : "off");
+    return g_radio.send_config(APP_CFG_KEY_VOICE_ALARM, enable);
+}
+
 void on_wifi_prov_request(void)
 {
     if (wifi_mgr_get_state() == WIFI_MGR_CONNECTED ||
@@ -1118,6 +1128,7 @@ extern "C" void app_main(void)
             ui_gw_set_audio_clip_cb(on_gw_audio_clip_change);
             ui_gw_set_sound_trigger_cb(on_gw_sound_trigger_change);
             ui_gw_set_pir_trigger_cb(on_gw_pir_trigger_change);
+            ui_gw_set_voice_alarm_cb(on_gw_voice_alarm_change);
             ui_gw_set_wifi_prov_cb(on_wifi_prov_request);
             ui_gw_set_wifi_disconnect_cb(on_wifi_disconnect_request);
 

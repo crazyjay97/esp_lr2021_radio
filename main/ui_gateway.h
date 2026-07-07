@@ -23,6 +23,7 @@ typedef bool (*ui_gw_interval_cb_t)(uint32_t interval_sec);
 typedef bool (*ui_gw_audio_clip_cb_t)(uint32_t enable);
 typedef bool (*ui_gw_sound_trigger_cb_t)(uint32_t level);
 typedef bool (*ui_gw_pir_trigger_cb_t)(uint32_t enable);
+typedef bool (*ui_gw_voice_alarm_cb_t)(uint32_t enable);
 typedef void (*ui_gw_wifi_prov_cb_t)(void);
 typedef void (*ui_gw_wifi_disconnect_cb_t)(void);
 
@@ -42,6 +43,7 @@ void ui_gw_set_interval_cb(ui_gw_interval_cb_t cb);
 void ui_gw_set_audio_clip_cb(ui_gw_audio_clip_cb_t cb);
 void ui_gw_set_sound_trigger_cb(ui_gw_sound_trigger_cb_t cb);
 void ui_gw_set_pir_trigger_cb(ui_gw_pir_trigger_cb_t cb);
+void ui_gw_set_voice_alarm_cb(ui_gw_voice_alarm_cb_t cb);
 void ui_gw_set_wifi_prov_cb(ui_gw_wifi_prov_cb_t cb);
 void ui_gw_set_wifi_disconnect_cb(ui_gw_wifi_disconnect_cb_t cb);
 
