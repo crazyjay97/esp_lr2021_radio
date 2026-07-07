@@ -33,7 +33,7 @@ constexpr size_t kCaptureDmaBufferCount = 4;
 #if APP_CAMERA_COLOR_ENABLE
 constexpr uint32_t kDvpCaptureWidth = APP_CAMERA_SENSOR_WIDTH;
 constexpr cam_ctlr_color_t kDvpInputColor = CAM_CTLR_COLOR_YUV422;
-constexpr uint32_t kOutputPixelformat = kFourccVyuy;
+constexpr uint32_t kOutputPixelformat = kFourccUyvy;
 #else
 constexpr uint32_t kDvpCaptureWidth = APP_CAMERA_SENSOR_WIDTH;
 constexpr cam_ctlr_color_t kDvpInputColor = CAM_CTLR_COLOR_GRAY8;
