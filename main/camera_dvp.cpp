@@ -482,7 +482,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
 
         // Invalidate CPU cache so memcpy reads fresh DMA data from PSRAM
         esp_cache_msync((void *)s_dvp_ctx.captured_buffer, kFrameBytes,
-                        ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C);
 
         uint8_t *copy = static_cast<uint8_t *>(
             heap_caps_malloc(kFrameBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
