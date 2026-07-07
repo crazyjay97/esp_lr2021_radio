@@ -207,6 +207,11 @@
 #define APP_SOUND_TRIGGER_THRESH_MED    5000
 #define APP_SOUND_TRIGGER_THRESH_HIGH   1200
 
+/* ----- Voice alarm (speaker playback on trigger) ------------------------- */
+
+#define APP_VOICE_ALARM_ENABLE          1
+#define APP_VOICE_ALARM_VOLUME_PERCENT  80U   /* gateway level 8 → 80% → REG32=0xCC */
+
 /* ----- Audio ring buffer (pre-capture retrospective recording) ----------- */
 
 #define APP_AUDIO_RINGBUF_SECONDS       5U

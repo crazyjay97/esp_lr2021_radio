@@ -25,6 +25,10 @@
 #include "app_config.h"
 #include "bsp.h"
 
+#if APP_VOICE_ALARM_ENABLE
+#include "warning_voice_opus.h"
+#endif
+
 namespace {
 constexpr const char *TAG = "app";
 constexpr const char *kNvsNs = "app";
@@ -298,6 +302,8 @@ void ptt_long_press_cb(void *arg)
 #endif
 }
 
+void play_audio_clip(const uint8_t *opus_packed, size_t total_len);
+
 // Image capture task: runs on device A (camera mode) when ImageCmd received
 struct ImageCaptureCtx {
     uint16_t session_id;
@@ -486,6 +492,17 @@ void image_capture_task(void *arg)
     bsp_lcd_set_camera_status(status);
 
     g_radio.resume_audio_capture();
+
+#if APP_VOICE_ALARM_ENABLE
+    if (session_id >= 0xC000) {
+        ESP_LOGI(TAG, "trigger capture done, playing voice alarm");
+        uint8_t prev_vol = APP_VOICE_ALARM_VOLUME_PERCENT;
+        bsp_audio_set_volume(prev_vol);
+        play_audio_clip(warning_voice_opus, warning_voice_opus_len);
+        bsp_audio_set_volume(100);
+    }
+#endif
+
     g_capture_busy = false;
     vTaskDelete(nullptr);
 }
