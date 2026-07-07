@@ -237,6 +237,9 @@
 #define APP_IMAGE_TASK_PRIORITY         3
 #define APP_IMAGE_TASK_CORE             1
 
+/* ----- Camera node LCD (set 0 to skip LCD release/reinit for faster capture) */
+#define APP_CAMERA_NODE_LCD_ENABLE      0
+
 /* ----- Camera/LCD bring-up (legacy) -------------------------------------- */
 
 #define APP_CAMERA_LCD_BRINGUP          0

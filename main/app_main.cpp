@@ -371,14 +371,16 @@ void image_capture_task(void *arg)
         }
     }
 
-#if APP_AUDIO_FEATURES_ENABLE
+#if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
     esp_err_t audio_e = bsp_audio_suspend();
     if (audio_e != ESP_OK) {
         ESP_LOGW(TAG, "audio suspend for image capture: %s", esp_err_to_name(audio_e));
     }
 #endif
 
-    esp_err_t e = bsp_lcd_release_for_camera();
+    esp_err_t e = ESP_OK;
+#if APP_CAMERA_NODE_LCD_ENABLE
+    e = bsp_lcd_release_for_camera();
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "release lcd for image capture: %s", esp_err_to_name(e));
         bsp_lcd_reinit_after_camera();
@@ -392,6 +394,7 @@ void image_capture_task(void *arg)
         vTaskDelete(nullptr);
         return;
     }
+#endif
 
     uint32_t t_cam_start = static_cast<uint32_t>(esp_log_timestamp());
     ESP_LOGI(TAG, "[TIMING] camera init start +%lums", static_cast<unsigned long>(t_cam_start - t_cmd));
@@ -409,8 +412,10 @@ void image_capture_task(void *arg)
     // LCD reinit and audio resume deferred until after transmission
 
     if (capture_e != ESP_OK || !frame) {
+#if APP_CAMERA_NODE_LCD_ENABLE
         bsp_lcd_reinit_after_camera();
-#if APP_AUDIO_FEATURES_ENABLE
+#endif
+#if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
         bsp_audio_resume();
 #endif
         bsp_lcd_set_camera_status("Capture failed");
@@ -434,8 +439,10 @@ void image_capture_task(void *arg)
              static_cast<unsigned>(jpeg_len));
 
     if (e != ESP_OK || !jpeg) {
+#if APP_CAMERA_NODE_LCD_ENABLE
         bsp_lcd_reinit_after_camera();
-#if APP_AUDIO_FEATURES_ENABLE
+#endif
+#if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
         bsp_audio_resume();
 #endif
         bsp_lcd_set_camera_status("JPEG encode failed");
@@ -459,8 +466,10 @@ void image_capture_task(void *arg)
             ESP_LOGE(TAG, "blob alloc failed: %u bytes", static_cast<unsigned>(blob_len));
             heap_caps_free(jpeg);
             heap_caps_free(opus_buf);
+#if APP_CAMERA_NODE_LCD_ENABLE
             bsp_lcd_reinit_after_camera();
-#if APP_AUDIO_FEATURES_ENABLE
+#endif
+#if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
             bsp_audio_resume();
 #endif
             bsp_lcd_set_camera_status("Alloc failed");
@@ -508,11 +517,13 @@ void image_capture_task(void *arg)
              static_cast<unsigned long>(t_tx_done - t_jpeg_done));
 
     // Reinit LCD now that transmission is done
+#if APP_CAMERA_NODE_LCD_ENABLE
     esp_err_t lcd_e = bsp_lcd_reinit_after_camera();
     if (lcd_e != ESP_OK) {
         ESP_LOGE(TAG, "lcd reinit after tx: %s", esp_err_to_name(lcd_e));
     }
-#if APP_AUDIO_FEATURES_ENABLE
+#endif
+#if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
     bsp_audio_resume();
 #endif
     char status[48];

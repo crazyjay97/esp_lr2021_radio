@@ -317,6 +317,7 @@ esp_err_t CameraUartStreamer::power_down()
     gpio_reset_pin(BSP_SP0A39_RESET_GPIO);
     sensor_i2c_detach();
     sensor_configured_ = false;
+    sensor_awake_ = false;
     return ESP_OK;
 }
 
@@ -362,8 +363,9 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
         if (init_ret != ESP_OK) { power_down(); return init_ret; }
         log_sensor_output_regs();
         sensor_configured_ = true;
-    } else {
-        // Fast path: skip reset and long I2C wait, but rewrite registers
+        sensor_awake_ = true;
+    } else if (!sensor_awake_) {
+        // Sensor was powered down after a failure, do fast reinit
         gpio_reset_pin(BSP_SP0A39_MCLK_GPIO);
         ledc_timer_resume(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1);
         ledc_channel_config_t ledc_ch = {};
@@ -384,6 +386,10 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
         esp_err_t init_ret = sensor_write_regs();
         if (init_ret != ESP_OK) { power_down(); return init_ret; }
         vTaskDelay(pdMS_TO_TICKS(100));
+        sensor_awake_ = true;
+    } else {
+        // Sensor still powered and configured — nothing to do
+        ESP_LOGI(TAG, "sensor already awake, skipping reinit");
     }
 
     // Release LEDC from GPIO3, then immediately create DVP (restores XCLK)
@@ -556,7 +562,18 @@ cleanup:
     }
     esp_cam_ctlr_del(cam_handle);
     if (ret == ESP_OK) {
-        soft_power_down();
+        // Keep sensor powered, restore LEDC MCLK (DVP released the GPIO)
+        gpio_reset_pin(BSP_SP0A39_MCLK_GPIO);
+        ledc_timer_resume(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1);
+        ledc_channel_config_t ledc_ch = {};
+        ledc_ch.speed_mode = LEDC_LOW_SPEED_MODE;
+        ledc_ch.channel = LEDC_CHANNEL_1;
+        ledc_ch.timer_sel = LEDC_TIMER_1;
+        ledc_ch.intr_type = LEDC_INTR_DISABLE;
+        ledc_ch.gpio_num = BSP_SP0A39_MCLK_GPIO;
+        ledc_ch.duty = 1;
+        ledc_ch.hpoint = 0;
+        ledc_channel_config(&ledc_ch);
     } else {
         power_down();
     }

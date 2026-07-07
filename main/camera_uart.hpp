@@ -24,4 +24,5 @@ private:
 
     bool initialized_ = false;
     bool sensor_configured_ = false;
+    bool sensor_awake_ = false;
 };
