@@ -455,7 +455,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     s_dvp_ctx.captured_buffer = nullptr;
     xQueueReset(capture_sem_);
     s_dvp_ctx.frame_count = 0;
-    s_dvp_ctx.capture_target = 5;
+    s_dvp_ctx.capture_target = 3;
 
     bool got_frame = xSemaphoreTake(capture_sem_, pdMS_TO_TICKS(5000)) == pdTRUE;
 

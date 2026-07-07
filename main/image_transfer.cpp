@@ -41,9 +41,11 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
         return ESP_ERR_INVALID_SIZE;
     }
 
-    // SP0A39 outputs UYVY = [Cb, Y0, Cr, Y1]
-    // Encoder expects YCbYCr = [Y0, Cb, Y1, Cr]
-    // Swizzle: [U, Y0, V, Y1] → [Y0, U, Y1, V]
+    // Swizzle YUV422 to encoder's YCbYCr based on actual pixel format
+    static constexpr uint32_t FOURCC_UYVY = 0x59565955;
+    static constexpr uint32_t FOURCC_YUYV = 0x56595559;
+    static constexpr uint32_t FOURCC_VYUY = 0x59555956;
+
     uint8_t *enc_input = static_cast<uint8_t *>(
         jpeg_calloc_align(expected_len, 16));
     if (!enc_input) {
@@ -52,11 +54,25 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
         return ESP_ERR_NO_MEM;
     }
 
-    for (size_t i = 0; i + 3 < expected_len; i += 4) {
-        enc_input[i + 0] = yuv422[i + 1]; // Y0
-        enc_input[i + 1] = yuv422[i + 0]; // U (Cb)
-        enc_input[i + 2] = yuv422[i + 3]; // Y1
-        enc_input[i + 3] = yuv422[i + 2]; // V (Cr)
+    if (pixfmt == FOURCC_YUYV) {
+        // YUYV [Y0, Cb, Y1, Cr] → YCbYCr — already correct order
+        memcpy(enc_input, yuv422, expected_len);
+    } else if (pixfmt == FOURCC_VYUY) {
+        // VYUY [Cr, Y0, Cb, Y1] → [Y0, Cb, Y1, Cr]
+        for (size_t i = 0; i + 3 < expected_len; i += 4) {
+            enc_input[i + 0] = yuv422[i + 1]; // Y0
+            enc_input[i + 1] = yuv422[i + 2]; // Cb
+            enc_input[i + 2] = yuv422[i + 3]; // Y1
+            enc_input[i + 3] = yuv422[i + 0]; // Cr
+        }
+    } else {
+        // UYVY [Cb, Y0, Cr, Y1] → [Y0, Cb, Y1, Cr]
+        for (size_t i = 0; i + 3 < expected_len; i += 4) {
+            enc_input[i + 0] = yuv422[i + 1]; // Y0
+            enc_input[i + 1] = yuv422[i + 0]; // Cb
+            enc_input[i + 2] = yuv422[i + 3]; // Y1
+            enc_input[i + 3] = yuv422[i + 2]; // Cr
+        }
     }
 
     jpeg_enc_config_t enc_cfg = DEFAULT_JPEG_ENC_CONFIG();
