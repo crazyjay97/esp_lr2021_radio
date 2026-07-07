@@ -8,12 +8,34 @@
 #include "esp_heap_caps.h"
 #include "qrcodegen.h"
 #include "wifi_manager.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "ui_gw";
+static const char *kGwNvs = "ui_gw";
+
+static void gw_nvs_save_u8(const char *key, uint8_t val)
+{
+    nvs_handle_t h;
+    if (nvs_open(kGwNvs, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, key, val);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static uint8_t gw_nvs_load_u8(const char *key, uint8_t def)
+{
+    nvs_handle_t h;
+    uint8_t val = def;
+    if (nvs_open(kGwNvs, NVS_READONLY, &h) == ESP_OK) {
+        (void)nvs_get_u8(h, key, &val);
+        nvs_close(h);
+    }
+    return val;
+}
 
 /* ─── Colors ─── */
 #define COL_STATUS_BG   lv_color_hex(0x263831)
@@ -527,21 +549,23 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
         }
         break;
     case 1: /* Audio toggle */
-        s_audio_clip_on = !s_audio_clip_on;
-        if (s_cfg_touch_btns[1]) {
-            lv_obj_set_style_bg_color(s_cfg_touch_btns[1],
-                s_audio_clip_on ? COL_AMBER : lv_color_hex(0xEDF4EF), 0);
-            lv_obj_set_style_bg_opa(s_cfg_touch_btns[1], LV_OPA_COVER, 0);
+        if (s_audio_clip_cb && s_audio_clip_cb(!s_audio_clip_on ? 1 : 0)) {
+            s_audio_clip_on = !s_audio_clip_on;
+            if (s_cfg_touch_btns[1]) {
+                lv_obj_set_style_bg_color(s_cfg_touch_btns[1],
+                    s_audio_clip_on ? COL_AMBER : lv_color_hex(0xEDF4EF), 0);
+                lv_obj_set_style_bg_opa(s_cfg_touch_btns[1], LV_OPA_COVER, 0);
+            }
+            if (s_cfg_touch_lbls[1]) {
+                lv_label_set_text(s_cfg_touch_lbls[1], s_audio_clip_on ? "Audio ON" : "Audio OFF");
+                lv_obj_set_style_text_color(s_cfg_touch_lbls[1],
+                    s_audio_clip_on ? lv_color_white() : COL_TEXT_MAIN, 0);
+            }
+            if (s_cfg_val_lbls[4]) {
+                lv_label_set_text(s_cfg_val_lbls[4], s_audio_clip_on ? "On" : "Off");
+            }
+            gw_nvs_save_u8("audio", s_audio_clip_on ? 1 : 0);
         }
-        if (s_cfg_touch_lbls[1]) {
-            lv_label_set_text(s_cfg_touch_lbls[1], s_audio_clip_on ? "Audio ON" : "Audio OFF");
-            lv_obj_set_style_text_color(s_cfg_touch_lbls[1],
-                s_audio_clip_on ? lv_color_white() : COL_TEXT_MAIN, 0);
-        }
-        if (s_cfg_val_lbls[4]) {
-            lv_label_set_text(s_cfg_val_lbls[4], s_audio_clip_on ? "On" : "Off");
-        }
-        if (s_audio_clip_cb) s_audio_clip_cb(s_audio_clip_on ? 1 : 0);
         break;
     case 2: /* Interval cycle */
         s_cfg_interval_idx = (s_cfg_interval_idx + 1) % INTERVAL_PRESET_COUNT;
@@ -568,50 +592,59 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
             snprintf(buf, sizeof(buf), "%d", s_volume_level);
             lv_label_set_text(s_cfg_val_lbls[5], buf);
         }
+        gw_nvs_save_u8("vol", (uint8_t)s_volume_level);
         break;
-    case 4: /* Sound trigger cycle */
-        s_sound_trigger_idx = (s_sound_trigger_idx + 1) % 4;
-        if (s_cfg_touch_lbls[4]) {
-            char buf[16];
-            snprintf(buf, sizeof(buf), "Snd: %s", s_trigger_labels[s_sound_trigger_idx]);
-            lv_label_set_text(s_cfg_touch_lbls[4], buf);
+    case 4: /* Sound trigger cycle */ {
+        uint8_t new_idx = (s_sound_trigger_idx + 1) % 4;
+        if (s_sound_trigger_cb && s_sound_trigger_cb((uint32_t)new_idx)) {
+            s_sound_trigger_idx = new_idx;
+            if (s_cfg_touch_lbls[4]) {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "Snd: %s", s_trigger_labels[s_sound_trigger_idx]);
+                lv_label_set_text(s_cfg_touch_lbls[4], buf);
+            }
+            if (s_cfg_touch_btns[4]) {
+                lv_obj_set_style_bg_color(s_cfg_touch_btns[4],
+                    s_sound_trigger_idx > 0 ? COL_AMBER : lv_color_hex(0xEDF4EF), 0);
+                lv_obj_set_style_text_color(s_cfg_touch_lbls[4],
+                    s_sound_trigger_idx > 0 ? lv_color_white() : COL_TEXT_MAIN, 0);
+            }
+            if (s_cfg_val_lbls[2]) {
+                lv_label_set_text(s_cfg_val_lbls[2], s_trigger_labels[s_sound_trigger_idx]);
+            }
+            gw_nvs_save_u8("snd", (uint8_t)s_sound_trigger_idx);
         }
-        if (s_cfg_touch_btns[4]) {
-            lv_obj_set_style_bg_color(s_cfg_touch_btns[4],
-                s_sound_trigger_idx > 0 ? COL_AMBER : lv_color_hex(0xEDF4EF), 0);
-            lv_obj_set_style_text_color(s_cfg_touch_lbls[4],
-                s_sound_trigger_idx > 0 ? lv_color_white() : COL_TEXT_MAIN, 0);
-        }
-        if (s_cfg_val_lbls[2]) {
-            lv_label_set_text(s_cfg_val_lbls[2], s_trigger_labels[s_sound_trigger_idx]);
-        }
-        if (s_sound_trigger_cb) s_sound_trigger_cb((uint32_t)s_sound_trigger_idx);
         break;
+    }
     case 5: /* PIR trigger toggle */
-        s_pir_on = !s_pir_on;
-        if (s_cfg_touch_btns[5]) {
-            lv_obj_set_style_bg_color(s_cfg_touch_btns[5],
-                s_pir_on ? COL_AMBER : lv_color_hex(0xEDF4EF), 0);
+        if (s_pir_trigger_cb && s_pir_trigger_cb(!s_pir_on ? 1 : 0)) {
+            s_pir_on = !s_pir_on;
+            if (s_cfg_touch_btns[5]) {
+                lv_obj_set_style_bg_color(s_cfg_touch_btns[5],
+                    s_pir_on ? COL_AMBER : lv_color_hex(0xEDF4EF), 0);
+            }
+            if (s_cfg_touch_lbls[5]) {
+                lv_label_set_text(s_cfg_touch_lbls[5], s_pir_on ? "PIR ON" : "PIR OFF");
+                lv_obj_set_style_text_color(s_cfg_touch_lbls[5],
+                    s_pir_on ? lv_color_white() : COL_TEXT_MAIN, 0);
+            }
+            gw_nvs_save_u8("pir", s_pir_on ? 1 : 0);
         }
-        if (s_cfg_touch_lbls[5]) {
-            lv_label_set_text(s_cfg_touch_lbls[5], s_pir_on ? "PIR ON" : "PIR OFF");
-            lv_obj_set_style_text_color(s_cfg_touch_lbls[5],
-                s_pir_on ? lv_color_white() : COL_TEXT_MAIN, 0);
-        }
-        if (s_pir_trigger_cb) s_pir_trigger_cb(s_pir_on ? 1 : 0);
         break;
     case 6: /* Voice alarm toggle */
-        s_alarm_on = !s_alarm_on;
-        if (s_cfg_touch_btns[6]) {
-            lv_obj_set_style_bg_color(s_cfg_touch_btns[6],
-                s_alarm_on ? COL_AMBER : lv_color_hex(0xEDF4EF), 0);
+        if (s_voice_alarm_cb && s_voice_alarm_cb(!s_alarm_on ? 1 : 0)) {
+            s_alarm_on = !s_alarm_on;
+            if (s_cfg_touch_btns[6]) {
+                lv_obj_set_style_bg_color(s_cfg_touch_btns[6],
+                    s_alarm_on ? COL_AMBER : lv_color_hex(0xEDF4EF), 0);
+            }
+            if (s_cfg_touch_lbls[6]) {
+                lv_label_set_text(s_cfg_touch_lbls[6], s_alarm_on ? "Alarm ON" : "Alarm OFF");
+                lv_obj_set_style_text_color(s_cfg_touch_lbls[6],
+                    s_alarm_on ? lv_color_white() : COL_TEXT_MAIN, 0);
+            }
+            gw_nvs_save_u8("alarm", s_alarm_on ? 1 : 0);
         }
-        if (s_cfg_touch_lbls[6]) {
-            lv_label_set_text(s_cfg_touch_lbls[6], s_alarm_on ? "Alarm ON" : "Alarm OFF");
-            lv_obj_set_style_text_color(s_cfg_touch_lbls[6],
-                s_alarm_on ? lv_color_white() : COL_TEXT_MAIN, 0);
-        }
-        if (s_voice_alarm_cb) s_voice_alarm_cb(s_alarm_on ? 1 : 0);
         break;
     }
 }
@@ -864,6 +897,16 @@ esp_err_t ui_gw_init(void)
         ESP_LOGE(TAG, "LVGL lock not available");
         return ESP_ERR_INVALID_STATE;
     }
+
+    s_volume_level = gw_nvs_load_u8("vol", 13);
+    s_audio_clip_on = gw_nvs_load_u8("audio", 0) != 0;
+    s_sound_trigger_idx = gw_nvs_load_u8("snd", 0);
+    if (s_sound_trigger_idx > 3) s_sound_trigger_idx = 0;
+    s_pir_on = gw_nvs_load_u8("pir", 0) != 0;
+    s_alarm_on = gw_nvs_load_u8("alarm", 0) != 0;
+    bsp_audio_set_volume((uint8_t)(s_volume_level * 10));
+    ESP_LOGI(TAG, "NVS load: vol=%d audio=%d snd=%d pir=%d alarm=%d",
+             s_volume_level, s_audio_clip_on, s_sound_trigger_idx, s_pir_on, s_alarm_on);
 
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
     create_shared_layout();

@@ -140,6 +140,26 @@ void save_capture_interval(uint32_t sec)
     nvs_close(nvs);
 }
 
+void save_config_u8(const char *key, uint8_t val)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(kNvsNs, NVS_READWRITE, &nvs) != ESP_OK) return;
+    nvs_set_u8(nvs, key, val);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+}
+
+uint8_t load_config_u8(const char *key, uint8_t def)
+{
+    nvs_handle_t nvs;
+    uint8_t val = def;
+    if (nvs_open(kNvsNs, NVS_READONLY, &nvs) == ESP_OK) {
+        (void)nvs_get_u8(nvs, key, &val);
+        nvs_close(nvs);
+    }
+    return val;
+}
+
 void on_image_capture_request(uint16_t session_id);
 
 void auto_capture_timer_cb(void *arg)
@@ -268,16 +288,20 @@ void on_config_received(uint8_t key, uint32_t value)
         bsp_lcd_set_camera_status(buf);
     } else if (key == APP_CFG_KEY_AUDIO_CLIP) {
         g_audio_clip_enabled = (value != 0);
+        save_config_u8("audio_clip", value ? 1 : 0);
         update_camera_timer_status();
         ESP_LOGI(TAG, "config: audio_clip=%s", g_audio_clip_enabled ? "on" : "off");
     } else if (key == APP_CFG_KEY_SOUND_TRIGGER) {
         g_radio.set_sound_trigger_level(value);
+        save_config_u8("snd_trig", (uint8_t)value);
         ESP_LOGI(TAG, "config: sound_trigger=%lu", static_cast<unsigned long>(value));
     } else if (key == APP_CFG_KEY_PIR_TRIGGER) {
         g_radio.set_pir_enabled(value != 0);
+        save_config_u8("pir", value ? 1 : 0);
         ESP_LOGI(TAG, "config: pir_trigger=%s", value ? "on" : "off");
     } else if (key == APP_CFG_KEY_VOICE_ALARM) {
         g_voice_alarm_enabled = (value != 0);
+        save_config_u8("alarm", value ? 1 : 0);
         ESP_LOGI(TAG, "config: voice_alarm=%s", value ? "on" : "off");
     }
 }
@@ -1075,6 +1099,13 @@ extern "C" void app_main(void)
             g_radio.enable_opus_preenc(true);
             ESP_LOGI(TAG, "camera mode: radio initialized for image transfer");
             g_capture_interval_sec = load_capture_interval();
+            g_audio_clip_enabled = load_config_u8("audio_clip", 0) != 0;
+            g_radio.set_sound_trigger_level(load_config_u8("snd_trig", 0));
+            g_radio.set_pir_enabled(load_config_u8("pir", 0) != 0);
+            g_voice_alarm_enabled = load_config_u8("alarm", 0) != 0;
+            ESP_LOGI(TAG, "NVS: audio=%d snd=%d pir=%d alarm=%d",
+                     g_audio_clip_enabled, load_config_u8("snd_trig", 0),
+                     load_config_u8("pir", 0), g_voice_alarm_enabled);
             start_auto_capture_timer();
             update_camera_timer_status();
             start_countdown_timer();
