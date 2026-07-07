@@ -1037,6 +1037,7 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
                     snprintf(buf, sizeof(buf), "Vol: %d", s_volume_level);
                     lv_label_set_text(s_cfg_touch_lbls[3], buf);
                 }
+                gw_nvs_save_u8("vol", (uint8_t)s_volume_level);
             } else if (s_cfg_sel == 0 || s_cfg_sel == 1) {
                 /* Capture rows — trigger capture */
                 if (s_capture_cb) {
