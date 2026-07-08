@@ -60,6 +60,16 @@ static bool IRAM_ATTR on_get_new_trans(esp_cam_ctlr_handle_t handle,
                                        esp_cam_ctlr_trans_t *trans, void *user_data)
 {
     dvp_cb_ctx *ctx = static_cast<dvp_cb_ctx *>(user_data);
+    if (ctx->capture_target > 0 && ctx->frame_count + 1 >= ctx->capture_target) {
+        trans->buffer = ctx->safe_buffer;
+        trans->buflen = ctx->buflen;
+        return true;
+    }
+    if (ctx->captured_buffer != nullptr && ctx->capture_target == 0) {
+        trans->buffer = ctx->safe_buffer;
+        trans->buflen = ctx->buflen;
+        return true;
+    }
     trans->buffer = ctx->buffers[ctx->next_buffer];
     trans->buflen = ctx->buflen;
     ctx->next_buffer = (ctx->next_buffer + 1) % kCaptureDmaBufferCount;
@@ -75,12 +85,6 @@ static bool IRAM_ATTR on_trans_finished(esp_cam_ctlr_handle_t handle,
     if (ctx->capture_target > 0 && ctx->frame_count >= ctx->capture_target) {
         ctx->received = trans->received_size;
         ctx->captured_buffer = static_cast<uint8_t *>(trans->buffer);
-        for (size_t i = 0; i < kCaptureDmaBufferCount; i++) {
-            if (ctx->buffers[i] == trans->buffer) {
-                ctx->buffers[i] = ctx->safe_buffer;
-                break;
-            }
-        }
         ctx->capture_target = 0;
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         xSemaphoreGiveFromISR(ctx->done_sem, &xHigherPriorityTaskWoken);
@@ -400,10 +404,11 @@ esp_err_t CameraUartStreamer::ensure_dvp_ready()
     }
     s_dvp_ctx.buflen = kFrameBytes;
 
-    // Allocate a safe buffer outside the DMA ring — ISR copies frame here
+    // Parking buffer used after a capture so the saved frame buffer is not reused.
     if (!safe_buf_) {
         safe_buf_ = static_cast<uint8_t *>(
-            heap_caps_malloc(kFrameBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            esp_cam_ctlr_alloc_buffer(cam_handle_, kFrameBytes,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA));
         if (!safe_buf_) {
             ESP_LOGE(TAG, "safe buffer alloc failed");
             for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
@@ -476,8 +481,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     s_dvp_ctx.received = 0;
     s_dvp_ctx.captured_buffer = nullptr;
     xQueueReset(capture_sem_);
-    s_dvp_ctx.frame_count = 0;
-    s_dvp_ctx.capture_target = 3;
+    s_dvp_ctx.capture_target = s_dvp_ctx.frame_count + 3;
 
     bool got_frame = xSemaphoreTake(capture_sem_, pdMS_TO_TICKS(5000)) == pdTRUE;
 
@@ -499,13 +503,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
                         ESP_CACHE_MSYNC_FLAG_DIR_M2C);
         memcpy(copy, (void *)s_dvp_ctx.captured_buffer, kFrameBytes);
 
-        // Restore captured buffer back into DMA rotation
-        for (size_t i = 0; i < kCaptureDmaBufferCount; i++) {
-            if (s_dvp_ctx.buffers[i] == safe_buf_) {
-                s_dvp_ctx.buffers[i] = (uint8_t *)s_dvp_ctx.captured_buffer;
-                break;
-            }
-        }
+        s_dvp_ctx.captured_buffer = nullptr;
 
         *out_data = copy;
         *out_len = kFrameBytes;

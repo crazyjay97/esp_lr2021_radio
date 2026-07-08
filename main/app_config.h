@@ -255,7 +255,7 @@
 
 /* SP0A39 DVP mode with 24 MHz input clock. */
 #define APP_CAMERA_COLOR_ENABLE         1
-#define APP_SP0A39_MCLK_HZ              24000000U
+#define APP_SP0A39_MCLK_HZ              12000000U
 #define APP_SP0A39_I2C_ADDR             0x21U
 
 /* LCD_CAM DVP input polarity. Toggle these when the sensor clocks/syncs are
