@@ -1748,6 +1748,7 @@ bool RadioPing::configure_lora_cad()
 {
     const void *ctx = radio_.ral.context;
 
+    lr20xx_radio_common_set_pkt_type(ctx, LR20XX_RADIO_COMMON_PKT_TYPE_LORA);
     lr20xx_radio_common_set_rf_freq(ctx, APP_FLRC_FREQUENCY_HZ);
 
     lr20xx_radio_lora_mod_params_t mod = {};
@@ -1858,6 +1859,7 @@ bool RadioPing::send_lora_wakeup()
     smtc_modem_hal_start_radio_tcxo();
     smtc_modem_hal_set_ant_switch(true);
 
+    lr20xx_radio_common_set_pkt_type(ctx, LR20XX_RADIO_COMMON_PKT_TYPE_LORA);
     lr20xx_radio_common_set_rf_freq(ctx, APP_FLRC_FREQUENCY_HZ);
 
     lr20xx_radio_lora_mod_params_t mod = {};

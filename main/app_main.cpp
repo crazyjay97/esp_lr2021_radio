@@ -1112,7 +1112,13 @@ extern "C" void app_main(void)
                 ESP_LOGE(TAG, "radio task start (gateway): %s", esp_err_to_name(e));
             } else {
                 g_radio_active = true;
-                g_low_power_enabled = load_config_u8("lowpwr", 0) != 0;
+                nvs_handle_t gw_nvs;
+                if (nvs_open("ui_gw", NVS_READONLY, &gw_nvs) == ESP_OK) {
+                    uint8_t lp = 0;
+                    nvs_get_u8(gw_nvs, "lowpwr", &lp);
+                    g_low_power_enabled = (lp != 0);
+                    nvs_close(gw_nvs);
+                }
             }
 #else
             ESP_LOGW(TAG, "radio initialized but tasks/RX disabled for camera isolation");
