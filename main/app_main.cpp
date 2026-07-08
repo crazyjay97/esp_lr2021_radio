@@ -956,12 +956,15 @@ void on_wifi_prov_request(void)
     ESP_LOGI(TAG, "WiFi provisioning requested");
     esp_err_t err = wifi_mgr_start_provisioning();
     if (err == ESP_OK) {
+        httpd_handle_t h = wifi_mgr_get_httpd();
+        if (h) {
+            image_store_register_httpd(h);
+        }
         const char *name = wifi_mgr_get_service_name();
-        const char *pass = wifi_mgr_get_ap_password();
         char payload[200];
         snprintf(payload, sizeof(payload),
-            "{\"ver\":\"v1\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"softap\",\"password\":\"%s\"}",
-            name, pass, pass);
+            "{\"ver\":\"v1\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"softap\"}",
+            name, wifi_mgr_get_ap_password());
         ui_gw_show_qr(payload);
     } else {
         ESP_LOGE(TAG, "start provisioning failed: %s", esp_err_to_name(err));
@@ -1253,6 +1256,10 @@ extern "C" void app_main(void)
                 wifi_mgr_set_state_cb(on_wifi_state_change);
                 wifi_mgr_init();
                 image_store_init();
+                {
+                    httpd_handle_t h = wifi_mgr_get_httpd();
+                    if (h) image_store_register_httpd(h);
+                }
 
                 // Sync audio clip state from gateway UI NVS
                 {

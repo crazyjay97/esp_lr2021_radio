@@ -1,4 +1,5 @@
 #include "wifi_manager.h"
+#include "app_config.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_wifi.h"
@@ -178,6 +179,14 @@ static const char CONNECT_OK_PAGE[] =
 
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/gallery");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t config_get_handler(httpd_req_t *req)
+{
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, CONFIG_PAGE, sizeof(CONFIG_PAGE) - 1);
     return ESP_OK;
@@ -288,6 +297,13 @@ static esp_err_t start_httpd(void)
     };
     httpd_register_uri_handler(s_httpd, &root);
 
+    const httpd_uri_t config_page = {
+        .uri = "/config",
+        .method = HTTP_GET,
+        .handler = config_get_handler,
+    };
+    httpd_register_uri_handler(s_httpd, &config_page);
+
     const httpd_uri_t connect_uri = {
         .uri = "/connect",
         .method = HTTP_POST,
@@ -305,9 +321,11 @@ static esp_err_t wifi_hw_start(void)
 {
     if (s_wifi_started) return ESP_OK;
 
+#if APP_WIFI_STA_ENABLE
     if (!s_sta_netif) {
         s_sta_netif = esp_netif_create_default_wifi_sta();
     }
+#endif
     if (!s_ap_netif) {
         s_ap_netif = esp_netif_create_default_wifi_ap();
     }
@@ -321,11 +339,24 @@ static esp_err_t wifi_hw_start(void)
     cfg.tx_buf_type = 1;
     ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi init");
 
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set mode");
+#if APP_WIFI_STA_ENABLE
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG, "set mode");
+#else
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP), TAG, "set mode");
+#endif
+
+    wifi_config_t ap_cfg = {};
+    strncpy((char *)ap_cfg.ap.ssid, s_service_name, sizeof(ap_cfg.ap.ssid) - 1);
+    ap_cfg.ap.ssid_len = strlen(s_service_name);
+    ap_cfg.ap.channel = 1;
+    ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+    ap_cfg.ap.max_connection = 4;
+    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
 
     s_wifi_started = true;
-    ESP_LOGI(TAG, "WiFi hardware started");
+    ESP_LOGI(TAG, "WiFi APSTA started, AP: %s (open)", s_service_name);
     return ESP_OK;
 }
 
@@ -351,11 +382,14 @@ esp_err_t wifi_mgr_init(void)
 
     generate_service_name();
 
+    ESP_RETURN_ON_ERROR(wifi_hw_start(), TAG, "hw start");
+    ESP_RETURN_ON_ERROR(start_httpd(), TAG, "httpd");
+
+#if APP_WIFI_STA_ENABLE
     char ssid[33] = {0};
     char pass[65] = {0};
     if (load_credentials(ssid, sizeof(ssid), pass, sizeof(pass))) {
-        ESP_LOGI(TAG, "saved WiFi: %s, starting hw...", ssid);
-        ESP_RETURN_ON_ERROR(wifi_hw_start(), TAG, "hw start");
+        ESP_LOGI(TAG, "saved WiFi: %s, connecting...", ssid);
 
         wifi_config_t wcfg = {};
         strncpy((char *)wcfg.sta.ssid, ssid, sizeof(wcfg.sta.ssid) - 1);
@@ -364,15 +398,23 @@ esp_err_t wifi_mgr_init(void)
         esp_wifi_connect();
         set_state(WIFI_MGR_CONNECTING);
     } else {
-        ESP_LOGI(TAG, "no saved credentials, WiFi deferred");
+        ESP_LOGI(TAG, "no saved credentials, AP-only mode");
         set_state(WIFI_MGR_DISCONNECTED);
     }
+#else
+    ESP_LOGI(TAG, "STA disabled, AP-only mode");
+    set_state(WIFI_MGR_DISCONNECTED);
+#endif
 
     return ESP_OK;
 }
 
 esp_err_t wifi_mgr_start_provisioning(void)
 {
+#if !APP_WIFI_STA_ENABLE
+    ESP_LOGW(TAG, "STA disabled, provisioning not available");
+    return ESP_ERR_NOT_SUPPORTED;
+#else
     ESP_RETURN_ON_ERROR(wifi_hw_start(), TAG, "hw start for prov");
 
     if (s_httpd) {
@@ -394,20 +436,15 @@ esp_err_t wifi_mgr_start_provisioning(void)
     wifi_prov_security_t security = WIFI_PROV_SECURITY_1;
     const char *pop = s_ap_password;
 
-    ESP_LOGI(TAG, "starting SoftAP prov: name=%s pass=%s", s_service_name, s_ap_password);
+    ESP_LOGI(TAG, "starting SoftAP prov: name=%s (open AP)", s_service_name);
 
     ESP_RETURN_ON_ERROR(
-        wifi_prov_mgr_start_provisioning(security, pop, s_service_name, s_ap_password),
+        wifi_prov_mgr_start_provisioning(security, pop, s_service_name, NULL),
         TAG, "start prov");
-
-    wifi_config_t ap_cfg;
-    if (esp_wifi_get_config(WIFI_IF_AP, &ap_cfg) == ESP_OK) {
-        ap_cfg.ap.max_connection = 4;
-        esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-    }
 
     set_state(WIFI_MGR_PROVISIONING);
     return ESP_OK;
+#endif
 }
 
 void wifi_mgr_stop_provisioning(void)

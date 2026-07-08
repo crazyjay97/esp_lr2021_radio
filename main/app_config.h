@@ -15,6 +15,9 @@
 #define APP_RADIO_AUTO_RX_ENABLE        1
 #define APP_RADIO_TASKS_ENABLE          1
 
+/* Set to 0 to disable STA/provisioning — AP-only gallery mode */
+#define APP_WIFI_STA_ENABLE             0
+
 /* ES8311/I2S sample rate used by both the microphone and speaker paths. */
 #define APP_AUDIO_SAMPLE_RATE_HZ        16000U
 

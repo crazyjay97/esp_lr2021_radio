@@ -829,28 +829,27 @@ static void create_config_page(void)
         lv_obj_set_style_opa(s_cfg_touch_btns[7], LV_OPA_50, 0);
     }
 
-    /* ── WiFi bar ── */
-    lv_obj_t *wifi_btn = lv_btn_create(cont);
-    lv_obj_set_size(wifi_btn, 224, 32);
-    lv_obj_set_style_radius(wifi_btn, 8, 0);
-    lv_obj_set_style_bg_opa(wifi_btn, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(wifi_btn, 0, 0);
-    lv_obj_add_event_cb(wifi_btn, cfg_wifi_btn_clicked_cb, LV_EVENT_CLICKED, NULL);
-    s_cfg_wifi_btn = wifi_btn;
+    /* ── WiFi info panel ── */
+    lv_obj_t *wifi_box = lv_obj_create(cont);
+    lv_obj_set_size(wifi_box, 224, 44);
+    lv_obj_set_style_radius(wifi_box, 8, 0);
+    lv_obj_set_style_bg_opa(wifi_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(wifi_box, lv_color_make(0x3a, 0x7a, 0x5f), 0);
+    lv_obj_set_style_border_width(wifi_box, 0, 0);
+    lv_obj_set_style_pad_all(wifi_box, 4, 0);
+    lv_obj_clear_flag(wifi_box, LV_OBJ_FLAG_SCROLLABLE);
+    s_cfg_wifi_btn = wifi_box;
 
-    s_cfg_wifi_lbl = lv_label_create(wifi_btn);
+    s_cfg_wifi_lbl = lv_label_create(wifi_box);
     lv_obj_set_style_text_font(s_cfg_wifi_lbl, &lv_font_montserrat_10, 0);
     lv_obj_set_style_text_color(s_cfg_wifi_lbl, lv_color_white(), 0);
     lv_obj_center(s_cfg_wifi_lbl);
 
-    if (s_wifi_connected && s_wifi_ssid[0]) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%s (%d dBm) [DISCONNECT]", s_wifi_ssid, s_wifi_rssi);
+    {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "WiFi: %s\nGallery: http://192.168.4.1",
+                 wifi_mgr_get_service_name());
         lv_label_set_text(s_cfg_wifi_lbl, buf);
-        lv_obj_set_style_bg_color(wifi_btn, COL_AMBER, 0);
-    } else {
-        lv_label_set_text(s_cfg_wifi_lbl, "CONNECT WIFI");
-        lv_obj_set_style_bg_color(wifi_btn, COL_GREEN, 0);
     }
 
     update_title("Settings", "CFG", COL_GREEN);
@@ -1253,18 +1252,10 @@ void ui_gw_wifi_update(const char *state_str, const char *ssid, int8_t rssi)
     s_wifi_rssi = rssi;
 
     if (s_cfg_wifi_lbl && s_cfg_wifi_btn) {
-        if (s_wifi_connected && s_wifi_ssid[0]) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "%s (%d dBm) [DISCONNECT]", s_wifi_ssid, rssi);
-            lv_label_set_text(s_cfg_wifi_lbl, buf);
-            lv_obj_set_style_bg_color(s_cfg_wifi_btn, COL_AMBER, 0);
-        } else if (state_str && strcmp(state_str, "Connecting...") == 0) {
-            lv_label_set_text(s_cfg_wifi_lbl, "WiFi: Connecting...");
-            lv_obj_set_style_bg_color(s_cfg_wifi_btn, COL_GREEN, 0);
-        } else {
-            lv_label_set_text(s_cfg_wifi_lbl, "CONNECT WIFI");
-            lv_obj_set_style_bg_color(s_cfg_wifi_btn, COL_GREEN, 0);
-        }
+        char buf[80];
+        snprintf(buf, sizeof(buf), "WiFi: %s\nGallery: http://192.168.4.1",
+                 wifi_mgr_get_service_name());
+        lv_label_set_text(s_cfg_wifi_lbl, buf);
     }
 
     if (s_page == UI_PAGE_QR && s_wifi_connected) {
