@@ -43,13 +43,12 @@ constexpr uint32_t kOutputPixelformat = kFourccGrey;
 
 struct dvp_cb_ctx {
     uint8_t *buffers[kCaptureDmaBufferCount];
+    uint8_t *safe_buffer;
     size_t buflen;
     volatile size_t received;
     volatile int frame_count;
     size_t next_buffer;
     volatile size_t last_received;
-    volatile uint8_t *captured_buffer;
-    volatile int locked_buffer_idx;
     SemaphoreHandle_t done_sem;
     volatile int capture_target;
 };
@@ -60,13 +59,6 @@ static bool IRAM_ATTR on_get_new_trans(esp_cam_ctlr_handle_t handle,
                                        esp_cam_ctlr_trans_t *trans, void *user_data)
 {
     dvp_cb_ctx *ctx = static_cast<dvp_cb_ctx *>(user_data);
-    int locked = ctx->locked_buffer_idx;
-    if (locked >= 0 && (int)ctx->next_buffer == locked) {
-        ctx->next_buffer = (ctx->next_buffer + 1) % kCaptureDmaBufferCount;
-    }
-    if (locked >= 0 && (int)ctx->next_buffer == locked) {
-        ctx->next_buffer = (ctx->next_buffer + 1) % kCaptureDmaBufferCount;
-    }
     trans->buffer = ctx->buffers[ctx->next_buffer];
     trans->buflen = ctx->buflen;
     ctx->next_buffer = (ctx->next_buffer + 1) % kCaptureDmaBufferCount;
@@ -81,13 +73,7 @@ static bool IRAM_ATTR on_trans_finished(esp_cam_ctlr_handle_t handle,
     ctx->last_received = trans->received_size;
     if (ctx->capture_target > 0 && ctx->frame_count >= ctx->capture_target) {
         ctx->received = trans->received_size;
-        ctx->captured_buffer = static_cast<uint8_t *>(trans->buffer);
-        for (int i = 0; i < (int)kCaptureDmaBufferCount; i++) {
-            if (ctx->buffers[i] == trans->buffer) {
-                ctx->locked_buffer_idx = i;
-                break;
-            }
-        }
+        memcpy(ctx->safe_buffer, trans->buffer, ctx->buflen);
         ctx->capture_target = 0;
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         xSemaphoreGiveFromISR(ctx->done_sem, &xHigherPriorityTaskWoken);
@@ -333,6 +319,7 @@ esp_err_t CameraUartStreamer::power_down()
         for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
             if (frame_bufs_[i]) { heap_caps_free(frame_bufs_[i]); frame_bufs_[i] = nullptr; }
         }
+        if (safe_buf_) { heap_caps_free(safe_buf_); safe_buf_ = nullptr; }
         dvp_ready_ = false;
     }
     set_pwdn(true);
@@ -405,7 +392,22 @@ esp_err_t CameraUartStreamer::ensure_dvp_ready()
         s_dvp_ctx.buffers[i] = frame_bufs_[i];
     }
     s_dvp_ctx.buflen = kFrameBytes;
-    s_dvp_ctx.locked_buffer_idx = -1;
+
+    // Allocate a safe buffer outside the DMA ring — ISR copies frame here
+    if (!safe_buf_) {
+        safe_buf_ = static_cast<uint8_t *>(
+            heap_caps_malloc(kFrameBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!safe_buf_) {
+            ESP_LOGE(TAG, "safe buffer alloc failed");
+            for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
+                if (frame_bufs_[i]) { heap_caps_free(frame_bufs_[i]); frame_bufs_[i] = nullptr; }
+            }
+            esp_cam_ctlr_del(cam_handle_);
+            cam_handle_ = nullptr;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    s_dvp_ctx.safe_buffer = safe_buf_;
 
     if (!capture_sem_) {
         capture_sem_ = xSemaphoreCreateBinary();
@@ -465,8 +467,6 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
 
     // Arm capture: skip a few frames for stable AE/AWB
     s_dvp_ctx.received = 0;
-    s_dvp_ctx.captured_buffer = nullptr;
-    s_dvp_ctx.locked_buffer_idx = -1;
     xQueueReset(capture_sem_);
     s_dvp_ctx.frame_count = 0;
     s_dvp_ctx.capture_target = 5;
@@ -474,15 +474,9 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     bool got_frame = xSemaphoreTake(capture_sem_, pdMS_TO_TICKS(5000)) == pdTRUE;
 
     if (got_frame && s_dvp_ctx.received >= kFrameBytes) {
-        const uint8_t *p = (const uint8_t *)s_dvp_ctx.captured_buffer;
-        ESP_LOGI(TAG, "captured frame: %u bytes (skipped %d) first16: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-                 (unsigned)s_dvp_ctx.received, s_dvp_ctx.frame_count - 1,
-                 p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
-                 p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
-
-        // Invalidate CPU cache so memcpy reads fresh DMA data from PSRAM
-        esp_cache_msync((void *)s_dvp_ctx.captured_buffer, kFrameBytes,
-                        ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        // safe_buffer was filled by ISR before DMA could overwrite
+        ESP_LOGI(TAG, "captured frame: %u bytes (skipped %d)",
+                 (unsigned)s_dvp_ctx.received, s_dvp_ctx.frame_count - 1);
 
         uint8_t *copy = static_cast<uint8_t *>(
             heap_caps_malloc(kFrameBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -490,22 +484,17 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
             copy = static_cast<uint8_t *>(
                 heap_caps_malloc(kFrameBytes, MALLOC_CAP_8BIT));
         }
-        if (copy) {
-            memcpy(copy, (const void *)s_dvp_ctx.captured_buffer, kFrameBytes);
-            // Unlock — DMA can reuse this buffer now
-            s_dvp_ctx.locked_buffer_idx = -1;
-            s_dvp_ctx.captured_buffer = nullptr;
-            *out_data = copy;
-            *out_len = kFrameBytes;
-            *out_width = APP_CAMERA_SENSOR_WIDTH;
-            *out_height = APP_CAMERA_SENSOR_HEIGHT;
-            *out_pixelformat = kOutputPixelformat;
-            return ESP_OK;
+        if (!copy) {
+            ESP_LOGE(TAG, "frame copy alloc failed");
+            return ESP_ERR_NO_MEM;
         }
-        s_dvp_ctx.locked_buffer_idx = -1;
-        s_dvp_ctx.captured_buffer = nullptr;
-        ESP_LOGE(TAG, "frame copy alloc failed");
-        return ESP_ERR_NO_MEM;
+        memcpy(copy, safe_buf_, kFrameBytes);
+        *out_data = copy;
+        *out_len = kFrameBytes;
+        *out_width = APP_CAMERA_SENSOR_WIDTH;
+        *out_height = APP_CAMERA_SENSOR_HEIGHT;
+        *out_pixelformat = kOutputPixelformat;
+        return ESP_OK;
     }
 
     ESP_LOGE(TAG, "capture failed: got=%d frames=%d last=%u received=%u expected=%u",

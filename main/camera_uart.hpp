@@ -33,5 +33,6 @@ private:
 
     esp_cam_ctlr_handle_t cam_handle_ = nullptr;
     uint8_t *frame_bufs_[4] = {};
+    uint8_t *safe_buf_ = nullptr;
     SemaphoreHandle_t capture_sem_ = nullptr;
 };
