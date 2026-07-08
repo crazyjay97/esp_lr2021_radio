@@ -104,6 +104,7 @@ static lv_obj_t *s_rx_bar = NULL;
 static lv_obj_t *s_rx_frag_lbl = NULL;
 static lv_obj_t *s_rx_rate_lbl = NULL;
 static lv_obj_t *s_rx_retry_lbl = NULL;
+static lv_obj_t *s_rx_rssi_lbl = NULL;
 static uint16_t s_rx_total = 0;
 static uint32_t s_rx_start_ms = 0;
 static int16_t s_rx_last_rssi = 0;
@@ -281,6 +282,7 @@ static void destroy_body_children(void)
     s_rx_frag_lbl = NULL;
     s_rx_rate_lbl = NULL;
     s_rx_retry_lbl = NULL;
+    s_rx_rssi_lbl = NULL;
     for (int i = 0; i < 5; i++) s_link_labels[i] = NULL;
     memset(s_cfg_touch_btns, 0, sizeof(s_cfg_touch_btns));
     memset(s_cfg_touch_lbls, 0, sizeof(s_cfg_touch_lbls));
@@ -415,7 +417,7 @@ static void create_rx_page(void)
     create_kv_row(panel, "Packets", "0 / 0", &s_rx_frag_lbl);
     create_kv_row(panel, "Rate", "-- kbps", &s_rx_rate_lbl);
     create_kv_row(panel, "Elapsed", "00:00.0", &s_rx_retry_lbl);
-    create_kv_row(panel, "RSSI", "-- dBm", NULL);
+    create_kv_row(panel, "RSSI", "-- dBm", &s_rx_rssi_lbl);
 
     update_title("Receiving", "RX", COL_AMBER);
 }
@@ -821,7 +823,11 @@ static void create_config_page(void)
     /* ── SYSTEM section ── */
     lv_obj_t *sec_sys = cfg_create_section(cont, "SYSTEM");
 
-    cfg_create_toggle_row(sec_sys, "Low Power", "Node sleep mode", 7, s_low_power_on);
+    cfg_create_toggle_row(sec_sys, "Low Power", "In development...", 7, false);
+    if (s_cfg_touch_btns[7]) {
+        lv_obj_add_state(s_cfg_touch_btns[7], LV_STATE_DISABLED);
+        lv_obj_set_style_opa(s_cfg_touch_btns[7], LV_OPA_50, 0);
+    }
 
     /* ── WiFi bar ── */
     lv_obj_t *wifi_btn = lv_btn_create(cont);
@@ -1042,64 +1048,29 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
 
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
 
-    if (s_page == UI_PAGE_QR) {
-        if (key == BSP_BTN_PTT) {
-            show_page(UI_PAGE_CONFIG);
-        }
-        goto done;
-    }
-
-    if (s_page == UI_PAGE_CONFIG) {
-        if (key == BSP_BTN_PTT) {
-            /* K6 = back */
-            show_page(UI_PAGE_IMAGE);
-        }
-        goto done;
-    }
-
-    if (key == BSP_BTN_VOL_UP) {
-        /* K4 = next page */
-        if (s_page == UI_PAGE_RX) goto done;
-        ui_page_t next = (ui_page_t)((s_page + 1) % UI_PAGE_COUNT);
-        if (next == UI_PAGE_RX) next = UI_PAGE_LINK;
-        if (next == UI_PAGE_QR) next = UI_PAGE_IMAGE;
-        show_page(next);
-    } else if (key == BSP_BTN_USER1) {
-        /* K5 = prev page */
-        if (s_page == UI_PAGE_RX) goto done;
-        int prev = (int)s_page - 1;
-        if (prev < 0) prev = UI_PAGE_COUNT - 1;
-        if (prev == UI_PAGE_RX) prev = UI_PAGE_IMAGE;
-        if (prev == UI_PAGE_QR) prev = UI_PAGE_CONFIG;
-        show_page((ui_page_t)prev);
-    } else if (key == BSP_BTN_VOL_DN) {
-        /* K3 = confirm / capture / retry */
-        if (s_page == UI_PAGE_RX) {
-            if (s_capture_cb) {
-                if (s_capture_cb()) {
-                    update_title("Waiting...", "RX", COL_AMBER);
-                } else {
-                    update_title("Audio preparing...", "WAIT", COL_AMBER);
-                }
-            }
-        } else if (s_page == UI_PAGE_IMAGE) {
-            if (s_capture_cb) {
+    if (key == BSP_BTN_VOL_DN) {
+        /* K3 = Capture (works from any page) */
+        if (s_capture_cb) {
+            if (s_page != UI_PAGE_RX) {
                 show_page(UI_PAGE_RX);
-                if (s_capture_cb()) {
-                    update_title("Waiting...", "RX", COL_AMBER);
-                } else {
-                    update_title("Audio preparing...", "WAIT", COL_AMBER);
-                }
+            }
+            if (s_capture_cb()) {
+                update_title("Waiting...", "RX", COL_AMBER);
+            } else {
+                update_title("Audio preparing...", "WAIT", COL_AMBER);
             }
         }
+    } else if (key == BSP_BTN_VOL_UP) {
+        /* K4 = Link page */
+        show_page(UI_PAGE_LINK);
+    } else if (key == BSP_BTN_USER1) {
+        /* K5 = Config page */
+        show_page(UI_PAGE_CONFIG);
     } else if (key == BSP_BTN_PTT) {
-        /* K6 = back → go to image page */
-        if (s_page != UI_PAGE_IMAGE) {
-            show_page(UI_PAGE_IMAGE);
-        }
+        /* K6 = Image page */
+        show_page(UI_PAGE_IMAGE);
     }
 
-done:
     xSemaphoreGiveRecursive(s_lock);
 }
 
@@ -1146,6 +1117,11 @@ void ui_gw_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
     uint32_t pct = total > 0 ? (uint32_t)received * 100 / total : 0;
 
     char buf[32];
+
+    if (s_rx_rssi_lbl) {
+        snprintf(buf, sizeof(buf), "%d dBm", rssi);
+        lv_label_set_text(s_rx_rssi_lbl, buf);
+    }
     snprintf(buf, sizeof(buf), "%lu%%", (unsigned long)pct);
     if (s_rx_pct_lbl) lv_label_set_text(s_rx_pct_lbl, buf);
     if (s_rx_bar) lv_bar_set_value(s_rx_bar, (int32_t)pct, LV_ANIM_OFF);
