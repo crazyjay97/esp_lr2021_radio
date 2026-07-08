@@ -547,8 +547,11 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
     case 0: /* Capture */
         if (s_capture_cb) {
             show_page(UI_PAGE_RX);
-            update_title("Waiting...", "RX", COL_AMBER);
-            s_capture_cb();
+            if (s_capture_cb()) {
+                update_title("Waiting...", "RX", COL_AMBER);
+            } else {
+                update_title("Audio preparing...", "WAIT", COL_AMBER);
+            }
         }
         break;
     case 1: /* Audio toggle */
@@ -1067,8 +1070,11 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
                 /* Capture rows — trigger capture */
                 if (s_capture_cb) {
                     show_page(UI_PAGE_RX);
-                    update_title("Waiting...", "RX", COL_AMBER);
-                    s_capture_cb();
+                    if (s_capture_cb()) {
+                        update_title("Waiting...", "RX", COL_AMBER);
+                    } else {
+                        update_title("Audio preparing...", "WAIT", COL_AMBER);
+                    }
                 }
             }
         } else if (key == BSP_BTN_PTT) {
@@ -1097,14 +1103,20 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
         /* K3 = confirm / capture / retry */
         if (s_page == UI_PAGE_RX) {
             if (s_capture_cb) {
-                update_title("Waiting...", "RX", COL_AMBER);
-                s_capture_cb();
+                if (s_capture_cb()) {
+                    update_title("Waiting...", "RX", COL_AMBER);
+                } else {
+                    update_title("Audio preparing...", "WAIT", COL_AMBER);
+                }
             }
         } else if (s_page == UI_PAGE_IMAGE) {
             if (s_capture_cb) {
                 show_page(UI_PAGE_RX);
-                update_title("Waiting...", "RX", COL_AMBER);
-                s_capture_cb();
+                if (s_capture_cb()) {
+                    update_title("Waiting...", "RX", COL_AMBER);
+                } else {
+                    update_title("Audio preparing...", "WAIT", COL_AMBER);
+                }
             }
         }
     } else if (key == BSP_BTN_PTT) {

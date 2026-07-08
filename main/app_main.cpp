@@ -36,6 +36,8 @@ constexpr const char *TAG = "app";
 constexpr const char *kNvsNs = "app";
 constexpr const char *kModeKey = "mode";
 
+uint32_t s_last_gw_capture_ms = 0;
+
 enum class AppMode : uint8_t {
     camera = 0,
     radio = 1,
@@ -563,6 +565,16 @@ void on_image_capture_request(uint16_t session_id)
         ESP_LOGW(TAG, "ImageCmd ignored: capture already busy");
         return;
     }
+    if (g_audio_clip_enabled) {
+        static uint32_t s_last_node_capture_ms = 0;
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (s_last_node_capture_ms != 0 &&
+            (now - s_last_node_capture_ms) < APP_AUDIO_CAPTURE_COOLDOWN_MS) {
+            ESP_LOGW(TAG, "ImageCmd ignored: audio cooldown");
+            return;
+        }
+        s_last_node_capture_ms = now;
+    }
     g_capture_busy = true;
 
     auto *ctx = new (std::nothrow) ImageCaptureCtx{ session_id };
@@ -620,6 +632,10 @@ void on_image_rx_complete(ImageTransfer *xfer)
     ESP_LOGI(TAG, "on_image_rx_complete: xfer=%p complete=%d",
              xfer, xfer ? xfer->rx_complete() : -1);
     if (!xfer || !xfer->rx_complete()) return;
+
+    if (g_audio_clip_enabled) {
+        s_last_gw_capture_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    }
 
     uint16_t sid = xfer->rx_session_id();
     bool has_audio = (sid & APP_AUDIO_SESSION_FLAG) != 0;
@@ -848,11 +864,22 @@ void on_image_rx_eot_nack(uint16_t missing_count, bool is_first_eot)
 }
 
 // Gateway UI capture callback — triggers remote photo via radio
-void on_gw_capture(void)
+
+bool on_gw_capture(void)
 {
+    if (g_audio_clip_enabled) {
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (s_last_gw_capture_ms != 0 &&
+            (now - s_last_gw_capture_ms) < APP_AUDIO_CAPTURE_COOLDOWN_MS) {
+            ESP_LOGW(TAG, "UI capture: audio cooldown, try later");
+            return false;
+        }
+        s_last_gw_capture_ms = now;
+    }
     ESP_LOGI(TAG, "UI capture: trigger remote photo");
     image_store_abort_transfer();
     g_radio.trigger_image_capture();
+    return true;
 }
 
 // Gateway UI interval change callback — sends config to camera node
@@ -865,6 +892,7 @@ bool on_gw_interval_change(uint32_t interval_sec)
 bool on_gw_audio_clip_change(uint32_t enable)
 {
     ESP_LOGI(TAG, "UI audio clip: %s", enable ? "on" : "off");
+    g_audio_clip_enabled = (enable != 0);
     return g_radio.send_config(APP_CFG_KEY_AUDIO_CLIP, enable);
 }
 
@@ -1200,6 +1228,17 @@ extern "C" void app_main(void)
                 wifi_mgr_set_state_cb(on_wifi_state_change);
                 wifi_mgr_init();
                 image_store_init();
+
+                // Sync audio clip state from gateway UI NVS
+                {
+                    nvs_handle_t h;
+                    uint8_t val = 0;
+                    if (nvs_open("ui_gw", NVS_READONLY, &h) == ESP_OK) {
+                        nvs_get_u8(h, "audio", &val);
+                        nvs_close(h);
+                    }
+                    g_audio_clip_enabled = (val != 0);
+                }
             }
         }
     }

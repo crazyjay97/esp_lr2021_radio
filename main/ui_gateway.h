@@ -18,7 +18,7 @@ typedef enum {
     UI_PAGE_COUNT
 } ui_page_t;
 
-typedef void (*ui_gw_capture_cb_t)(void);
+typedef bool (*ui_gw_capture_cb_t)(void);
 typedef bool (*ui_gw_interval_cb_t)(uint32_t interval_sec);
 typedef bool (*ui_gw_audio_clip_cb_t)(uint32_t enable);
 typedef bool (*ui_gw_sound_trigger_cb_t)(uint32_t level);
