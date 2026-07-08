@@ -109,6 +109,7 @@ private:
     bool configure_lora_cad();
     void enter_low_power_cad();
     void handle_cad_irq(ral_irq_t irq);
+    bool send_lora_wakeup();
 
     struct VoicePacket {
         uint16_t seq;
@@ -202,6 +203,7 @@ private:
 
     // Low power CAD state
     bool low_power_cad_active_ = false;
+    bool is_gateway_ = false;
 
     // Sound/PIR trigger state (shared cooldown)
     uint32_t sound_trigger_level_ = 0;

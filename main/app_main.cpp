@@ -889,6 +889,7 @@ bool on_gw_voice_alarm_change(uint32_t enable)
 bool on_gw_low_power_change(uint32_t enable)
 {
     ESP_LOGI(TAG, "UI low power: %s", enable ? "on" : "off");
+    g_low_power_enabled = (enable != 0);
     return g_radio.send_config(APP_CFG_KEY_LOW_POWER, enable);
 }
 
@@ -1111,6 +1112,7 @@ extern "C" void app_main(void)
                 ESP_LOGE(TAG, "radio task start (gateway): %s", esp_err_to_name(e));
             } else {
                 g_radio_active = true;
+                g_low_power_enabled = load_config_u8("lowpwr", 0) != 0;
             }
 #else
             ESP_LOGW(TAG, "radio initialized but tasks/RX disabled for camera isolation");

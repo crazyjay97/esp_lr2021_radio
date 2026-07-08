@@ -14,6 +14,7 @@
 
 #include "lr20xx_radio_lora.h"
 #include "lr20xx_radio_common.h"
+#include "lr20xx_radio_fifo.h"
 #include "lr20xx_system.h"
 
 extern volatile bool g_low_power_enabled;
@@ -177,6 +178,7 @@ esp_err_t RadioPing::init()
 esp_err_t RadioPing::init_gateway()
 {
     instance_ = this;
+    is_gateway_ = true;
 
     esp_err_t err = codec_.init_decoder_only();
     if (err != ESP_OK) {
@@ -489,7 +491,9 @@ void RadioPing::poll_once()
 
     if (mode_ == Mode::idle) {
         if (g_low_power_enabled) {
-            enter_low_power_cad();
+            if (!is_gateway_) {
+                enter_low_power_cad();
+            }
         } else if (tx_burst_active_) {
             schedule_tx();
             if (!tx_burst_active_ && !ptt_active_ && mode_ == Mode::idle) {
@@ -1000,6 +1004,17 @@ void RadioPing::trigger_image_capture()
     if (image_tx_active_) {
         ESP_LOGW(TAG, "image TX already active, ignoring trigger");
         return;
+    }
+
+    if (g_low_power_enabled) {
+        uint32_t t0 = smtc_modem_hal_get_time_in_ms();
+        if (!send_lora_wakeup()) {
+            ESP_LOGE(TAG, "LoRa wakeup failed");
+            return;
+        }
+        uint32_t elapsed = smtc_modem_hal_get_time_in_ms() - t0;
+        ESP_LOGI(TAG, "LoRa wakeup preamble TX took %lu ms", (unsigned long)elapsed);
+        configure_flrc();
     }
 
     uint16_t session_id = image_session_id_++;
@@ -1823,4 +1838,57 @@ void RadioPing::handle_cad_irq(ral_irq_t irq)
 
         vTaskDelay(pdMS_TO_TICKS(500));
     }
+}
+
+bool RadioPing::send_lora_wakeup()
+{
+    const void *ctx = radio_.ral.context;
+
+    ESP_LOGI(TAG, "sending LoRa wakeup (508 symbol preamble)");
+
+    smtc_modem_hal_protect_api_call();
+    if (mode_ == Mode::rx_pending || mode_ == Mode::cad_pending) {
+        ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+        ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+        mode_ = Mode::idle;
+    }
+    smtc_modem_hal_unprotect_api_call();
+
+    smtc_modem_hal_protect_api_call();
+    smtc_modem_hal_start_radio_tcxo();
+    smtc_modem_hal_set_ant_switch(true);
+
+    lr20xx_radio_common_set_rf_freq(ctx, APP_FLRC_FREQUENCY_HZ);
+
+    lr20xx_radio_lora_mod_params_t mod = {};
+    mod.sf = LR20XX_RADIO_LORA_SF7;
+    mod.bw = LR20XX_RADIO_LORA_BW_125;
+    mod.cr = LR20XX_RADIO_LORA_CR_4_5;
+    mod.ppm = LR20XX_RADIO_LORA_NO_PPM;
+    lr20xx_radio_lora_set_modulation_params(ctx, &mod);
+
+    lr20xx_radio_lora_pkt_params_t pkt = {};
+    pkt.preamble_len_in_symb = 508;
+    pkt.pkt_mode = LR20XX_RADIO_LORA_PKT_EXPLICIT;
+    pkt.pld_len_in_bytes = 4;
+    pkt.crc = LR20XX_RADIO_LORA_CRC_ENABLED;
+    pkt.iq = LR20XX_RADIO_LORA_IQ_STANDARD;
+    lr20xx_radio_lora_set_packet_params(ctx, &pkt);
+
+    uint8_t dummy[4] = {0xCA, 0xFE, 0x00, 0x01};
+    lr20xx_radio_fifo_write_tx(ctx, dummy, 4);
+
+    ral_set_dio_irq_params(&radio_.ral, RAL_IRQ_TX_DONE);
+    ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+    lr20xx_radio_common_set_tx(ctx, 2000);
+    smtc_modem_hal_unprotect_api_call();
+
+    mode_ = Mode::tx_pending;
+    bool ok = wait_for_tx_done(1500);
+    if (!ok) {
+        ESP_LOGE(TAG, "LoRa wakeup TX timeout");
+    } else {
+        ESP_LOGI(TAG, "LoRa wakeup sent");
+    }
+    return ok;
 }
