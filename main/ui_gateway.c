@@ -109,7 +109,7 @@ static uint32_t s_rx_start_ms = 0;
 static int16_t s_rx_last_rssi = 0;
 
 /* PAGE_LINK objects */
-static lv_obj_t *s_link_labels[6] = {NULL};
+static lv_obj_t *s_link_labels[5] = {NULL};
 static int16_t s_link_rssi = 0;
 static uint32_t s_link_rate = 0;
 static uint32_t s_link_elapsed_ms = 0;
@@ -303,7 +303,7 @@ static void destroy_body_children(void)
     s_rx_frag_lbl = NULL;
     s_rx_rate_lbl = NULL;
     s_rx_retry_lbl = NULL;
-    for (int i = 0; i < 6; i++) s_link_labels[i] = NULL;
+    for (int i = 0; i < 5; i++) s_link_labels[i] = NULL;
     memset(s_cfg_rows, 0, sizeof(s_cfg_rows));
     memset(s_cfg_val_lbls, 0, sizeof(s_cfg_val_lbls));
     memset(s_cfg_touch_btns, 0, sizeof(s_cfg_touch_btns));
@@ -469,10 +469,10 @@ static void create_link_page(void)
     lv_obj_set_style_pad_row(panel, 0, 0);
 
     static const char *keys[] = {
-        "Mode", "RSSI", "Rate", "Loss", "Retrans", "Last TX"
+        "Mode", "RSSI", "Rate", "Loss", "Transfer"
     };
 
-    char val_bufs[6][32];
+    char val_bufs[5][32];
 
     /* Mode */
     snprintf(val_bufs[0], sizeof(val_bufs[0]), "FLRC 2.6M");
@@ -501,25 +501,16 @@ static void create_link_page(void)
         snprintf(val_bufs[3], sizeof(val_bufs[3]), "--%%");
     }
 
-    /* Retrans = total_retransmitted / total * 100% */
-    if (s_stats_total_frags > 0 && s_stats_first_eot_seen) {
-        uint32_t ret_x10 = (uint32_t)s_stats_total_retransmitted * 1000 / s_stats_total_frags;
-        snprintf(val_bufs[4], sizeof(val_bufs[4]), "%lu.%lu%%",
-                 (unsigned long)(ret_x10 / 10), (unsigned long)(ret_x10 % 10));
-    } else {
-        snprintf(val_bufs[4], sizeof(val_bufs[4]), "--%%");
-    }
-
-    /* Last TX elapsed */
+    /* Transfer time */
     if (s_link_elapsed_ms > 0) {
-        snprintf(val_bufs[5], sizeof(val_bufs[5]), "%lu.%lu s",
+        snprintf(val_bufs[4], sizeof(val_bufs[4]), "%lu.%lu s",
                  (unsigned long)(s_link_elapsed_ms / 1000),
                  (unsigned long)((s_link_elapsed_ms % 1000) / 100));
     } else {
-        snprintf(val_bufs[5], sizeof(val_bufs[5]), "-- s");
+        snprintf(val_bufs[4], sizeof(val_bufs[4]), "-- s");
     }
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 5; i++) {
         create_kv_row(panel, keys[i], val_bufs[i], &s_link_labels[i]);
     }
 

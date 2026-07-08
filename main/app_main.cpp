@@ -62,6 +62,7 @@ int64_t g_last_capture_time_us = 0;
 // K6 short/long press state
 int64_t g_ptt_press_time_us = 0;
 bool g_ptt_held_long = false;
+esp_timer_handle_t g_cooldown_retry_timer = nullptr;
 esp_timer_handle_t g_ptt_timer = nullptr;
 constexpr int64_t kShortPressMaxUs = 300000; // 300ms
 
@@ -865,16 +866,40 @@ void on_image_rx_eot_nack(uint16_t missing_count, bool is_first_eot)
 
 // Gateway UI capture callback — triggers remote photo via radio
 
+void cooldown_retry_cb(void *arg)
+{
+    ESP_LOGI(TAG, "Cooldown expired, auto-triggering capture");
+    s_last_gw_capture_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    image_store_abort_transfer();
+    g_radio.trigger_image_capture();
+}
+
 bool on_gw_capture(void)
 {
     if (g_audio_clip_enabled) {
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
         if (s_last_gw_capture_ms != 0 &&
             (now - s_last_gw_capture_ms) < APP_AUDIO_CAPTURE_COOLDOWN_MS) {
-            ESP_LOGW(TAG, "UI capture: audio cooldown, try later");
+            uint32_t remaining_ms = APP_AUDIO_CAPTURE_COOLDOWN_MS - (now - s_last_gw_capture_ms);
+            ESP_LOGW(TAG, "UI capture: audio cooldown, auto-retry in %lums",
+                     (unsigned long)remaining_ms);
+            if (!g_cooldown_retry_timer) {
+                const esp_timer_create_args_t args = {
+                    .callback = cooldown_retry_cb,
+                    .arg = nullptr,
+                    .dispatch_method = ESP_TIMER_TASK,
+                    .name = "cooldown_retry",
+                };
+                esp_timer_create(&args, &g_cooldown_retry_timer);
+            }
+            esp_timer_stop(g_cooldown_retry_timer);
+            esp_timer_start_once(g_cooldown_retry_timer, (uint64_t)remaining_ms * 1000);
             return false;
         }
         s_last_gw_capture_ms = now;
+    }
+    if (g_cooldown_retry_timer) {
+        esp_timer_stop(g_cooldown_retry_timer);
     }
     ESP_LOGI(TAG, "UI capture: trigger remote photo");
     image_store_abort_transfer();
