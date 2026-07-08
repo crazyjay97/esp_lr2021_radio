@@ -374,6 +374,11 @@ esp_err_t wifi_mgr_init(void)
 esp_err_t wifi_mgr_start_provisioning(void)
 {
     ESP_RETURN_ON_ERROR(wifi_hw_start(), TAG, "hw start for prov");
+
+    if (s_httpd) {
+        httpd_stop(s_httpd);
+        s_httpd = NULL;
+    }
     ESP_RETURN_ON_ERROR(start_httpd(), TAG, "httpd");
 
     wifi_prov_scheme_softap_set_httpd_handle(&s_httpd);
