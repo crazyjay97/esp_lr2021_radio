@@ -204,6 +204,7 @@ private:
     // Low power CAD state
     bool low_power_cad_active_ = false;
     bool is_gateway_ = false;
+    uint32_t cad_wakeup_ms_ = 0;
 
     // Sound/PIR trigger state (shared cooldown)
     uint32_t sound_trigger_level_ = 0;

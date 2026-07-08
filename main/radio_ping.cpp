@@ -492,7 +492,13 @@ void RadioPing::poll_once()
     if (mode_ == Mode::idle) {
         if (g_low_power_enabled) {
             if (!is_gateway_) {
-                enter_low_power_cad();
+                if (cad_wakeup_ms_ != 0 &&
+                    (smtc_modem_hal_get_time_in_ms() - cad_wakeup_ms_) < 8000) {
+                    schedule_rx();
+                } else {
+                    cad_wakeup_ms_ = 0;
+                    enter_low_power_cad();
+                }
             }
         } else if (tx_burst_active_) {
             schedule_tx();
@@ -1051,6 +1057,8 @@ void RadioPing::trigger_image_capture()
         }
     }
 
+    image_rx_pending_ = true;
+    image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
     schedule_rx();
 }
 
@@ -1822,8 +1830,9 @@ void RadioPing::handle_cad_irq(ral_irq_t irq)
     }
 
     if ((irq & RAL_IRQ_CAD_OK) != 0) {
-        ESP_LOGI(TAG, "CAD detected activity, switching to FLRC RX");
+        ESP_LOGI(TAG, "CAD detected activity, switching to FLRC RX (8s window)");
         low_power_cad_active_ = false;
+        cad_wakeup_ms_ = smtc_modem_hal_get_time_in_ms();
         smtc_modem_hal_protect_api_call();
         configure_flrc();
         smtc_modem_hal_unprotect_api_call();
