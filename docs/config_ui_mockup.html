@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=240">
+<title>Gateway CONFIG Page Mockup (240x320)</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 20px;
+  background: #1a1a2e;
+  font-family: -apple-system, sans-serif;
+}
+.phone {
+  width: 240px;
+  height: 320px;
+  background: #f5faf7;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Title bar */
+.titlebar {
+  height: 28px;
+  background: #2d6b4f;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.titlebar span {
+  color: white;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+/* Scrollable content */
+.content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 8px;
+}
+
+/* Section group */
+.section {
+  background: white;
+  border-radius: 8px;
+  margin-bottom: 8px;
+  border: 1px solid #e0ebe5;
+  overflow: hidden;
+}
+.section-title {
+  font-size: 9px;
+  color: #6b8f7b;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  padding: 6px 10px 2px;
+  font-weight: 600;
+}
+
+/* Row item */
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid #f0f5f2;
+  min-height: 36px;
+}
+.row:last-child { border-bottom: none; }
+.row-left {
+  display: flex;
+  flex-direction: column;
+}
+.row-label {
+  font-size: 12px;
+  color: #1a3a2a;
+  font-weight: 500;
+}
+.row-desc {
+  font-size: 9px;
+  color: #7a9b8a;
+  margin-top: 1px;
+}
+.row-right {
+  display: flex;
+  align-items: center;
+}
+
+/* Toggle switch */
+.toggle {
+  width: 36px;
+  height: 20px;
+  border-radius: 10px;
+  background: #ccc;
+  position: relative;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.toggle.on { background: #e8940a; }
+.toggle::after {
+  content: '';
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: white;
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  transition: left 0.2s;
+}
+.toggle.on::after { left: 18px; }
+
+/* Value badge */
+.value {
+  font-size: 11px;
+  color: #2d6b4f;
+  font-weight: 600;
+  background: #e8f5ee;
+  padding: 3px 8px;
+  border-radius: 10px;
+}
+
+/* Cycle button (tap to change) */
+.cycle-btn {
+  font-size: 10px;
+  color: white;
+  background: #e8940a;
+  padding: 4px 8px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-weight: 500;
+}
+.cycle-btn.off {
+  background: #b0c4b8;
+  color: #3a5a4a;
+}
+
+/* Big action button */
+.action-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 38px;
+  background: #2d6b4f;
+  border-radius: 8px;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+.action-btn span {
+  color: white;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* WiFi bar */
+.wifi-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 32px;
+  background: #3a7a5f;
+  border-radius: 8px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+.wifi-bar span {
+  color: white;
+  font-size: 10px;
+}
+</style>
+</head>
+<body>
+
+<div class="phone">
+  <div class="titlebar">
+    <span>SETTINGS</span>
+  </div>
+
+  <div class="content">
+
+    <!-- Capture button (prominent) -->
+    <div class="action-btn">
+      <span>CAPTURE</span>
+    </div>
+
+    <!-- Trigger section -->
+    <div class="section">
+      <div class="section-title">Trigger</div>
+      <div class="row">
+        <div class="row-left">
+          <span class="row-label">PIR Motion</span>
+          <span class="row-desc">Infrared motion detect</span>
+        </div>
+        <div class="row-right">
+          <div class="toggle on"></div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-left">
+          <span class="row-label">Sound</span>
+          <span class="row-desc">Mic trigger level</span>
+        </div>
+        <div class="row-right">
+          <span class="cycle-btn">Med</span>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-left">
+          <span class="row-label">Timer</span>
+          <span class="row-desc">Auto-capture interval</span>
+        </div>
+        <div class="row-right">
+          <span class="value">5 min</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Audio section -->
+    <div class="section">
+      <div class="section-title">Audio</div>
+      <div class="row">
+        <div class="row-left">
+          <span class="row-label">Audio Clip</span>
+          <span class="row-desc">Record 5s with photo</span>
+        </div>
+        <div class="row-right">
+          <div class="toggle on"></div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-left">
+          <span class="row-label">Voice Alarm</span>
+          <span class="row-desc">Play alert on trigger</span>
+        </div>
+        <div class="row-right">
+          <div class="toggle"></div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-left">
+          <span class="row-label">Volume</span>
+        </div>
+        <div class="row-right">
+          <span class="value">13</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- System section -->
+    <div class="section">
+      <div class="section-title">System</div>
+      <div class="row">
+        <div class="row-left">
+          <span class="row-label">Low Power</span>
+          <span class="row-desc">Node sleep between captures</span>
+        </div>
+        <div class="row-right">
+          <div class="toggle"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- WiFi -->
+    <div class="wifi-bar">
+      <span>WiFi: MyHome_5G (-42 dBm) &nbsp; [CONNECT]</span>
+    </div>
+
+  </div>
+</div>
+
+</body>
+</html>
