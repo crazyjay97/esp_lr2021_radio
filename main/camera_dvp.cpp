@@ -51,6 +51,7 @@ struct dvp_cb_ctx {
     volatile size_t last_received;
     SemaphoreHandle_t done_sem;
     volatile int capture_target;
+    volatile uint8_t *captured_buffer;
 };
 
 static dvp_cb_ctx s_dvp_ctx;
@@ -73,7 +74,13 @@ static bool IRAM_ATTR on_trans_finished(esp_cam_ctlr_handle_t handle,
     ctx->last_received = trans->received_size;
     if (ctx->capture_target > 0 && ctx->frame_count >= ctx->capture_target) {
         ctx->received = trans->received_size;
-        memcpy(ctx->safe_buffer, trans->buffer, ctx->buflen);
+        ctx->captured_buffer = static_cast<uint8_t *>(trans->buffer);
+        for (size_t i = 0; i < kCaptureDmaBufferCount; i++) {
+            if (ctx->buffers[i] == trans->buffer) {
+                ctx->buffers[i] = ctx->safe_buffer;
+                break;
+            }
+        }
         ctx->capture_target = 0;
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         xSemaphoreGiveFromISR(ctx->done_sem, &xHigherPriorityTaskWoken);
@@ -467,14 +474,14 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
 
     // Arm capture: skip a few frames for stable AE/AWB
     s_dvp_ctx.received = 0;
+    s_dvp_ctx.captured_buffer = nullptr;
     xQueueReset(capture_sem_);
     s_dvp_ctx.frame_count = 0;
-    s_dvp_ctx.capture_target = 5;
+    s_dvp_ctx.capture_target = 3;
 
     bool got_frame = xSemaphoreTake(capture_sem_, pdMS_TO_TICKS(5000)) == pdTRUE;
 
-    if (got_frame && s_dvp_ctx.received >= kFrameBytes) {
-        // safe_buffer was filled by ISR before DMA could overwrite
+    if (got_frame && s_dvp_ctx.received >= kFrameBytes && s_dvp_ctx.captured_buffer) {
         ESP_LOGI(TAG, "captured frame: %u bytes (skipped %d)",
                  (unsigned)s_dvp_ctx.received, s_dvp_ctx.frame_count - 1);
 
@@ -488,7 +495,18 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
             ESP_LOGE(TAG, "frame copy alloc failed");
             return ESP_ERR_NO_MEM;
         }
-        memcpy(copy, safe_buf_, kFrameBytes);
+        esp_cache_msync((void *)s_dvp_ctx.captured_buffer, kFrameBytes,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        memcpy(copy, (void *)s_dvp_ctx.captured_buffer, kFrameBytes);
+
+        // Restore captured buffer back into DMA rotation
+        for (size_t i = 0; i < kCaptureDmaBufferCount; i++) {
+            if (s_dvp_ctx.buffers[i] == safe_buf_) {
+                s_dvp_ctx.buffers[i] = (uint8_t *)s_dvp_ctx.captured_buffer;
+                break;
+            }
+        }
+
         *out_data = copy;
         *out_len = kFrameBytes;
         *out_width = APP_CAMERA_SENSOR_WIDTH;
