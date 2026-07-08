@@ -24,6 +24,7 @@ typedef struct {
 
 esp_err_t image_store_init(void);
 void      image_store_start_sntp(void);
+void      image_store_restore_time(void);
 
 esp_err_t image_store_save(const uint8_t *jpeg, size_t jpeg_len,
                            const uint8_t *opus, size_t opus_len,

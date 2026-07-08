@@ -177,14 +177,6 @@ static const char CONNECT_OK_PAGE[] =
     "<p>Device is connecting to your WiFi network. This page will become unreachable.</p>"
     "</body></html>";
 
-static esp_err_t root_get_handler(httpd_req_t *req)
-{
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "/gallery");
-    httpd_resp_send(req, NULL, 0);
-    return ESP_OK;
-}
-
 static esp_err_t config_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
@@ -284,18 +276,11 @@ static esp_err_t start_httpd(void)
     if (s_httpd) return ESP_OK;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 10;
+    cfg.max_uri_handlers = 12;
     cfg.stack_size = 8192;
     cfg.lru_purge_enable = true;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     ESP_RETURN_ON_ERROR(httpd_start(&s_httpd, &cfg), TAG, "httpd start");
-
-    const httpd_uri_t root = {
-        .uri = "/",
-        .method = HTTP_GET,
-        .handler = root_get_handler,
-    };
-    httpd_register_uri_handler(s_httpd, &root);
 
     const httpd_uri_t config_page = {
         .uri = "/config",

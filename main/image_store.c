@@ -4,6 +4,8 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_sntp.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -12,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sys/time.h>
 
 static const char *TAG = "img_store";
 
@@ -54,6 +57,81 @@ void image_store_start_sntp(void)
     esp_sntp_init();
     s_sntp_started = true;
     ESP_LOGI(TAG, "SNTP started");
+}
+
+/* ---- Time sync (browser → device) ---- */
+
+#define NVS_TIME_NAMESPACE "time_sync"
+#define NVS_KEY_EPOCH      "epoch"
+#define NVS_KEY_UPTIME     "uptime_s"
+
+static void save_time_to_nvs(uint32_t epoch)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_TIME_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return;
+    uint32_t uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    nvs_set_u32(nvs, NVS_KEY_EPOCH, epoch);
+    nvs_set_u32(nvs, NVS_KEY_UPTIME, uptime_s);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+}
+
+void image_store_restore_time(void)
+{
+    setenv("TZ", "CST-8", 1);
+    tzset();
+
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_TIME_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return;
+    uint32_t saved_epoch = 0, saved_uptime = 0;
+    nvs_get_u32(nvs, NVS_KEY_EPOCH, &saved_epoch);
+    nvs_get_u32(nvs, NVS_KEY_UPTIME, &saved_uptime);
+    nvs_close(nvs);
+
+    if (saved_epoch < 1700000000) return;
+
+    uint32_t uptime_now = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    uint32_t estimated = saved_epoch + uptime_now;
+    struct timeval tv = { .tv_sec = (time_t)estimated, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+
+    struct tm t;
+    time_t now = (time_t)estimated;
+    localtime_r(&now, &t);
+    ESP_LOGI(TAG, "time restored from NVS: %04d-%02d-%02d %02d:%02d:%02d (approx)",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+             t.tm_hour, t.tm_min, t.tm_sec);
+}
+
+static esp_err_t handler_synctime(httpd_req_t *req)
+{
+    char buf[32] = {0};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No body");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    uint32_t epoch = (uint32_t)strtoul(buf, NULL, 10);
+    if (epoch < 1700000000) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid timestamp");
+        return ESP_FAIL;
+    }
+
+    struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    save_time_to_nvs(epoch);
+
+    struct tm t;
+    time_t now = (time_t)epoch;
+    localtime_r(&now, &t);
+    ESP_LOGI(TAG, "time synced from browser: %04d-%02d-%02d %02d:%02d:%02d",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+             t.tm_hour, t.tm_min, t.tm_sec);
+
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
 }
 
 /* ---- Background PCM decode ---- */
@@ -603,6 +681,7 @@ static const char GALLERY_HTML[] =
     "d.innerHTML='<img src=\"/img/'+m.id+'\" loading=\"lazy\"><div class=\"info\"><span>'+tm+' &middot; '+sz+'</span>'+badge+'</div>';"
     "grid.appendChild(d)})(i)}})}"
     "load();setInterval(load,8000);"
+    "fetch('/api/synctime',{method:'POST',body:Math.floor(Date.now()/1000).toString()});"
     "</script></body></html>";
 
 static esp_err_t handler_gallery(httpd_req_t *req)
@@ -621,6 +700,11 @@ esp_err_t image_store_register_httpd(httpd_handle_t httpd)
         .method = HTTP_GET,
         .handler = handler_gallery,
     };
+    const httpd_uri_t uri_root = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = handler_gallery,
+    };
     const httpd_uri_t uri_api = {
         .uri = "/api/images",
         .method = HTTP_GET,
@@ -636,12 +720,19 @@ esp_err_t image_store_register_httpd(httpd_handle_t httpd)
         .method = HTTP_GET,
         .handler = handler_audio,
     };
+    const httpd_uri_t uri_synctime = {
+        .uri = "/api/synctime",
+        .method = HTTP_POST,
+        .handler = handler_synctime,
+    };
 
     httpd_register_uri_handler(httpd, &uri_gallery);
     httpd_register_uri_handler(httpd, &uri_api);
     httpd_register_uri_handler(httpd, &uri_img);
     httpd_register_uri_handler(httpd, &uri_audio);
+    httpd_register_uri_handler(httpd, &uri_synctime);
+    httpd_register_uri_handler(httpd, &uri_root);
 
-    ESP_LOGI(TAG, "HTTP handlers registered: /gallery /api/images /img/* /audio/*");
+    ESP_LOGI(TAG, "HTTP handlers registered: / /gallery /api/images /img/* /audio/* /api/synctime");
     return ESP_OK;
 }

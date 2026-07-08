@@ -1256,6 +1256,7 @@ extern "C" void app_main(void)
                 wifi_mgr_set_state_cb(on_wifi_state_change);
                 wifi_mgr_init();
                 image_store_init();
+                image_store_restore_time();
                 {
                     httpd_handle_t h = wifi_mgr_get_httpd();
                     if (h) image_store_register_httpd(h);
