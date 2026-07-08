@@ -46,6 +46,7 @@ static uint8_t gw_nvs_load_u8(const char *key, uint8_t def)
 #define COL_TEXT_LIGHT  lv_color_hex(0xEAF6EF)
 #define COL_GREEN       lv_color_hex(0x2F7D5B)
 #define COL_AMBER       lv_color_hex(0xB76A2C)
+#define COL_ORANGE      lv_color_hex(0xFF8C00)
 #define COL_PANEL_BG    lv_color_hex(0xFFFFFF)
 #define COL_PANEL_BORDER lv_color_hex(0xC9D8D0)
 #define COL_KV_BORDER   lv_color_hex(0xE2EBE6)
@@ -123,8 +124,8 @@ static bool s_stats_first_eot_seen = false;
 /* PAGE_CONFIG objects */
 static lv_obj_t *s_cfg_rows[6] = {NULL};
 static lv_obj_t *s_cfg_val_lbls[6] = {NULL};
-static lv_obj_t *s_cfg_touch_btns[7] = {NULL};
-static lv_obj_t *s_cfg_touch_lbls[7] = {NULL};
+static lv_obj_t *s_cfg_touch_btns[8] = {NULL};
+static lv_obj_t *s_cfg_touch_lbls[8] = {NULL};
 static int s_cfg_sel = 0;
 static int s_volume_level = 13; /* 0~15, default 13 → 130% */
 static ui_gw_audio_clip_cb_t s_audio_clip_cb = NULL;
@@ -136,6 +137,8 @@ static ui_gw_pir_trigger_cb_t s_pir_trigger_cb = NULL;
 static bool s_pir_on = false;
 static ui_gw_voice_alarm_cb_t s_voice_alarm_cb = NULL;
 static bool s_alarm_on = false;
+static ui_gw_low_power_cb_t s_low_power_cb = NULL;
+static bool s_low_power_on = false;
 static ui_gw_wifi_prov_cb_t s_wifi_prov_cb = NULL;
 static ui_gw_wifi_disconnect_cb_t s_wifi_disconnect_cb = NULL;
 
@@ -646,6 +649,20 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
             gw_nvs_save_u8("alarm", s_alarm_on ? 1 : 0);
         }
         break;
+    case 7: /* Low power toggle */
+        if (s_low_power_cb && s_low_power_cb(!s_low_power_on ? 1 : 0)) {
+            s_low_power_on = !s_low_power_on;
+            if (s_cfg_touch_btns[7]) {
+                lv_obj_set_style_bg_color(s_cfg_touch_btns[7],
+                    s_low_power_on ? COL_ORANGE : lv_color_hex(0xEDF4EF), 0);
+            }
+            if (s_cfg_touch_lbls[7]) {
+                lv_obj_set_style_text_color(s_cfg_touch_lbls[7],
+                    s_low_power_on ? lv_color_white() : COL_TEXT_MAIN, 0);
+            }
+            gw_nvs_save_u8("lowpwr", s_low_power_on ? 1 : 0);
+        }
+        break;
     }
 }
 
@@ -697,9 +714,9 @@ static void create_config_page(void)
     snprintf(vol_buf, sizeof(vol_buf), "Vol: %d", s_volume_level);
     char snd_buf[16];
     snprintf(snd_buf, sizeof(snd_buf), "Snd: %s", s_trigger_labels[s_sound_trigger_idx]);
-    const char *btn_labels[] = {"Capture", s_audio_clip_on ? "Audio ON" : "Audio OFF", interval_buf, vol_buf, snd_buf, s_pir_on ? "PIR ON" : "PIR OFF", s_alarm_on ? "Alarm ON" : "Alarm OFF"};
+    const char *btn_labels[] = {"Capture", s_audio_clip_on ? "Audio ON" : "Audio OFF", interval_buf, vol_buf, snd_buf, s_pir_on ? "PIR ON" : "PIR OFF", s_alarm_on ? "Alarm ON" : "Alarm OFF", "Low Power"};
 
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < 8; i++) {
         lv_obj_t *btn = lv_btn_create(btn_grid);
         lv_obj_set_size(btn, 109, 32);
         lv_obj_set_style_radius(btn, 6, 0);
@@ -714,6 +731,8 @@ static void create_config_page(void)
             lv_obj_set_style_bg_color(btn, COL_AMBER, 0);
         } else if (i == 6 && s_alarm_on) {
             lv_obj_set_style_bg_color(btn, COL_AMBER, 0);
+        } else if (i == 7 && s_low_power_on) {
+            lv_obj_set_style_bg_color(btn, COL_ORANGE, 0);
         } else {
             lv_obj_set_style_bg_color(btn, lv_color_hex(0xEDF4EF), 0);
         }
@@ -721,7 +740,7 @@ static void create_config_page(void)
 
         lv_obj_t *lbl = lv_label_create(btn);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-        if ((i == 1 && s_audio_clip_on) || (i == 4 && s_sound_trigger_idx > 0) || (i == 5 && s_pir_on) || (i == 6 && s_alarm_on)) {
+        if ((i == 1 && s_audio_clip_on) || (i == 4 && s_sound_trigger_idx > 0) || (i == 5 && s_pir_on) || (i == 6 && s_alarm_on) || (i == 7 && s_low_power_on)) {
             lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
         } else {
             lv_obj_set_style_text_color(lbl, COL_TEXT_MAIN, 0);
@@ -904,6 +923,7 @@ esp_err_t ui_gw_init(void)
     if (s_sound_trigger_idx > 3) s_sound_trigger_idx = 0;
     s_pir_on = gw_nvs_load_u8("pir", 0) != 0;
     s_alarm_on = gw_nvs_load_u8("alarm", 0) != 0;
+    s_low_power_on = gw_nvs_load_u8("lowpwr", 0) != 0;
     bsp_audio_set_volume((uint8_t)(s_volume_level * 10));
     ESP_LOGI(TAG, "NVS load: vol=%d audio=%d snd=%d pir=%d alarm=%d",
              s_volume_level, s_audio_clip_on, s_sound_trigger_idx, s_pir_on, s_alarm_on);
@@ -947,6 +967,11 @@ void ui_gw_set_pir_trigger_cb(ui_gw_pir_trigger_cb_t cb)
 void ui_gw_set_voice_alarm_cb(ui_gw_voice_alarm_cb_t cb)
 {
     s_voice_alarm_cb = cb;
+}
+
+void ui_gw_set_low_power_cb(ui_gw_low_power_cb_t cb)
+{
+    s_low_power_cb = cb;
 }
 
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed)

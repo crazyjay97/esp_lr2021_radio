@@ -52,6 +52,7 @@ esp_timer_handle_t g_countdown_timer = nullptr;
 uint32_t g_capture_interval_sec = APP_AUTO_CAPTURE_DEFAULT_SEC;
 bool g_audio_clip_enabled = APP_AUDIO_CLIP_DEFAULT_ENABLE;
 volatile bool g_voice_alarm_enabled = false;
+volatile bool g_low_power_enabled = false;
 uint16_t g_auto_session_id = 0x8000;
 int64_t g_last_capture_time_us = 0;
 
@@ -303,6 +304,10 @@ void on_config_received(uint8_t key, uint32_t value)
         g_voice_alarm_enabled = (value != 0);
         save_config_u8("alarm", value ? 1 : 0);
         ESP_LOGI(TAG, "config: voice_alarm=%s", value ? "on" : "off");
+    } else if (key == APP_CFG_KEY_LOW_POWER) {
+        g_low_power_enabled = (value != 0);
+        save_config_u8("lowpwr", value ? 1 : 0);
+        ESP_LOGI(TAG, "config: low_power=%s", value ? "on" : "off");
     }
 }
 
@@ -880,6 +885,12 @@ bool on_gw_voice_alarm_change(uint32_t enable)
     return g_radio.send_config(APP_CFG_KEY_VOICE_ALARM, enable);
 }
 
+bool on_gw_low_power_change(uint32_t enable)
+{
+    ESP_LOGI(TAG, "UI low power: %s", enable ? "on" : "off");
+    return g_radio.send_config(APP_CFG_KEY_LOW_POWER, enable);
+}
+
 void on_wifi_prov_request(void)
 {
     if (wifi_mgr_get_state() == WIFI_MGR_CONNECTED ||
@@ -1114,9 +1125,10 @@ extern "C" void app_main(void)
             g_radio.set_sound_trigger_level(load_config_u8("snd_trig", 0));
             g_radio.set_pir_enabled(load_config_u8("pir", 0) != 0);
             g_voice_alarm_enabled = load_config_u8("alarm", 0) != 0;
-            ESP_LOGI(TAG, "NVS: audio=%d snd=%d pir=%d alarm=%d",
+            g_low_power_enabled = load_config_u8("lowpwr", 0) != 0;
+            ESP_LOGI(TAG, "NVS: audio=%d snd=%d pir=%d alarm=%d lowpwr=%d",
                      g_audio_clip_enabled, load_config_u8("snd_trig", 0),
-                     load_config_u8("pir", 0), g_voice_alarm_enabled);
+                     load_config_u8("pir", 0), g_voice_alarm_enabled, g_low_power_enabled);
             start_auto_capture_timer();
             update_camera_timer_status();
             start_countdown_timer();
@@ -1172,6 +1184,7 @@ extern "C" void app_main(void)
                 ui_gw_set_sound_trigger_cb(on_gw_sound_trigger_change);
                 ui_gw_set_pir_trigger_cb(on_gw_pir_trigger_change);
                 ui_gw_set_voice_alarm_cb(on_gw_voice_alarm_change);
+                ui_gw_set_low_power_cb(on_gw_low_power_change);
                 ui_gw_set_wifi_prov_cb(on_wifi_prov_request);
                 ui_gw_set_wifi_disconnect_cb(on_wifi_disconnect_request);
 
