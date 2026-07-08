@@ -12,6 +12,12 @@
 
 #include "app_config.h"
 
+#include "lr20xx_radio_lora.h"
+#include "lr20xx_radio_common.h"
+#include "lr20xx_system.h"
+
+extern volatile bool g_low_power_enabled;
+
 namespace {
 constexpr const char *TAG = "radio_ping";
 constexpr uint8_t kSyncWord[4] = {
@@ -482,12 +488,19 @@ void RadioPing::poll_once()
     }
 
     if (mode_ == Mode::idle) {
-        if (tx_burst_active_) {
+        if (g_low_power_enabled) {
+            enter_low_power_cad();
+        } else if (tx_burst_active_) {
             schedule_tx();
             if (!tx_burst_active_ && !ptt_active_ && mode_ == Mode::idle) {
                 schedule_rx();
             }
         } else if (!ptt_active_) {
+            if (low_power_cad_active_) {
+                low_power_cad_active_ = false;
+                configure_flrc();
+                ESP_LOGI(TAG, "low power off, back to FLRC RX");
+            }
             schedule_rx();
         }
     }
@@ -543,6 +556,8 @@ void RadioPing::handle_irq(ral_irq_t irq)
         if (APP_FLRC_VOICE_TX_GAP_MS > 0) {
             vTaskDelay(ms_to_ticks_min_1(APP_FLRC_VOICE_TX_GAP_MS));
         }
+    } else if (completed_mode == Mode::cad_pending) {
+        handle_cad_irq(irq);
     }
 }
 
@@ -1712,4 +1727,100 @@ size_t RadioPing::snapshot_audio(int16_t *out, size_t max_samples)
 size_t RadioPing::snapshot_opus(uint8_t *out, size_t max_bytes)
 {
     return opus_ringbuf_.snapshot(out, max_bytes);
+}
+
+bool RadioPing::configure_lora_cad()
+{
+    const void *ctx = radio_.ral.context;
+
+    lr20xx_radio_common_set_rf_freq(ctx, APP_FLRC_FREQUENCY_HZ);
+
+    lr20xx_radio_lora_mod_params_t mod = {};
+    mod.sf = LR20XX_RADIO_LORA_SF7;
+    mod.bw = LR20XX_RADIO_LORA_BW_125;
+    mod.cr = LR20XX_RADIO_LORA_CR_4_5;
+    mod.ppm = LR20XX_RADIO_LORA_NO_PPM;
+    if (lr20xx_radio_lora_set_modulation_params(ctx, &mod) != LR20XX_STATUS_OK) {
+        ESP_LOGE(TAG, "lora mod params failed");
+        return false;
+    }
+
+    lr20xx_radio_lora_cad_params_t cad = {};
+    cad.cad_symb_nb = 2;
+    cad.pnr_delta = 0;
+    cad.cad_exit_mode = LR20XX_RADIO_LORA_CAD_EXIT_MODE_STANDBYRC;
+    cad.cad_timeout_in_pll_step = 0;
+    cad.cad_detect_peak = 56;
+    if (lr20xx_radio_lora_configure_cad_params(ctx, &cad) != LR20XX_STATUS_OK) {
+        ESP_LOGE(TAG, "lora cad params failed");
+        return false;
+    }
+
+    return true;
+}
+
+void RadioPing::enter_low_power_cad()
+{
+    if (mode_ != Mode::idle) return;
+
+    const void *ctx = radio_.ral.context;
+
+    if (!low_power_cad_active_) {
+        smtc_modem_hal_protect_api_call();
+        if (mode_ == Mode::rx_pending) {
+            ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+            ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+            mode_ = Mode::idle;
+        }
+        smtc_modem_hal_unprotect_api_call();
+        low_power_cad_active_ = true;
+        ESP_LOGI(TAG, "entering low power CAD mode");
+    }
+
+    smtc_modem_hal_protect_api_call();
+    smtc_modem_hal_start_radio_tcxo();
+
+    if (!configure_lora_cad()) {
+        smtc_modem_hal_unprotect_api_call();
+        ESP_LOGE(TAG, "CAD config failed, fallback to FLRC RX");
+        low_power_cad_active_ = false;
+        configure_flrc();
+        schedule_rx();
+        return;
+    }
+
+    ral_set_dio_irq_params(&radio_.ral, RAL_IRQ_CAD_DONE | RAL_IRQ_CAD_OK);
+    lr20xx_radio_lora_set_cad(ctx);
+    smtc_modem_hal_unprotect_api_call();
+
+    mode_ = Mode::cad_pending;
+}
+
+void RadioPing::handle_cad_irq(ral_irq_t irq)
+{
+    mode_ = Mode::idle;
+
+    if ((irq & RAL_IRQ_CAD_DONE) == 0) {
+        ESP_LOGW(TAG, "CAD unexpected irq=0x%08lx", static_cast<unsigned long>(irq));
+        return;
+    }
+
+    if ((irq & RAL_IRQ_CAD_OK) != 0) {
+        ESP_LOGI(TAG, "CAD detected activity, switching to FLRC RX");
+        low_power_cad_active_ = false;
+        smtc_modem_hal_protect_api_call();
+        configure_flrc();
+        smtc_modem_hal_unprotect_api_call();
+        schedule_rx();
+    } else {
+        const void *ctx = radio_.ral.context;
+        lr20xx_system_sleep_cfg_t sleep_cfg = {};
+        sleep_cfg.is_clk_32k_enabled = 1;
+        sleep_cfg.is_ram_retention_enabled = 1;
+        smtc_modem_hal_protect_api_call();
+        lr20xx_system_set_sleep_mode(ctx, &sleep_cfg, 0);
+        smtc_modem_hal_unprotect_api_call();
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
 }

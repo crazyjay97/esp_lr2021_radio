@@ -29,6 +29,8 @@
 #include "warning_voice_opus.h"
 #endif
 
+volatile bool g_low_power_enabled = false;
+
 namespace {
 constexpr const char *TAG = "app";
 constexpr const char *kNvsNs = "app";
@@ -52,7 +54,6 @@ esp_timer_handle_t g_countdown_timer = nullptr;
 uint32_t g_capture_interval_sec = APP_AUTO_CAPTURE_DEFAULT_SEC;
 bool g_audio_clip_enabled = APP_AUDIO_CLIP_DEFAULT_ENABLE;
 volatile bool g_voice_alarm_enabled = false;
-volatile bool g_low_power_enabled = false;
 uint16_t g_auto_session_id = 0x8000;
 int64_t g_last_capture_time_us = 0;
 

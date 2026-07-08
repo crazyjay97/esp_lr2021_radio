@@ -65,6 +65,7 @@ private:
         idle,
         rx_pending,
         tx_pending,
+        cad_pending,
     };
 
     static void task_trampoline(void *arg);
@@ -105,6 +106,9 @@ private:
     bool wait_for_tx_done(uint32_t timeout_ms);
     void check_image_rx_timeout();
     void send_config_ack(uint8_t key, uint32_t value);
+    bool configure_lora_cad();
+    void enter_low_power_cad();
+    void handle_cad_irq(ral_irq_t irq);
 
     struct VoicePacket {
         uint16_t seq;
@@ -195,6 +199,9 @@ private:
 
     // Config ACK state
     volatile bool config_ack_received_ = false;
+
+    // Low power CAD state
+    bool low_power_cad_active_ = false;
 
     // Sound/PIR trigger state (shared cooldown)
     uint32_t sound_trigger_level_ = 0;
