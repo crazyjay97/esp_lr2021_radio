@@ -206,9 +206,9 @@
 #define APP_TRIGGER_COOLDOWN_SEC        15U
 #define APP_AUDIO_CAPTURE_COOLDOWN_MS   6000U
 #define APP_PIR_GPIO                    GPIO_NUM_12
-#define APP_SOUND_TRIGGER_THRESH_LOW    12000
+#define APP_SOUND_TRIGGER_THRESH_LOW    1200
 #define APP_SOUND_TRIGGER_THRESH_MED    5000
-#define APP_SOUND_TRIGGER_THRESH_HIGH   1200
+#define APP_SOUND_TRIGGER_THRESH_HIGH   12000
 
 /* ----- Voice alarm (speaker playback on trigger) ------------------------- */
 
