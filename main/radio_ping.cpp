@@ -515,15 +515,28 @@ void RadioPing::poll_once()
     }
 
     if (mode_ == Mode::idle) {
-        if (g_low_power_enabled) {
-            if (!is_gateway_) {
-                if (cad_wakeup_ms_ != 0 &&
-                    (smtc_modem_hal_get_time_in_ms() - cad_wakeup_ms_) < 8000) {
-                    schedule_rx();
-                } else {
-                    cad_wakeup_ms_ = 0;
+        if (g_low_power_enabled && !is_gateway_) {
+            // Low-power CAD sleep is a NODE-only behavior. The gateway never
+            // sleeps: it must stay in continuous FLRC RX so it can receive a
+            // node's self-initiated (PIR-triggered) image push, which arrives
+            // with no prior request from the gateway.
+            if (pir_push_wake_) {
+                // PIR push in progress: node is (about to be) the transmitter.
+                // Stay awake-but-idle — do NOT open RX and do NOT sleep to CAD.
+                // image_tx_task will grab the radio (suspended_=true) once the
+                // capture completes. 8s safety timeout in case the capture never
+                // fires (e.g. blocked by the 15s cooldown) so we don't stay awake
+                // forever burning power — fall back to CAD sleep.
+                if (smtc_modem_hal_get_time_in_ms() - pir_push_wake_ms_ >= 8000) {
+                    pir_push_wake_ = false;
                     enter_low_power_cad();
                 }
+            } else if (cad_wakeup_ms_ != 0 &&
+                (smtc_modem_hal_get_time_in_ms() - cad_wakeup_ms_) < 8000) {
+                schedule_rx();
+            } else {
+                cad_wakeup_ms_ = 0;
+                enter_low_power_cad();
             }
         } else if (tx_burst_active_) {
             schedule_tx();
@@ -600,8 +613,15 @@ void RadioPing::schedule_rx()
 {
     if (mode_ != Mode::idle) return;
 
+    // The gateway is RX-only and must listen with NO gaps: a node's
+    // self-initiated (PIR) image push arrives unannounced, and the 100ms
+    // timeout+re-arm cycle leaves a set_standby/set_rx blind spot the push can
+    // fall into. So the gateway always uses continuous RX. It still transmits
+    // fine because every gateway TX path (send_lora_wakeup, trigger_image_
+    // capture) breaks out of RX via ral_set_standby first. Nodes keep the short
+    // timeout so they can fall back into CAD sleep between windows.
     uint32_t rx_timeout = APP_FLRC_RX_TIMEOUT_MS;
-    if (image_rx_pending_) {
+    if (image_rx_pending_ || is_gateway_) {
         rx_timeout = RAL_RX_TIMEOUT_CONTINUOUS_MODE;
     }
 
@@ -1369,10 +1389,13 @@ void RadioPing::image_tx_task()
         // ESP_LOGI(TAG, "image TX finished: session=%u done=%d",
         //          req.session_id, transfer_done ? 1 : 0);
 
-        // Low power: work done, end the 8s wake window so the main loop
-        // returns to CAD sleep on the next idle pass.
-        if (g_low_power_enabled && !is_gateway_ && cad_wakeup_ms_ != 0) {
+        // Low power: work done, end the wake window(s) so the main loop returns
+        // to CAD sleep on the next idle pass. cad_wakeup_ms_ = gateway-request RX
+        // window; pir_push_wake_ = PIR self-push keep-awake guard. Clear whichever
+        // brought us here.
+        if (g_low_power_enabled && !is_gateway_ && (cad_wakeup_ms_ != 0 || pir_push_wake_)) {
             cad_wakeup_ms_ = 0;
+            pir_push_wake_ = false;
             ESP_LOGI(TAG, "image TX done, ending wake window -> CAD sleep");
         }
 
@@ -1851,9 +1874,17 @@ bool RadioPing::low_power_sleep(uint32_t ms)
 
     esp_sleep_enable_timer_wakeup((uint64_t)ms * 1000ULL);
 
-    // PIR wake is only armed when PIR is actually enabled — otherwise the pin
-    // level is undefined and could cause spurious wakeups.
-    bool pir_wake = pir_enabled_;
+    // ESP32-S3 light-sleep GPIO wake ONLY supports level mode; edge mode
+    // (GPIO_INTR_POSEDGE) is rejected at runtime with:
+    //   "GPIO wakeup only supports level mode, but edge mode set"
+    // so we arm GPIO_INTR_HIGH_LEVEL — the same trigger type the PIR ISR uses.
+    // We only arm it when pir_armed_ is set: after a detection the ISR disables
+    // the trigger and clears pir_armed_ for the 15s cooldown, during which the
+    // still-high PIR pin must NOT wake us. The GPIO ISR (also HIGH_LEVEL) is
+    // already installed, so on wake it fires, disables the source, sets
+    // pir_triggered_, and starts the re-arm timer — we don't touch the trigger
+    // config here, we only supply the light-sleep wake source.
+    bool pir_wake = pir_enabled_ && pir_armed_;
     if (pir_wake) {
         gpio_wakeup_enable(APP_PIR_GPIO, GPIO_INTR_HIGH_LEVEL);
         esp_sleep_enable_gpio_wakeup();
@@ -1863,19 +1894,21 @@ bool RadioPing::low_power_sleep(uint32_t ms)
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     bool woken_by_pir = false;
+
     if (pir_wake) {
-        // Undo the light-sleep level trigger and restore the normal edge ISR.
         gpio_wakeup_disable(APP_PIR_GPIO);
-        gpio_set_intr_type(APP_PIR_GPIO, GPIO_INTR_POSEDGE);
         if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+            // The HIGH_LEVEL GPIO ISR fires on resume and handles the trigger
+            // (disable source, set pir_triggered_, start 15s re-arm). We just
+            // report the PIR wake so the caller keeps the node awake to push.
             woken_by_pir = true;
-            pir_triggered_ = true;
             ESP_LOGI(TAG, "light sleep: woken by PIR");
         }
     }
     if (cause == ESP_SLEEP_WAKEUP_TIMER) {
         ESP_LOGD(TAG, "light sleep: timer wake");
     }
+
     return woken_by_pir;
 }
 
@@ -1954,19 +1987,19 @@ void RadioPing::handle_cad_irq(ral_irq_t irq)
         bool woken_by_pir = low_power_sleep(500);
 
         if (woken_by_pir) {
-            // PIR fired: come fully awake so the PIR-triggered capture can run
-            // without the loop sleeping again mid-capture. Switch to FLRC and
-            // open the wake window; the "image TX done" handler closes it.
-            // The LR2021 wakes from sleep via the NSS edge of these SPI
-            // commands (HAL waits on BUSY), same as the normal CAD re-arm path.
-            smtc_modem_hal_protect_api_call();
-            smtc_modem_hal_start_radio_tcxo();
-            configure_flrc();
-            smtc_modem_hal_unprotect_api_call();
-            low_power_cad_active_ = false;
-            cad_wakeup_ms_ = smtc_modem_hal_get_time_in_ms();
-            schedule_rx();
-            ESP_LOGI(TAG, "PIR wake: staying awake for capture");
+            // PIR is a self-initiated PUSH: the node is the transmitter, exactly
+            // like the non-low-power PIR path in tx_task, which touches the radio
+            // ZERO times — it only calls image_capture_cb_. image_tx_task then
+            // takes over the radio entirely (its own configure_flrc + ImageStart
+            // + schedule_rx for the ACK). So here we must NOT touch the radio: no
+            // TCXO, no configure_flrc, and definitely no schedule_rx (we are not
+            // waiting for anyone). The ONE thing we need is to stop the loop from
+            // dropping back into CAD sleep before tx_task fires the capture. The
+            // pir_push_wake_ guard keeps the loop awake-but-idle for that; the
+            // radio stays asleep until image_tx_task's SPI wakes it.
+            pir_push_wake_ = true;
+            pir_push_wake_ms_ = smtc_modem_hal_get_time_in_ms();
+            ESP_LOGI(TAG, "PIR wake: staying awake, capture will push image");
         }
     }
 }

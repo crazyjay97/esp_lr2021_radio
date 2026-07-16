@@ -9,6 +9,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
@@ -260,18 +261,57 @@ void start_countdown_timer()
     esp_timer_start_periodic(g_countdown_timer, 1000000ULL);
 }
 
+// 15s one-shot timer that re-arms the PIR trigger after a detection.
+static TimerHandle_t g_pir_rearm_timer = nullptr;
+
+// PIR uses GPIO_INTR_HIGH_LEVEL: the sensor holds GPIO12 HIGH for several
+// seconds after motion, and level-mode is also the ONLY mode the ESP32-S3
+// light-sleep GPIO wake supports. A level trigger left enabled would fire
+// continuously while the pin is high — an interrupt storm that trips the
+// interrupt watchdog and RESTARTS the node. So the ISR disables the trigger
+// source the instant it fires, and a 15s one-shot timer re-arms it. That 15s
+// re-arm also serves as the capture cooldown: continuous motion just keeps the
+// pin high, and when the timer re-enables the level interrupt on a still-high
+// pin it fires again immediately, disables again, and restarts the 15s timer.
 static void IRAM_ATTR pir_isr_handler(void *arg)
 {
+    // Kill the level trigger NOW so it can't re-fire while GPIO12 stays high.
+    gpio_intr_disable(APP_PIR_GPIO);
+    static_cast<RadioPing *>(arg)->set_pir_armed(false);
     static_cast<RadioPing *>(arg)->pir_trigger();
+    if (g_pir_rearm_timer != nullptr) {
+        BaseType_t hp_woken = pdFALSE;
+        xTimerStartFromISR(g_pir_rearm_timer, &hp_woken);
+        portYIELD_FROM_ISR(hp_woken);
+    }
+}
+
+// Re-arm the PIR level trigger 15s after the last detection.
+static void pir_rearm_timer_cb(TimerHandle_t /*t*/)
+{
+    gpio_intr_disable(APP_PIR_GPIO);
+    gpio_set_intr_type(APP_PIR_GPIO, GPIO_INTR_HIGH_LEVEL);
+    g_radio.set_pir_armed(true);
+    gpio_intr_enable(APP_PIR_GPIO);
+    ESP_LOGI(TAG, "PIR: GPIO%d high-level re-armed", APP_PIR_GPIO);
 }
 
 void pir_arm_timer_cb(void *arg)
 {
+    if (g_pir_rearm_timer == nullptr) {
+        g_pir_rearm_timer = xTimerCreate(
+            "pir_rearm",
+            pdMS_TO_TICKS(APP_TRIGGER_COOLDOWN_SEC * 1000U),
+            pdFALSE, // one-shot
+            nullptr,
+            pir_rearm_timer_cb);
+    }
     gpio_intr_disable(APP_PIR_GPIO);
     gpio_isr_handler_add(APP_PIR_GPIO, pir_isr_handler, arg);
-    gpio_set_intr_type(APP_PIR_GPIO, GPIO_INTR_POSEDGE);
+    gpio_set_intr_type(APP_PIR_GPIO, GPIO_INTR_HIGH_LEVEL);
+    static_cast<RadioPing *>(arg)->set_pir_armed(true);
     gpio_intr_enable(APP_PIR_GPIO);
-    ESP_LOGI(TAG, "PIR: GPIO%d rising edge armed", APP_PIR_GPIO);
+    ESP_LOGI(TAG, "PIR: GPIO%d high-level armed", APP_PIR_GPIO);
 }
 
 void on_config_received(uint8_t key, uint32_t value)
@@ -1234,7 +1274,7 @@ extern "C" void app_main(void)
             update_camera_timer_status();
             start_countdown_timer();
 
-            // PIR sensor on GPIO12: delay 5s then arm rising edge
+            // PIR sensor on GPIO12: delay 5s then arm high-level trigger
             // (allow residual touch IC signals to settle after power-on)
             gpio_config_t pir_cfg = {
                 .pin_bit_mask = 1ULL << APP_PIR_GPIO,

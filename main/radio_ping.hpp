@@ -59,6 +59,12 @@ public:
     void set_sound_trigger_level(uint32_t level) { sound_trigger_level_ = level; }
     void set_pir_enabled(bool en) { pir_enabled_ = en; }
     void IRAM_ATTR pir_trigger() { pir_triggered_ = true; }
+    // Tracks whether the PIR level trigger is currently armed. Cleared by the
+    // ISR on detection (trigger disabled), set again by the 15s re-arm timer.
+    // low_power_sleep only arms the light-sleep GPIO wake when this is true, so
+    // during the 15s cooldown the node won't wake on the still-high PIR pin.
+    void IRAM_ATTR set_pir_armed(bool armed) { pir_armed_ = armed; }
+    bool pir_armed() const { return pir_armed_; }
 
     // Audio ring buffer for pre-capture retrospective recording
     size_t snapshot_audio(int16_t *out, size_t max_samples);
@@ -214,6 +220,12 @@ private:
     bool low_power_cad_active_ = false;
     bool is_gateway_ = false;
     uint32_t cad_wakeup_ms_ = 0;
+    // PIR self-push wake: node woke on PIR to CAPTURE+PUSH an image (it is the
+    // transmitter, not a receiver). Keeps the loop awake (no RX, no CAD) until
+    // image_tx_task takes over the radio. Distinct from cad_wakeup_ms_, which is
+    // the gateway-request RX window (node received a LoRa wakeup, must RX cmd).
+    volatile bool pir_push_wake_ = false;
+    uint32_t pir_push_wake_ms_ = 0;
 
     // Sound/PIR trigger state (shared cooldown)
     uint32_t sound_trigger_level_ = 0;
@@ -221,4 +233,5 @@ private:
     int64_t last_trigger_us_ = 0;
     uint16_t sound_trigger_session_id_ = 0xC000;
     volatile bool pir_triggered_ = false;
+    volatile bool pir_armed_ = false;
 };
