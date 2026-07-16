@@ -9,7 +9,6 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/timers.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
@@ -262,7 +261,14 @@ void start_countdown_timer()
 }
 
 // 15s one-shot timer that re-arms the PIR trigger after a detection.
-static TimerHandle_t g_pir_rearm_timer = nullptr;
+// MUST be esp_timer, NOT a FreeRTOS xTimer: with CONFIG_PM_ENABLE off, the
+// FreeRTOS tick is FROZEN during esp_light_sleep_start(), so a tick-based timer
+// barely advances across the node's 500ms CAD light-sleep cycles and would take
+// many minutes (or effectively never) to expire — which is exactly why the 2nd
+// PIR never re-armed until a gateway wakeup kept the CPU awake long enough to
+// accumulate ticks. esp_timer runs off the hardware timer, which keeps counting
+// through light sleep, so 15s of wall-clock time expires correctly.
+static esp_timer_handle_t g_pir_rearm_timer = nullptr;
 
 // PIR uses GPIO_INTR_HIGH_LEVEL: the sensor holds GPIO12 HIGH for several
 // seconds after motion, and level-mode is also the ONLY mode the ESP32-S3
@@ -280,18 +286,21 @@ static void IRAM_ATTR pir_isr_handler(void *arg)
     static_cast<RadioPing *>(arg)->set_pir_armed(false);
     static_cast<RadioPing *>(arg)->pir_trigger();
     if (g_pir_rearm_timer != nullptr) {
-        BaseType_t hp_woken = pdFALSE;
-        xTimerStartFromISR(g_pir_rearm_timer, &hp_woken);
-        portYIELD_FROM_ISR(hp_woken);
+        // esp_timer_start_once is ISR-safe. Guard against a double-start (the
+        // timer could still be pending if a stray edge slipped in) by stopping
+        // first is NOT ISR-safe, so we rely on the trigger being disabled above
+        // to prevent re-entry until the timer fires and re-arms.
+        esp_timer_start_once(g_pir_rearm_timer,
+                             (uint64_t)APP_TRIGGER_COOLDOWN_SEC * 1000000ULL);
     }
 }
 
 // Re-arm the PIR level trigger 15s after the last detection.
-static void pir_rearm_timer_cb(TimerHandle_t /*t*/)
+static void pir_rearm_timer_cb(void *arg)
 {
     gpio_intr_disable(APP_PIR_GPIO);
     gpio_set_intr_type(APP_PIR_GPIO, GPIO_INTR_HIGH_LEVEL);
-    g_radio.set_pir_armed(true);
+    static_cast<RadioPing *>(arg)->set_pir_armed(true);
     gpio_intr_enable(APP_PIR_GPIO);
     ESP_LOGI(TAG, "PIR: GPIO%d high-level re-armed", APP_PIR_GPIO);
 }
@@ -299,12 +308,14 @@ static void pir_rearm_timer_cb(TimerHandle_t /*t*/)
 void pir_arm_timer_cb(void *arg)
 {
     if (g_pir_rearm_timer == nullptr) {
-        g_pir_rearm_timer = xTimerCreate(
-            "pir_rearm",
-            pdMS_TO_TICKS(APP_TRIGGER_COOLDOWN_SEC * 1000U),
-            pdFALSE, // one-shot
-            nullptr,
-            pir_rearm_timer_cb);
+        const esp_timer_create_args_t rearm_args = {
+            .callback = pir_rearm_timer_cb,
+            .arg = arg,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "pir_rearm",
+            .skip_unhandled_events = true,
+        };
+        esp_timer_create(&rearm_args, &g_pir_rearm_timer);
     }
     gpio_intr_disable(APP_PIR_GPIO);
     gpio_isr_handler_add(APP_PIR_GPIO, pir_isr_handler, arg);
