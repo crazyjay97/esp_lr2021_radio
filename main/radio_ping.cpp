@@ -808,6 +808,12 @@ void RadioPing::handle_rx_packet()
             config_received_cb_(key, value);
         }
         send_config_ack(key, value);
+        // Low power: config applied + ACK sent, work done. End the wake window
+        // so the main loop returns to CAD sleep on the next idle pass.
+        if (g_low_power_enabled && !is_gateway_ && cad_wakeup_ms_ != 0) {
+            cad_wakeup_ms_ = 0;
+            ESP_LOGI(TAG, "config ACK sent, ending wake window -> CAD sleep");
+        }
     } else if (rx_buf_[4] == kPacketTypeConfigAck) {
         ESP_LOGI(TAG, "RX ConfigAck");
         config_ack_received_ = true;
@@ -1174,6 +1180,10 @@ void RadioPing::image_tx_task()
             image_tx_active_ = false;
             suspended_ = false;
             ptt_active_ = was_ptt;
+            if (g_low_power_enabled && !is_gateway_ && cad_wakeup_ms_ != 0) {
+                cad_wakeup_ms_ = 0;
+                ESP_LOGI(TAG, "image TX aborted, ending wake window -> CAD sleep");
+            }
             if (!ptt_active_) schedule_rx();
             continue;
         }
@@ -1333,6 +1343,13 @@ void RadioPing::image_tx_task()
         ptt_active_ = was_ptt;
         // ESP_LOGI(TAG, "image TX finished: session=%u done=%d",
         //          req.session_id, transfer_done ? 1 : 0);
+
+        // Low power: work done, end the 8s wake window so the main loop
+        // returns to CAD sleep on the next idle pass.
+        if (g_low_power_enabled && !is_gateway_ && cad_wakeup_ms_ != 0) {
+            cad_wakeup_ms_ = 0;
+            ESP_LOGI(TAG, "image TX done, ending wake window -> CAD sleep");
+        }
 
         if (mode_ != Mode::rx_pending && !ptt_active_) {
             schedule_rx();
@@ -1669,6 +1686,21 @@ bool RadioPing::send_config(uint8_t key, uint32_t value)
     put_u32_le(&pkt[9], value);
     pkt[13] = 0;
 
+    // Low power: node sleeps in CAD, so wake it with a long LoRa preamble
+    // before sending the config, same as trigger_image_capture().
+    if (g_low_power_enabled) {
+        uint32_t t0 = smtc_modem_hal_get_time_in_ms();
+        if (!send_lora_wakeup()) {
+            ESP_LOGE(TAG, "LoRa wakeup failed for config");
+            suspended_ = false;
+            if (!ptt_active_) schedule_rx();
+            return false;
+        }
+        uint32_t elapsed = smtc_modem_hal_get_time_in_ms() - t0;
+        ESP_LOGI(TAG, "LoRa wakeup preamble TX took %lu ms (config)", (unsigned long)elapsed);
+        configure_flrc();
+    }
+
     for (int attempt = 0; attempt < 3; attempt++) {
         smtc_modem_hal_protect_api_call();
         if (mode_ == Mode::rx_pending) {
@@ -1828,6 +1860,8 @@ void RadioPing::handle_cad_irq(ral_irq_t irq)
         ESP_LOGW(TAG, "CAD unexpected irq=0x%08lx", static_cast<unsigned long>(irq));
         return;
     }
+
+    ESP_LOGI(TAG, "CAD done: %s", (irq & RAL_IRQ_CAD_OK) ? "activity detected" : "channel clear");
 
     if ((irq & RAL_IRQ_CAD_OK) != 0) {
         ESP_LOGI(TAG, "CAD detected activity, switching to FLRC RX (8s window)");

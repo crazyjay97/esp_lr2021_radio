@@ -823,11 +823,7 @@ static void create_config_page(void)
     /* ── SYSTEM section ── */
     lv_obj_t *sec_sys = cfg_create_section(cont, "SYSTEM");
 
-    cfg_create_toggle_row(sec_sys, "Low Power", "In development...", 7, false);
-    if (s_cfg_touch_btns[7]) {
-        lv_obj_add_state(s_cfg_touch_btns[7], LV_STATE_DISABLED);
-        lv_obj_set_style_opa(s_cfg_touch_btns[7], LV_OPA_50, 0);
-    }
+    cfg_create_toggle_row(sec_sys, "Low Power", "CAD sleep standby", 7, s_low_power_on);
 
     /* ── WiFi info panel ── */
     lv_obj_t *wifi_box = lv_obj_create(cont);
