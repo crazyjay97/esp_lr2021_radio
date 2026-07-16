@@ -1073,6 +1073,10 @@ extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "Lierda L-LRMAM36-FANN4-DK01 booting");
     esp_log_level_set("RALF_LR20XX", ESP_LOG_WARN);
+    // Suppress noisy but harmless HTTP server warnings: /favicon.ico 404s
+    // (browser auto-requests it) and recv errno 104 (client closed connection).
+    esp_log_level_set("httpd_uri", ESP_LOG_ERROR);
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
 
     esp_err_t e;
     init_nvs();

@@ -184,7 +184,7 @@ static void create_shared_layout(void)
     s_status_lbl_l = lv_label_create(s_status_bar);
     lv_obj_set_style_text_color(s_status_lbl_l, COL_TEXT_LIGHT, 0);
     lv_obj_set_style_text_font(s_status_lbl_l, &lv_font_montserrat_10, 0);
-    lv_label_set_text(s_status_lbl_l, "N01 FLRC");
+    lv_label_set_text(s_status_lbl_l, "");
     lv_obj_align(s_status_lbl_l, LV_ALIGN_LEFT_MID, 7, 0);
 
     s_status_lbl_r = lv_label_create(s_status_bar);
