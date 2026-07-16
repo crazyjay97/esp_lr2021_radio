@@ -276,7 +276,9 @@ static esp_err_t start_httpd(void)
     if (s_httpd) return ESP_OK;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 12;
+    /* wifi_provisioning softap registers ~5 handlers, wifi_manager adds 2, and
+     * image_store adds 6. Keep headroom so none fail with HANDLERS_FULL. */
+    cfg.max_uri_handlers = 20;
     cfg.stack_size = 8192;
     cfg.lru_purge_enable = true;
     cfg.uri_match_fn = httpd_uri_match_wildcard;

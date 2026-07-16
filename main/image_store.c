@@ -4,8 +4,6 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_sntp.h"
-#include "nvs_flash.h"
-#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -35,6 +33,38 @@ static bool s_sntp_started = false;
 static SemaphoreHandle_t s_decode_sem = NULL;
 static TaskHandle_t s_decode_task = NULL;
 
+/* Epoch below this is treated as "clock not set yet" (boot-relative). */
+#define TIME_VALID_THRESHOLD 1700000000UL
+
+/* Retroactively convert boot-relative photo timestamps into real epoch time.
+ *
+ * On boot the system clock starts at 0 (1970), so a photo captured before the
+ * clock is set stores a timestamp equal to the device uptime at capture. Once
+ * a real time source arrives (browser sync or SNTP) we know the real epoch that
+ * corresponds to "now". Because esp_timer keeps counting from boot regardless
+ * of settimeofday(), offset = real_epoch - uptime_now maps any capture uptime
+ * back to its true wall-clock time: real_capture = capture_uptime + offset.
+ */
+static void adjust_stored_timestamps(uint32_t real_epoch)
+{
+    uint32_t uptime_now = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    if (real_epoch < uptime_now) return; /* sanity: real time must exceed uptime */
+    uint32_t offset = real_epoch - uptime_now;
+
+    int fixed = 0;
+    for (int i = 0; i < IMAGE_STORE_MAX_SLOTS; i++) {
+        image_slot_t *s = &s_slots[i];
+        if (s->meta.valid && s->meta.timestamp < TIME_VALID_THRESHOLD) {
+            s->meta.timestamp += offset;
+            fixed++;
+        }
+    }
+    if (fixed > 0) {
+        ESP_LOGI(TAG, "adjusted %d photo timestamp(s) to real time (offset=%lu)",
+                 fixed, (unsigned long)offset);
+    }
+}
+
 /* ---- SNTP ---- */
 
 static void sntp_sync_cb(struct timeval *tv)
@@ -44,6 +74,7 @@ static void sntp_sync_cb(struct timeval *tv)
     ESP_LOGI(TAG, "SNTP synced: %04d-%02d-%02d %02d:%02d:%02d",
              t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
              t.tm_hour, t.tm_min, t.tm_sec);
+    adjust_stored_timestamps((uint32_t)tv->tv_sec);
 }
 
 void image_store_start_sntp(void)
@@ -61,46 +92,13 @@ void image_store_start_sntp(void)
 
 /* ---- Time sync (browser → device) ---- */
 
-#define NVS_TIME_NAMESPACE "time_sync"
-#define NVS_KEY_EPOCH      "epoch"
-#define NVS_KEY_UPTIME     "uptime_s"
-
-static void save_time_to_nvs(uint32_t epoch)
-{
-    nvs_handle_t nvs;
-    if (nvs_open(NVS_TIME_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return;
-    uint32_t uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-    nvs_set_u32(nvs, NVS_KEY_EPOCH, epoch);
-    nvs_set_u32(nvs, NVS_KEY_UPTIME, uptime_s);
-    nvs_commit(nvs);
-    nvs_close(nvs);
-}
-
+/* Set timezone only. Time itself is not persisted across reboots: the clock
+ * starts at 0 (1970) on boot and photos store boot-relative timestamps until a
+ * real time source (browser sync or SNTP) lets us back-calculate them. */
 void image_store_restore_time(void)
 {
     setenv("TZ", "CST-8", 1);
     tzset();
-
-    nvs_handle_t nvs;
-    if (nvs_open(NVS_TIME_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return;
-    uint32_t saved_epoch = 0, saved_uptime = 0;
-    nvs_get_u32(nvs, NVS_KEY_EPOCH, &saved_epoch);
-    nvs_get_u32(nvs, NVS_KEY_UPTIME, &saved_uptime);
-    nvs_close(nvs);
-
-    if (saved_epoch < 1700000000) return;
-
-    uint32_t uptime_now = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-    uint32_t estimated = saved_epoch + uptime_now;
-    struct timeval tv = { .tv_sec = (time_t)estimated, .tv_usec = 0 };
-    settimeofday(&tv, NULL);
-
-    struct tm t;
-    time_t now = (time_t)estimated;
-    localtime_r(&now, &t);
-    ESP_LOGI(TAG, "time restored from NVS: %04d-%02d-%02d %02d:%02d:%02d (approx)",
-             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-             t.tm_hour, t.tm_min, t.tm_sec);
 }
 
 static esp_err_t handler_synctime(httpd_req_t *req)
@@ -114,14 +112,16 @@ static esp_err_t handler_synctime(httpd_req_t *req)
     buf[len] = '\0';
 
     uint32_t epoch = (uint32_t)strtoul(buf, NULL, 10);
-    if (epoch < 1700000000) {
+    if (epoch < TIME_VALID_THRESHOLD) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid timestamp");
         return ESP_FAIL;
     }
 
+    /* Back-calculate boot-relative photo timestamps before moving the clock. */
+    adjust_stored_timestamps(epoch);
+
     struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
     settimeofday(&tv, NULL);
-    save_time_to_nvs(epoch);
 
     struct tm t;
     time_t now = (time_t)epoch;
@@ -384,12 +384,16 @@ void image_store_abort_transfer(void)
 
 /* ---- HTTP Handlers ---- */
 
-#define CHUNK_SIZE  4096
+#define CHUNK_SIZE  8192
 
 static esp_err_t send_jpeg_chunked(httpd_req_t *req, const uint8_t *data, size_t len)
 {
     s_abort = false;
     httpd_resp_set_type(req, "image/jpeg");
+
+    char cl[16];
+    snprintf(cl, sizeof(cl), "%u", (unsigned)len);
+    httpd_resp_set_hdr(req, "Content-Length", cl);
 
     size_t sent = 0;
     while (sent < len) {
@@ -481,120 +485,106 @@ static esp_err_t handler_audio(httpd_req_t *req)
 
     image_slot_t *slot = &s_slots[phys];
 
-    /* Pre-decoded PCM available - fast path */
-    if (slot->pcm && slot->meta.pcm_len > 0) {
-        uint32_t pcm_bytes = slot->meta.pcm_len;
-        uint8_t wav_hdr[44];
-        write_wav_header(wav_hdr, pcm_bytes);
+    /* Prepare PCM: use pre-decoded if available, else decode on the fly */
+    const uint8_t *pcm_data = slot->pcm;
+    size_t pcm_bytes = slot->meta.pcm_len;
+    uint8_t *temp_buf = NULL;
 
-        s_abort = false;
-        httpd_resp_set_type(req, "audio/wav");
-        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-
-        esp_err_t err = httpd_resp_send_chunk(req, (const char *)wav_hdr, 44);
-        if (err != ESP_OK) return err;
-
-        size_t sent = 0;
-        while (sent < pcm_bytes) {
-            if (s_abort) {
-                httpd_resp_send_chunk(req, NULL, 0);
-                return ESP_OK;
-            }
-            size_t chunk = (pcm_bytes - sent > CHUNK_SIZE) ? CHUNK_SIZE : (pcm_bytes - sent);
-            err = httpd_resp_send_chunk(req, (const char *)&slot->pcm[sent], chunk);
-            if (err != ESP_OK) return err;
-            sent += chunk;
+    if (!pcm_data || pcm_bytes == 0) {
+        /* Fallback: decode Opus to temporary buffer */
+        const uint8_t *opus_data = slot->opus;
+        size_t opus_len = slot->meta.opus_len;
+        if (!opus_data || opus_len == 0) {
+            httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Audio not found");
+            return ESP_FAIL;
         }
-        httpd_resp_send_chunk(req, NULL, 0);
-        return ESP_OK;
+
+        size_t pos = 0, num_frames = 0;
+        while (pos < opus_len) {
+            uint8_t flen = opus_data[pos++];
+            if (flen == 0 || pos + flen > opus_len) break;
+            pos += flen;
+            num_frames++;
+        }
+        if (num_frames == 0) {
+            httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No frames");
+            return ESP_FAIL;
+        }
+
+        uint32_t pcm_samples = num_frames * APP_AUDIO_FRAME_SAMPLES;
+        pcm_bytes = pcm_samples * 2;
+
+        temp_buf = (uint8_t *)heap_caps_malloc(pcm_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!temp_buf) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+            return ESP_FAIL;
+        }
+
+        int err_code = 0;
+        OpusDecoder *dec = opus_decoder_create(APP_AUDIO_SAMPLE_RATE_HZ, 1, &err_code);
+        if (!dec) {
+            heap_caps_free(temp_buf);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Decoder err");
+            return ESP_FAIL;
+        }
+
+        int16_t *pcm = (int16_t *)temp_buf;
+        pos = 0;
+        size_t soff = 0;
+        while (pos < opus_len && soff < pcm_samples) {
+            uint8_t flen = opus_data[pos++];
+            if (flen == 0 || pos + flen > opus_len) break;
+            int got = opus_decode(dec, &opus_data[pos], flen, &pcm[soff], APP_AUDIO_FRAME_SAMPLES, 0);
+            pos += flen;
+            if (got > 0) soff += got;
+        }
+        opus_decoder_destroy(dec);
+
+        /* Normalize */
+        int16_t peak = 0;
+        for (size_t i = 0; i < soff; i++) {
+            int16_t v = pcm[i] < 0 ? -pcm[i] : pcm[i];
+            if (v > peak) peak = v;
+        }
+        if (peak > 0 && peak < 29490) {
+            int32_t gain = 29490 * 256 / peak;
+            for (size_t i = 0; i < soff; i++) {
+                int32_t s = ((int32_t)pcm[i] * gain) >> 8;
+                if (s > 32767) s = 32767;
+                if (s < -32768) s = -32768;
+                pcm[i] = (int16_t)s;
+            }
+        }
+
+        pcm_data = temp_buf;
+        pcm_bytes = soff * 2;
     }
 
-    /* Fallback: decode on the fly if PCM not ready yet */
-    size_t opus_len = 0;
-    const uint8_t *opus_data = slot->opus;
-    if (!opus_data) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Audio not found");
-        return ESP_FAIL;
-    }
-    opus_len = slot->meta.opus_len;
-
-    size_t pos = 0, num_frames = 0;
-    while (pos < opus_len) {
-        uint8_t flen = opus_data[pos++];
-        if (flen == 0 || pos + flen > opus_len) break;
-        pos += flen;
-        num_frames++;
-    }
-    if (num_frames == 0) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No frames");
-        return ESP_FAIL;
-    }
-
-    uint32_t pcm_samples = num_frames * APP_AUDIO_FRAME_SAMPLES;
-    size_t pcm_bytes = pcm_samples * 2;
+    /* Assemble complete WAV file in contiguous buffer (header + PCM).
+     * This lets httpd_resp_send handle Content-Length and Range requests
+     * automatically, so audio progress bar works correctly. */
     size_t wav_size = 44 + pcm_bytes;
-
     uint8_t *wav_buf = (uint8_t *)heap_caps_malloc(wav_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!wav_buf) {
+        heap_caps_free(temp_buf);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
         return ESP_FAIL;
     }
 
     write_wav_header(wav_buf, pcm_bytes);
+    memcpy(wav_buf + 44, pcm_data, pcm_bytes);
+    heap_caps_free(temp_buf);
 
-    int err_code = 0;
-    OpusDecoder *dec = opus_decoder_create(APP_AUDIO_SAMPLE_RATE_HZ, 1, &err_code);
-    if (!dec) {
-        heap_caps_free(wav_buf);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Decoder err");
-        return ESP_FAIL;
-    }
-
-    int16_t *pcm = (int16_t *)(wav_buf + 44);
-    pos = 0;
-    size_t soff = 0;
-    while (pos < opus_len && soff < pcm_samples) {
-        uint8_t flen = opus_data[pos++];
-        if (flen == 0 || pos + flen > opus_len) break;
-        int got = opus_decode(dec, &opus_data[pos], flen, &pcm[soff], APP_AUDIO_FRAME_SAMPLES, 0);
-        pos += flen;
-        if (got > 0) soff += got;
-    }
-    opus_decoder_destroy(dec);
-
-    int16_t peak = 0;
-    for (size_t i = 0; i < soff; i++) {
-        int16_t v = pcm[i] < 0 ? -pcm[i] : pcm[i];
-        if (v > peak) peak = v;
-    }
-    if (peak > 0 && peak < 29490) {
-        int32_t gain = 29490 * 256 / peak;
-        for (size_t i = 0; i < soff; i++) {
-            int32_t s = ((int32_t)pcm[i] * gain) >> 8;
-            if (s > 32767) s = 32767;
-            if (s < -32768) s = -32768;
-            pcm[i] = (int16_t)s;
-        }
-    }
-
-    s_abort = false;
     httpd_resp_set_type(req, "audio/wav");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    size_t sent = 0;
-    while (sent < wav_size) {
-        if (s_abort) {
-            httpd_resp_send_chunk(req, NULL, 0);
-            heap_caps_free(wav_buf);
-            return ESP_OK;
-        }
-        size_t chunk = (wav_size - sent > CHUNK_SIZE) ? CHUNK_SIZE : (wav_size - sent);
-        esp_err_t err = httpd_resp_send_chunk(req, (const char *)&wav_buf[sent], chunk);
-        if (err != ESP_OK) { heap_caps_free(wav_buf); return err; }
-        sent += chunk;
-    }
-    httpd_resp_send_chunk(req, NULL, 0);
+
+    /* httpd_resp_send sets Content-Length from wav_size, so the browser knows
+     * the total duration and the progress bar works. The whole clip is small
+     * and fully buffered client-side, so local seeking works without server
+     * Range support. */
+    esp_err_t err = httpd_resp_send(req, (const char *)wav_buf, wav_size);
     heap_caps_free(wav_buf);
-    return ESP_OK;
+    return err;
 }
 
 static const char GALLERY_HTML[] =
@@ -610,7 +600,7 @@ static const char GALLERY_HTML[] =
     ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px;max-width:1100px;margin:0 auto}"
     ".card{background:#fff;border-radius:12px;overflow:hidden;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.08);transition:transform .15s,box-shadow .15s}"
     ".card:hover{transform:translateY(-2px);box-shadow:0 4px 16px rgba(0,0,0,.12)}"
-    ".card img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block}"
+    ".card img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;pointer-events:none}"
     ".card .info{padding:10px 12px;font-size:.8em;color:#555;display:flex;justify-content:space-between;align-items:center}"
     ".card .badge{background:#1a73e8;color:#fff;padding:2px 7px;border-radius:10px;font-size:.7em;font-weight:600}"
     ".ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:100;align-items:center;justify-content:center;flex-direction:column}"
@@ -647,9 +637,9 @@ static const char GALLERY_HTML[] =
     "var info=document.getElementById('info');"
     "var empty=document.getElementById('empty');"
     "var imgList=[],curIdx=0;"
-    "function fmtT(ts){if(ts<1600000000)return'--:--';"
-    "var d=new Date(ts*1000);return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',hour12:false})"
-    "+' '+d.toLocaleDateString([],{month:'short',day:'numeric'})}"
+    "function fmtT(ts){if(ts<1700000000){var m=Math.floor(ts/60);return'Boot +'+m+'min'}"
+    "var d=new Date(ts*1000);function p(n){return(n<10?'0':'')+n}"
+    "return d.getFullYear()+'.'+(d.getMonth()+1)+'.'+d.getDate()+' '+p(d.getHours())+':'+p(d.getMinutes())}"
     "function showImg(idx){"
     "if(idx<0)idx=imgList.length-1;if(idx>=imgList.length)idx=0;"
     "curIdx=idx;var m=imgList[idx];"
@@ -680,8 +670,8 @@ static const char GALLERY_HTML[] =
     "var badge=m.audio?'<span class=\"badge\">AUDIO</span>':'';"
     "d.innerHTML='<img src=\"/img/'+m.id+'\" loading=\"lazy\"><div class=\"info\"><span>'+tm+' &middot; '+sz+'</span>'+badge+'</div>';"
     "grid.appendChild(d)})(i)}})}"
-    "load();setInterval(load,8000);"
-    "fetch('/api/synctime',{method:'POST',body:Math.floor(Date.now()/1000).toString()});"
+    "fetch('/api/synctime',{method:'POST',body:Math.floor(Date.now()/1000).toString()})"
+    ".catch(function(){}).finally(function(){load();setInterval(load,8000)});"
     "</script></body></html>";
 
 static esp_err_t handler_gallery(httpd_req_t *req)
@@ -726,12 +716,19 @@ esp_err_t image_store_register_httpd(httpd_handle_t httpd)
         .handler = handler_synctime,
     };
 
-    httpd_register_uri_handler(httpd, &uri_gallery);
-    httpd_register_uri_handler(httpd, &uri_api);
-    httpd_register_uri_handler(httpd, &uri_img);
-    httpd_register_uri_handler(httpd, &uri_audio);
-    httpd_register_uri_handler(httpd, &uri_synctime);
-    httpd_register_uri_handler(httpd, &uri_root);
+    const httpd_uri_t *all[] = {
+        &uri_gallery, &uri_api, &uri_img, &uri_audio, &uri_synctime, &uri_root,
+    };
+    esp_err_t first_err = ESP_OK;
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+        esp_err_t e = httpd_register_uri_handler(httpd, all[i]);
+        /* Already-registered is fine: this may be called again on reconnect. */
+        if (e != ESP_OK && e != ESP_ERR_HTTPD_HANDLER_EXISTS) {
+            ESP_LOGE(TAG, "register '%s' failed: %s", all[i]->uri, esp_err_to_name(e));
+            if (first_err == ESP_OK) first_err = e;
+        }
+    }
+    if (first_err != ESP_OK) return first_err;
 
     ESP_LOGI(TAG, "HTTP handlers registered: / /gallery /api/images /img/* /audio/* /api/synctime");
     return ESP_OK;
