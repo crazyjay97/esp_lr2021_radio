@@ -21,6 +21,9 @@ typedef void (*image_rx_complete_cb_t)(ImageTransfer *xfer);
 typedef void (*image_rx_progress_cb_t)(uint16_t received, uint16_t total, int16_t rssi);
 typedef void (*image_rx_eot_cb_t)(uint16_t missing_count, bool is_first_eot);
 typedef void (*config_received_cb_t)(uint8_t key, uint32_t value);
+// Low power: called when the node enters (true) / leaves (false) CAD sleep
+// standby, so the app can release/restore power-hungry peripherals (camera, I2S).
+typedef void (*low_power_standby_cb_t)(bool entering);
 
 class RadioPing {
 public:
@@ -42,6 +45,7 @@ public:
     void set_image_rx_progress_cb(image_rx_progress_cb_t cb) { image_rx_progress_cb_ = cb; }
     void set_image_rx_eot_cb(image_rx_eot_cb_t cb) { image_rx_eot_cb_ = cb; }
     void set_config_received_cb(config_received_cb_t cb) { config_received_cb_ = cb; }
+    void set_low_power_standby_cb(low_power_standby_cb_t cb) { low_power_standby_cb_ = cb; }
     void set_inter_packet_us(uint32_t us) { image_tx_inter_packet_us_ = us; }
 
     bool send_config(uint8_t key, uint32_t value);
@@ -108,6 +112,10 @@ private:
     void send_config_ack(uint8_t key, uint32_t value);
     bool configure_lora_cad();
     void enter_low_power_cad();
+    // Light-sleep the ESP32 for up to `ms`, waking on the timer or (if PIR is
+    // enabled) the PIR GPIO. Returns true if woken by PIR. Used during CAD
+    // standby to save whole-chip power.
+    bool low_power_sleep(uint32_t ms);
     void handle_cad_irq(ral_irq_t irq);
     bool send_lora_wakeup();
 
@@ -175,6 +183,7 @@ private:
     image_rx_progress_cb_t image_rx_progress_cb_ = nullptr;
     image_rx_eot_cb_t image_rx_eot_cb_ = nullptr;
     config_received_cb_t config_received_cb_ = nullptr;
+    low_power_standby_cb_t low_power_standby_cb_ = nullptr;
     uint16_t image_session_id_ = 1;
     volatile bool image_tx_active_ = false;
     bool opus_preenc_enabled_ = false;

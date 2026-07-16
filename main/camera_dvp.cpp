@@ -324,8 +324,16 @@ esp_err_t CameraUartStreamer::configure_camera_pins()
 esp_err_t CameraUartStreamer::power_down()
 {
     if (dvp_ready_ && cam_handle_) {
-        esp_cam_ctlr_disable(cam_handle_);
-        esp_cam_ctlr_del(cam_handle_);
+        // init() leaves the controller started, so tear down in the correct
+        // order: stop -> disable -> del. Skipping stop() leaves the DVP IO
+        // signals claimed and the next esp_cam_new_dvp_ctlr() fails with
+        // "failed to claim io signals".
+        esp_err_t se = esp_cam_ctlr_stop(cam_handle_);
+        if (se != ESP_OK) ESP_LOGW(TAG, "cam stop: %s", esp_err_to_name(se));
+        se = esp_cam_ctlr_disable(cam_handle_);
+        if (se != ESP_OK) ESP_LOGW(TAG, "cam disable: %s", esp_err_to_name(se));
+        se = esp_cam_ctlr_del(cam_handle_);
+        if (se != ESP_OK) ESP_LOGW(TAG, "cam del: %s", esp_err_to_name(se));
         cam_handle_ = nullptr;
         for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
             if (frame_bufs_[i]) { heap_caps_free(frame_bufs_[i]); frame_bufs_[i] = nullptr; }
@@ -345,6 +353,16 @@ esp_err_t CameraUartStreamer::soft_power_down()
 {
     set_pwdn(true);
     return ESP_OK;
+}
+
+esp_err_t CameraUartStreamer::low_power_standby()
+{
+    // Release everything (DVP controller, DMA buffers, XCLK, sensor power) and
+    // clear initialized_ so the next capture_frame()->init() rebuilds cleanly.
+    esp_err_t ret = power_down();
+    initialized_ = false;
+    ESP_LOGI(TAG, "camera in low power standby (released)");
+    return ret;
 }
 
 esp_err_t CameraUartStreamer::ensure_dvp_ready()

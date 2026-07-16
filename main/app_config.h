@@ -206,6 +206,7 @@
 #define APP_CFG_KEY_LOW_POWER           0x07
 #define APP_AUDIO_CLIP_DEFAULT_ENABLE   0
 
+
 #define APP_TRIGGER_COOLDOWN_SEC        15U
 #define APP_AUDIO_CAPTURE_COOLDOWN_MS   6000U
 #define APP_PIR_GPIO                    GPIO_NUM_12

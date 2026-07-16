@@ -326,6 +326,15 @@ void on_config_received(uint8_t key, uint32_t value)
     }
 }
 
+// Node low power: called by the radio when entering CAD sleep standby. Release
+// the camera to save power; capture_frame() rebuilds it on the next capture.
+void on_low_power_standby(bool entering)
+{
+    if (!entering) return;
+    if (g_capture_busy) return;  // never release mid-capture
+    g_camera_uart.low_power_standby();
+}
+
 void switch_mode_and_restart()
 {
     AppMode next = g_app_mode == AppMode::camera ? AppMode::radio : AppMode::camera;
@@ -1187,6 +1196,7 @@ extern "C" void app_main(void)
             g_radio.set_image_rx_progress_cb(on_image_rx_progress);
             g_radio.set_image_rx_eot_cb(on_image_rx_eot_nack);
             g_radio.set_config_received_cb(on_config_received);
+            g_radio.set_low_power_standby_cb(on_low_power_standby);
         }
         if (g_app_mode == AppMode::radio && radio_ok) {
 #if APP_RADIO_TASKS_ENABLE

@@ -2,10 +2,13 @@
 
 #include <cstring>
 #include <cmath>
+#include <cstdio>
 
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
+#include "esp_sleep.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -1839,6 +1842,43 @@ bool RadioPing::configure_lora_cad()
     return true;
 }
 
+bool RadioPing::low_power_sleep(uint32_t ms)
+{
+    // Flush the console so the last log line isn't truncated when clocks stop.
+    // Note: the USB Serial/JTAG console does not survive light sleep, so serial
+    // output stops during CAD standby — this is expected. Run on battery/adapter.
+    fflush(stdout);
+
+    esp_sleep_enable_timer_wakeup((uint64_t)ms * 1000ULL);
+
+    // PIR wake is only armed when PIR is actually enabled — otherwise the pin
+    // level is undefined and could cause spurious wakeups.
+    bool pir_wake = pir_enabled_;
+    if (pir_wake) {
+        gpio_wakeup_enable(APP_PIR_GPIO, GPIO_INTR_HIGH_LEVEL);
+        esp_sleep_enable_gpio_wakeup();
+    }
+
+    esp_light_sleep_start();
+
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    bool woken_by_pir = false;
+    if (pir_wake) {
+        // Undo the light-sleep level trigger and restore the normal edge ISR.
+        gpio_wakeup_disable(APP_PIR_GPIO);
+        gpio_set_intr_type(APP_PIR_GPIO, GPIO_INTR_POSEDGE);
+        if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+            woken_by_pir = true;
+            pir_triggered_ = true;
+            ESP_LOGI(TAG, "light sleep: woken by PIR");
+        }
+    }
+    if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+        ESP_LOGD(TAG, "light sleep: timer wake");
+    }
+    return woken_by_pir;
+}
+
 void RadioPing::enter_low_power_cad()
 {
     if (mode_ != Mode::idle) return;
@@ -1855,6 +1895,11 @@ void RadioPing::enter_low_power_cad()
         smtc_modem_hal_unprotect_api_call();
         low_power_cad_active_ = true;
         ESP_LOGI(TAG, "entering low power CAD mode");
+        // Release power-hungry peripherals (camera DVP). capture_frame() rebuilds
+        // the camera on demand, so no explicit restore is needed on wake.
+        if (low_power_standby_cb_) {
+            low_power_standby_cb_(true);
+        }
     }
 
     smtc_modem_hal_protect_api_call();
@@ -1904,7 +1949,25 @@ void RadioPing::handle_cad_irq(ral_irq_t irq)
         lr20xx_system_set_sleep_mode(ctx, &sleep_cfg, 0);
         smtc_modem_hal_unprotect_api_call();
 
-        vTaskDelay(pdMS_TO_TICKS(500));
+        // LR2021 is now asleep and SPI is idle, so light-sleep the ESP32 too
+        // for the 500ms CAD off-period. Wakes on timer (next CAD) or PIR.
+        bool woken_by_pir = low_power_sleep(500);
+
+        if (woken_by_pir) {
+            // PIR fired: come fully awake so the PIR-triggered capture can run
+            // without the loop sleeping again mid-capture. Switch to FLRC and
+            // open the wake window; the "image TX done" handler closes it.
+            // The LR2021 wakes from sleep via the NSS edge of these SPI
+            // commands (HAL waits on BUSY), same as the normal CAD re-arm path.
+            smtc_modem_hal_protect_api_call();
+            smtc_modem_hal_start_radio_tcxo();
+            configure_flrc();
+            smtc_modem_hal_unprotect_api_call();
+            low_power_cad_active_ = false;
+            cad_wakeup_ms_ = smtc_modem_hal_get_time_in_ms();
+            schedule_rx();
+            ESP_LOGI(TAG, "PIR wake: staying awake for capture");
+        }
     }
 }
 

@@ -18,6 +18,9 @@ public:
                             uint32_t *out_height,
                             uint32_t *out_pixelformat);
     esp_err_t power_down();
+    // Low power: fully release the DVP + sensor and allow init() to rebuild it
+    // on the next capture_frame(). Reversible, unlike power_down() alone.
+    esp_err_t low_power_standby();
 
 private:
     esp_err_t configure_camera_pins();
