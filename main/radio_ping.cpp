@@ -1987,29 +1987,21 @@ void RadioPing::handle_cad_irq(ral_irq_t irq)
         bool woken_by_pir = low_power_sleep(500);
 
         if (woken_by_pir) {
-            // PIR is a self-initiated PUSH: the node is the transmitter, like the
-            // non-low-power PIR path in tx_task — it only calls image_capture_cb_
-            // and image_tx_task later takes over the radio (its own configure_flrc
-            // + ImageStart + schedule_rx). So we do NOT arm RX or configure FLRC
-            // here.
-            //
-            // BUT the LR2021 was put to SLEEP above (lr20xx_system_set_sleep_mode),
-            // and BUSY is held HIGH while asleep. If we left it asleep, the first
-            // SPI access in image_tx_task's configure_flrc would hit the HAL's
-            // check_device_ready → NSS glitch → wait_on_busy, an UNBOUNDED spin.
-            // If that wake ever races/fails, the radio task hangs forever there and
-            // the node stops answering the gateway. So wake the chip HERE, in this
-            // controlled context, with an explicit NSS glitch (lr20xx_system_wakeup
-            // does exactly gpio NSS low→1ms→high and marks the HAL RADIO_AWAKE).
-            // The chip returns to standby with RAM retained; image_tx_task then
-            // configures FLRC on an already-awake chip.
-            smtc_modem_hal_protect_api_call();
-            lr20xx_system_wakeup(ctx);
-            smtc_modem_hal_unprotect_api_call();
-
+            // PIR is a self-initiated PUSH: the node is the transmitter, exactly
+            // like the non-low-power PIR path in tx_task, which touches the radio
+            // ZERO times — it only calls image_capture_cb_. image_tx_task then
+            // takes over the radio entirely (its own configure_flrc + ImageStart
+            // + schedule_rx for the ACK). So here we must NOT touch the radio: no
+            // TCXO, no configure_flrc, and definitely no schedule_rx (we are not
+            // waiting for anyone). The ONE thing we need is to stop the loop from
+            // dropping back into CAD sleep before tx_task fires the capture. The
+            // pir_push_wake_ guard keeps the loop awake-but-idle for that; the
+            // radio stays asleep (RADIO_SLEEP) until image_tx_task's first SPI
+            // access, which robustly wakes it via the HAL's improved sleep-branch
+            // retry (NSS glitch every 10ms until BUSY drops).
             pir_push_wake_ = true;
             pir_push_wake_ms_ = smtc_modem_hal_get_time_in_ms();
-            ESP_LOGI(TAG, "PIR wake: radio NSS-woken, staying awake to push image");
+            ESP_LOGI(TAG, "PIR wake: staying awake, capture will push image");
         }
     }
 }
