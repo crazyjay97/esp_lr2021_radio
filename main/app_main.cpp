@@ -312,6 +312,17 @@ void on_config_received(uint8_t key, uint32_t value)
         g_low_power_enabled = (value != 0);
         save_config_u8("lowpwr", value ? 1 : 0);
         ESP_LOGI(TAG, "config: low_power=%s", value ? "on" : "off");
+        if (value != 0) {
+            // Low power sleeps the CPU during CAD standby, so sound trigger and
+            // audio clip can't work. Zero them (and persist) so they stay off
+            // even after low power is turned off, matching the gateway UI.
+            g_audio_clip_enabled = false;
+            save_config_u8("audio_clip", 0);
+            g_radio.set_sound_trigger_level(0);
+            save_config_u8("snd_trig", 0);
+            update_camera_timer_status();
+            ESP_LOGI(TAG, "low power: sound trigger + audio clip disabled");
+        }
     }
 }
 
@@ -917,8 +928,13 @@ bool on_gw_interval_change(uint32_t interval_sec)
 bool on_gw_audio_clip_change(uint32_t enable)
 {
     ESP_LOGI(TAG, "UI audio clip: %s", enable ? "on" : "off");
-    g_audio_clip_enabled = (enable != 0);
-    return g_radio.send_config(APP_CFG_KEY_AUDIO_CLIP, enable);
+    // Commit local state only on success so the UI switch stays the single
+    // source of truth (mismatch would desync the capture cooldown logic).
+    bool ok = g_radio.send_config(APP_CFG_KEY_AUDIO_CLIP, enable);
+    if (ok) {
+        g_audio_clip_enabled = (enable != 0);
+    }
+    return ok;
 }
 
 bool on_gw_sound_trigger_change(uint32_t level)
@@ -942,8 +958,14 @@ bool on_gw_voice_alarm_change(uint32_t enable)
 bool on_gw_low_power_change(uint32_t enable)
 {
     ESP_LOGI(TAG, "UI low power: %s", enable ? "on" : "off");
-    g_low_power_enabled = (enable != 0);
-    return g_radio.send_config(APP_CFG_KEY_LOW_POWER, enable);
+    // Send first (reads current g_low_power_enabled to decide whether to send
+    // the wakeup preamble), then commit local state only on success so the UI
+    // switch stays the single source of truth.
+    bool ok = g_radio.send_config(APP_CFG_KEY_LOW_POWER, enable);
+    if (ok) {
+        g_low_power_enabled = (enable != 0);
+    }
+    return ok;
 }
 
 void on_wifi_prov_request(void)

@@ -520,11 +520,16 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
             }
         }
         break;
-    case 2: /* Interval cycle */
-        s_cfg_interval_idx = (s_cfg_interval_idx + 1) % INTERVAL_PRESET_COUNT;
-        cfg_style_value(2, s_interval_labels[s_cfg_interval_idx]);
-        if (s_interval_cb) s_interval_cb(s_interval_presets[s_cfg_interval_idx]);
+    case 2: /* Interval cycle */ {
+        int new_idx = (s_cfg_interval_idx + 1) % INTERVAL_PRESET_COUNT;
+        /* Commit index + display only if the config was delivered, so the UI
+         * stays the single source of truth. */
+        if (s_interval_cb && s_interval_cb(s_interval_presets[new_idx])) {
+            s_cfg_interval_idx = new_idx;
+            cfg_style_value(2, s_interval_labels[s_cfg_interval_idx]);
+        }
         break;
+    }
     case 3: /* Volume +1 */
         s_volume_level = (s_volume_level + 1) % 16;
         bsp_audio_set_volume((uint8_t)(s_volume_level * 10));
@@ -702,6 +707,43 @@ static void cfg_style_value(int idx, const char *text)
     lv_label_set_text(s_cfg_touch_lbls[idx], text);
 }
 
+/* Gray out + disable (or restore) a config control by index. Used to lock the
+ * Sound trigger and Audio Clip controls while Low Power is on, since the node
+ * disables those functions in low power. */
+static void cfg_set_ctrl_enabled(int idx, bool enabled)
+{
+    lv_obj_t *btn = s_cfg_touch_btns[idx];
+    if (!btn) return;
+    if (enabled) {
+        lv_obj_clear_state(btn, LV_STATE_DISABLED);
+        lv_obj_set_style_opa(btn, LV_OPA_COVER, 0);
+    } else {
+        lv_obj_add_state(btn, LV_STATE_DISABLED);
+        lv_obj_set_style_opa(btn, LV_OPA_50, 0);
+    }
+}
+
+/* Apply the Low Power lock: when on, force Audio Clip + Sound trigger off in the
+ * UI/NVS (no config is sent — the node disables them on its own in low power)
+ * and gray them out; when off, re-enable the controls (they stay off). */
+static void cfg_apply_low_power_lock(bool low_power_on)
+{
+    if (low_power_on) {
+        if (s_audio_clip_on) {
+            s_audio_clip_on = false;
+            gw_nvs_save_u8("audio", 0);
+            if (s_cfg_touch_btns[1]) lv_obj_clear_state(s_cfg_touch_btns[1], LV_STATE_CHECKED);
+        }
+        if (s_sound_trigger_idx != 0) {
+            s_sound_trigger_idx = 0;
+            gw_nvs_save_u8("snd", 0);
+            cfg_style_value(4, s_trigger_labels[0]);
+        }
+    }
+    cfg_set_ctrl_enabled(1, !low_power_on);  /* Audio Clip */
+    cfg_set_ctrl_enabled(4, !low_power_on);  /* Sound trigger */
+}
+
 /* Switch toggle callback — handles all on/off toggles */
 static void cfg_switch_cb(lv_event_t *e)
 {
@@ -749,6 +791,8 @@ static void cfg_switch_cb(lv_event_t *e)
             if (s_low_power_cb(on ? 1 : 0)) {
                 s_low_power_on = on;
                 gw_nvs_save_u8("lowpwr", on ? 1 : 0);
+                /* Lock/unlock Audio Clip + Sound trigger to match low power. */
+                cfg_apply_low_power_lock(on);
             } else {
                 if (on) lv_obj_clear_state(sw, LV_STATE_CHECKED);
                 else lv_obj_add_state(sw, LV_STATE_CHECKED);
@@ -824,6 +868,13 @@ static void create_config_page(void)
     lv_obj_t *sec_sys = cfg_create_section(cont, "SYSTEM");
 
     cfg_create_toggle_row(sec_sys, "Low Power", "CAD sleep standby", 7, s_low_power_on);
+
+    /* If low power is already on, gray out Audio Clip + Sound trigger to match
+     * the node (which keeps those functions disabled in low power). */
+    if (s_low_power_on) {
+        cfg_set_ctrl_enabled(1, false);  /* Audio Clip */
+        cfg_set_ctrl_enabled(4, false);  /* Sound trigger */
+    }
 
     /* ── WiFi info panel ── */
     lv_obj_t *wifi_box = lv_obj_create(cont);

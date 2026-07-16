@@ -390,6 +390,28 @@ void RadioPing::tx_task()
             continue;
         }
 
+        // Low power (node): the CPU sleeps during CAD standby, so we don't
+        // sample the mic at all — no voice prep, no Opus pre-encoding, no sound
+        // trigger. PIR is a hardware GPIO wake source, so its trigger is still
+        // handled here after wakeup.
+        if (g_low_power_enabled && !is_gateway_) {
+            if (pir_triggered_) {
+                pir_triggered_ = false;
+                if (pir_enabled_) {
+                    int64_t now = esp_timer_get_time();
+                    if ((now - last_trigger_us_) >= (int64_t)APP_TRIGGER_COOLDOWN_SEC * 1000000LL) {
+                        last_trigger_us_ = now;
+                        ESP_LOGI(TAG, "PIR trigger! (low power)");
+                        if (image_capture_cb_) {
+                            image_capture_cb_(sound_trigger_session_id_++);
+                        }
+                    }
+                }
+            }
+            vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
+            continue;
+        }
+
         if (!read_mono_frame(tx_pcm_, APP_AUDIO_FRAME_SAMPLES)) {
             vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
             continue;
@@ -1686,9 +1708,11 @@ bool RadioPing::send_config(uint8_t key, uint32_t value)
     put_u32_le(&pkt[9], value);
     pkt[13] = 0;
 
-    // Low power: node sleeps in CAD, so wake it with a long LoRa preamble
-    // before sending the config, same as trigger_image_capture().
-    if (g_low_power_enabled) {
+    // Wake the node with a long LoRa preamble before sending, since it sleeps
+    // in CAD standby. Always do this for the LOW_POWER key itself (regardless of
+    // the gateway's current belief about node state) so the on/off command is
+    // guaranteed to reach the node and the two sides can't get stuck desynced.
+    if (g_low_power_enabled || key == APP_CFG_KEY_LOW_POWER) {
         uint32_t t0 = smtc_modem_hal_get_time_in_ms();
         if (!send_lora_wakeup()) {
             ESP_LOGE(TAG, "LoRa wakeup failed for config");
