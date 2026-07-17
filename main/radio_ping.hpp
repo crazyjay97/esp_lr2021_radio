@@ -130,6 +130,16 @@ private:
 
     // Image transfer methods
     void handle_image_cmd();
+    void handle_image_cmd_ack();
+    // Send one ImageCmd packet for image_req_session_ (does LoRa wakeup +
+    // FLRC reconfig first in low power). Shared by trigger_image_capture and
+    // the retry poll.
+    void send_image_cmd_once();
+    // Called from the radio task loop: resend ImageCmd when the retry interval
+    // elapses and the node hasn't acked yet. Runs in the SAME task as poll_once
+    // so radio access stays serialized (no IRQ/mode races with an esp_timer).
+    void check_image_req_retry();
+    void stop_image_req_retry();
     void handle_image_start();
     void handle_image_data();
     void handle_image_eot();
@@ -226,6 +236,15 @@ private:
     uint16_t image_rx_eot_count_ = 0;
     int16_t image_rx_last_rssi_ = 0;
     uint16_t image_rx_done_session_ = 0;
+    // Gateway ImageCmd request-retry state. image_req_session_ is fixed for the
+    // whole request (NOT re-generated per retry), so retries never spawn a new
+    // capture. image_req_active_ is cleared when the node replies (ImageCmdAck)
+    // OR when an ImageStart arrives (backstop if the ack was lost). The retry is
+    // driven from the radio task loop (check_image_req_retry), NOT an esp_timer,
+    // so all radio ops stay in one task. image_req_next_ms_ = next resend time.
+    bool image_req_active_ = false;
+    uint16_t image_req_session_ = 0;
+    uint32_t image_req_next_ms_ = 0;
     uint32_t image_cmd_sent_ms_ = 0;
     uint32_t image_rx_start_ms_ = 0;
     uint32_t image_rx_transfer_ms_ = 0;

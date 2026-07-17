@@ -41,6 +41,7 @@ constexpr uint8_t kPacketTypeImageEOT = 7;
 constexpr uint8_t kPacketTypeImageStart = 8;
 constexpr uint8_t kPacketTypeConfig = 9;
 constexpr uint8_t kPacketTypeConfigAck = 10;
+constexpr uint8_t kPacketTypeImageCmdAck = 11;
 constexpr uint16_t kHeaderSize = 14;
 constexpr uint32_t kConfigAckTimeoutMs = 500;
 
@@ -380,6 +381,7 @@ void RadioPing::task()
             poll_once();
             update_playback_timeout();
             check_image_rx_timeout();
+            check_image_req_retry();
         }
         ulTaskNotifyTake(pdTRUE, ms_to_ticks_min_1(APP_RADIO_TASK_POLL_MS));
     }
@@ -876,6 +878,8 @@ void RadioPing::handle_rx_packet()
         handle_image_eot();
     } else if (rx_buf_[4] == kPacketTypeImageStart) {
         handle_image_start();
+    } else if (rx_buf_[4] == kPacketTypeImageCmdAck) {
+        handle_image_cmd_ack();
     } else if (rx_buf_[4] == kPacketTypeConfig) {
         uint8_t key = rx_buf_[8];
         uint32_t value = get_u32_le(&rx_buf_[9]);
@@ -1094,35 +1098,53 @@ void RadioPing::trigger_image_capture()
         return;
     }
 
-    if (g_low_power_enabled) {
-        uint32_t t0 = smtc_modem_hal_get_time_in_ms();
-        if (!send_lora_wakeup()) {
-            ESP_LOGE(TAG, "LoRa wakeup failed");
-            return;
-        }
-        uint32_t elapsed = smtc_modem_hal_get_time_in_ms() - t0;
-        ESP_LOGI(TAG, "LoRa wakeup preamble TX took %lu ms", (unsigned long)elapsed);
-        configure_flrc();
-    }
-
-    uint16_t session_id = image_session_id_++;
+    // Pick the session ONCE for this whole request. Retries reuse it (they do
+    // NOT ++), so a resend can never spawn a second capture / a different JPEG.
+    image_req_session_ = image_session_id_++;
     if (image_session_id_ == 0) {
         image_session_id_ = 1;
     }
+    // First send. send_image_cmd_once does the low-power LoRa wakeup + FLRC
+    // reconfig itself; the radio-task retry poll repeats it (the node may have
+    // gone back to CAD sleep between attempts).
+    send_image_cmd_once();
 
-    // Build ImageCmd packet
+    image_rx_pending_ = true;
+    image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
+    schedule_rx();
+
+    // Mark the request active. check_image_req_retry (radio task loop) resends
+    // ImageCmd once per interval until the node acks (or ImageStart backstop).
+    uint32_t retry_ms = g_low_power_enabled ? APP_IMAGE_REQ_RETRY_INTERVAL_LP_MS
+                                            : APP_IMAGE_REQ_RETRY_INTERVAL_MS;
+    image_req_active_ = true;
+    image_req_next_ms_ = smtc_modem_hal_get_time_in_ms() + retry_ms;
+}
+
+// Send one ImageCmd for image_req_session_. In low power, redo the LoRa wakeup
+// preamble + FLRC reconfig first (the node may have returned to CAD sleep).
+void RadioPing::send_image_cmd_once()
+{
+    if (g_low_power_enabled) {
+        if (!send_lora_wakeup()) {
+            ESP_LOGE(TAG, "LoRa wakeup failed (retry)");
+            return;
+        }
+        configure_flrc();
+    }
+
     uint8_t pkt[kHeaderSize];
     std::memcpy(pkt, kMagic, sizeof(kMagic));
     pkt[4] = kPacketTypeImageCmd;
     pkt[5] = 1;
-    put_u16_le(&pkt[6], session_id);
+    put_u16_le(&pkt[6], image_req_session_);
     put_u32_le(&pkt[8], smtc_modem_hal_get_time_in_ms());
     pkt[12] = 0;
     pkt[13] = 0;
 
     image_cmd_sent_ms_ = smtc_modem_hal_get_time_in_ms();
 
-    // Stop RX
+    // Stop RX before TX
     smtc_modem_hal_protect_api_call();
     if (mode_ == Mode::rx_pending) {
         (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
@@ -1131,17 +1153,38 @@ void RadioPing::trigger_image_capture()
     }
     smtc_modem_hal_unprotect_api_call();
 
-    // Blind send 3 times with 30ms interval
-    for (int i = 0; i < 3; i++) {
-        send_single_packet(pkt, kHeaderSize);
-        if (i < 2) {
-            vTaskDelay(pdMS_TO_TICKS(30));
-        }
-    }
-
-    image_rx_pending_ = true;
+    send_single_packet(pkt, kHeaderSize);
+    // Keep the RX watchdog fresh so a long capture doesn't trip the 10s giveup.
     image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
-    schedule_rx();
+}
+
+// Runs in the radio task (next to poll_once), so send_image_cmd_once here shares
+// the task with RX handling — no IRQ/mode races. Resends ImageCmd once per
+// interval until the node acks or an ImageStart backstop clears image_req_active_.
+void RadioPing::check_image_req_retry()
+{
+    if (!image_req_active_) return;
+    // A transfer already started (ImageStart / data) — stop requesting.
+    if (image_tx_active_) {
+        image_req_active_ = false;
+        return;
+    }
+    uint32_t now = smtc_modem_hal_get_time_in_ms();
+    if ((int32_t)(now - image_req_next_ms_) < 0) return;
+
+    ESP_LOGI(TAG, "ImageCmd no ack yet, resending (session=%u)", image_req_session_);
+    send_image_cmd_once();
+    if (mode_ != Mode::rx_pending) {
+        schedule_rx();
+    }
+    uint32_t retry_ms = g_low_power_enabled ? APP_IMAGE_REQ_RETRY_INTERVAL_LP_MS
+                                            : APP_IMAGE_REQ_RETRY_INTERVAL_MS;
+    image_req_next_ms_ = smtc_modem_hal_get_time_in_ms() + retry_ms;
+}
+
+void RadioPing::stop_image_req_retry()
+{
+    image_req_active_ = false;
 }
 
 void RadioPing::send_image(const uint8_t *jpeg, size_t jpeg_len, uint16_t session_id)
@@ -1215,9 +1258,15 @@ void RadioPing::image_tx_task()
             mode_ = Mode::idle;
         }
 
-        // Step 0: Send ImageStart and wait for R to confirm ready
+        // Step 0: Send ImageStart and wait for R to confirm ready. Persistent
+        // (100 x 50ms = 5s) so it survives the gateway's ImageCmd flood: the
+        // 50ms interval is non-harmonic with the gateway's 30ms ImageCmd retry,
+        // so their phases drift and an ImageStart eventually lands in a gap. As
+        // soon as one ImageStart reaches the gateway it stops sending ImageCmd
+        // (backstop in handle_image_start), the channel clears, and the ready-ACK
+        // gets through within a couple of tries.
         bool r_ready = false;
-        for (uint16_t start_try = 0; start_try < APP_IMAGE_EOT_RETRY_COUNT && !r_ready; start_try++) {
+        for (uint16_t start_try = 0; start_try < APP_IMAGE_START_RETRY_COUNT && !r_ready; start_try++) {
             uint8_t start_pkt[kHeaderSize];
             std::memcpy(start_pkt, kMagic, sizeof(kMagic));
             start_pkt[4] = kPacketTypeImageStart;
@@ -1233,7 +1282,7 @@ void RadioPing::image_tx_task()
 
             uint32_t wait_start = smtc_modem_hal_get_time_in_ms();
             while (!image_nack_received_ && !image_done_received_) {
-                if (smtc_modem_hal_get_time_in_ms() - wait_start > APP_IMAGE_EOT_RETRY_INTERVAL_MS) {
+                if (smtc_modem_hal_get_time_in_ms() - wait_start > APP_IMAGE_START_RETRY_INTERVAL_MS) {
                     break;
                 }
                 if (irq_pending_) {
@@ -1254,7 +1303,7 @@ void RadioPing::image_tx_task()
                 // ESP_LOGI(TAG, "image TX: R ready, starting data burst");
             } else {
             // ESP_LOGW(TAG, "image TX: ImageStart no response, retry %u/%u",
-            //          start_try + 1, APP_IMAGE_EOT_RETRY_COUNT);
+            //          start_try + 1, APP_IMAGE_START_RETRY_COUNT);
             }
         }
 
@@ -1352,33 +1401,12 @@ void RadioPing::image_tx_task()
             }
 
             if (!got_response) {
-                // ESP_LOGW(TAG, "image TX: no ACK after %u EOT retries, resending all frags",
-                //          APP_IMAGE_EOT_RETRY_COUNT);
-                // No ACK — resend all fragments (blind retransmit)
-                for (uint16_t i = 0; i < total_fragments; i++) {
-                    size_t offset = static_cast<size_t>(i) * APP_IMAGE_FRAGMENT_DATA_SIZE;
-                    uint16_t frag_len = static_cast<uint16_t>(
-                        ((offset + APP_IMAGE_FRAGMENT_DATA_SIZE) <= req.jpeg_len)
-                            ? APP_IMAGE_FRAGMENT_DATA_SIZE
-                            : (req.jpeg_len - offset));
-
-                    uint8_t pkt[APP_FLRC_MAX_PAYLOAD_BYTES];
-                    std::memcpy(pkt, kMagic, sizeof(kMagic));
-                    pkt[4] = kPacketTypeImageData;
-                    pkt[5] = 1;
-                    put_u16_le(&pkt[6], req.session_id);
-                    put_u16_le(&pkt[8], i);
-                    put_u16_le(&pkt[10], total_fragments);
-                    put_u16_le(&pkt[12], frag_len);
-                    std::memcpy(&pkt[kHeaderSize], req.jpeg + offset, frag_len);
-                    uint16_t crc = crc16_ccitt(&pkt[4], kHeaderSize - 4 + frag_len);
-                    put_u16_le(&pkt[kHeaderSize + frag_len], crc);
-
-                    send_single_packet(pkt, static_cast<uint16_t>(kHeaderSize + frag_len + 2));
-                    if (image_tx_inter_packet_us_ > 0) {
-                        esp_rom_delay_us(image_tx_inter_packet_us_);
-                    }
-                }
+                // No ACK this round. Do NOT blindly resend the whole image —
+                // that floods the channel and makes a bad RF environment worse.
+                // Just advance to the next round, which re-sends EOT and waits
+                // again. The initial burst already sent every fragment once;
+                // actual retransmission only happens on an explicit NACK
+                // missing-list below.
                 continue;
             }
 
@@ -1491,9 +1519,43 @@ void RadioPing::handle_image_cmd()
     uint16_t session_id = get_u16_le(&rx_buf_[6]);
     // ESP_LOGI(TAG, "RX ImageCmd: session=%u", session_id);
 
+    // Ack immediately (before the slow JPEG capture) so the gateway stops
+    // resending ImageCmd. This is sent on EVERY ImageCmd — including gateway
+    // retransmits of the same session (their ack was lost) — so a lost ack
+    // self-heals. The capture-side dedup (image_capture_cb_) drops the duplicate
+    // dispatch, so re-acking never triggers a second capture.
+    uint8_t ack[kHeaderSize];
+    std::memcpy(ack, kMagic, sizeof(kMagic));
+    ack[4] = kPacketTypeImageCmdAck;
+    ack[5] = 1;
+    put_u16_le(&ack[6], session_id);
+    ack[8] = 0; ack[9] = 0; ack[10] = 0; ack[11] = 0; ack[12] = 0; ack[13] = 0;
+
+    if (mode_ == Mode::rx_pending) {
+        smtc_modem_hal_protect_api_call();
+        (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+        (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+        smtc_modem_hal_unprotect_api_call();
+        mode_ = Mode::idle;
+    }
+    send_single_packet(ack, kHeaderSize);
+    schedule_rx();
+
     if (image_capture_cb_) {
         image_capture_cb_(session_id);
     }
+}
+
+// Gateway side: node acknowledged the ImageCmd. Stop the request-retry timer.
+void RadioPing::handle_image_cmd_ack()
+{
+    uint16_t session_id = get_u16_le(&rx_buf_[6]);
+    if (session_id != image_req_session_) {
+        return;
+    }
+    // ESP_LOGI(TAG, "RX ImageCmdAck: session=%u", session_id);
+    stop_image_req_retry();
+    schedule_rx();
 }
 
 void RadioPing::handle_image_start()
@@ -1504,6 +1566,23 @@ void RadioPing::handle_image_start()
 
     // ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx",
     //          session_id, total_frags, static_cast<unsigned long>(expected_crc32));
+
+    // Backstop: an ImageStart proves the node got our request, so stop resending
+    // ImageCmd even if its ImageCmdAck was lost.
+    stop_image_req_retry();
+
+    // Reentry guard against progress rollback: if we're already receiving this
+    // same session and have taken in at least one fragment, this is a stale or
+    // duplicate ImageStart (the node only sends it during its pre-data handshake).
+    // Re-running rx_begin here would wipe received fragments and snap the UI back
+    // to 0. Drop it. (During the handshake, received==0, so re-begin is harmless
+    // and we fall through to re-send the ready-ACK so the node proceeds.)
+    if (image_rx_pending_ &&
+        session_id == image_xfer_.rx_session_id() &&
+        image_xfer_.rx_received_count() > 0) {
+        return;
+    }
+
     image_rx_start_ms_ = smtc_modem_hal_get_time_in_ms();
 
     // Prepare RX buffer

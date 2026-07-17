@@ -234,11 +234,29 @@
 #define APP_IMAGE_TX_INTER_PACKET_US    0U
 #define APP_IMAGE_RX_TIMEOUT_MS         3000U
 #define APP_IMAGE_RX_PROGRESS_INTERVAL_MS 100U
-#define APP_IMAGE_NACK_MAX_RETRIES      30U
+#define APP_IMAGE_NACK_MAX_RETRIES      400U
 #define APP_IMAGE_NACK_MAX_INDICES      120U
 #define APP_IMAGE_MAX_JPEG_SIZE         (400U * 1024U)
 #define APP_IMAGE_EOT_RETRY_COUNT       10U
 #define APP_IMAGE_EOT_RETRY_INTERVAL_MS 30U
+// ImageStart handshake (node Step 0): node resends ImageStart until the gateway
+// replies with a ready-ACK. The interval is deliberately NOT a multiple of the
+// gateway's ImageCmd retry interval (30ms non-LP) so their phases drift instead
+// of locking together and colliding every time on the half-duplex radio.
+// 100 x 50ms = 5s budget: enough to break a phase-lock and ride out RF loss;
+// past that the node is genuinely unreachable (a "special case" giveup).
+#define APP_IMAGE_START_RETRY_COUNT     100U
+#define APP_IMAGE_START_RETRY_INTERVAL_MS 50U
+// Gateway ImageCmd request: after the first send, resend every this many ms
+// until the node replies with ImageCmdAck (or an ImageStart backstop arrives).
+// Unlimited retries — no cap.
+//   Non-low-power: node is always in FLRC RX and acks instantly, so the interval
+//   only needs to cover the ImageCmd+ImageCmdAck round trip and leave an RX
+//   window to catch the ack — 30ms (matches the old blind-send cadence).
+//   Low power: each resend must re-send the LoRa wakeup preamble (~520ms) to
+//   wake a node that may have gone back to CAD sleep — 1000ms is comfortable.
+#define APP_IMAGE_REQ_RETRY_INTERVAL_MS    30U
+#define APP_IMAGE_REQ_RETRY_INTERVAL_LP_MS 1000U
 #define APP_IMAGE_TASK_STACK_BYTES      16384U
 #define APP_IMAGE_TASK_PRIORITY         3
 #define APP_IMAGE_TASK_CORE             1

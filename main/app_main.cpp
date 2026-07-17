@@ -645,6 +645,17 @@ void on_image_capture_request(uint16_t session_id)
         g_radio.notify_capture_dropped();
         return;
     }
+    // Dedup gateway ImageCmd retransmits of the same session. The gateway resends
+    // ImageCmd until it gets an ack; if an ack is lost for the whole capture, a
+    // late retransmit can arrive after g_capture_busy cleared. handle_image_cmd
+    // still re-acks it (good), but we must not launch a second capture for a
+    // session we already handled. New requests always carry a new session_id.
+    static uint16_t s_last_dispatched_session = 0;
+    static bool s_have_dispatched = false;
+    if (s_have_dispatched && session_id == s_last_dispatched_session) {
+        ESP_LOGW(TAG, "ImageCmd ignored: session %u already dispatched", session_id);
+        return;
+    }
     if (g_audio_clip_enabled) {
         static uint32_t s_last_node_capture_ms = 0;
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
@@ -657,6 +668,8 @@ void on_image_capture_request(uint16_t session_id)
         s_last_node_capture_ms = now;
     }
     g_capture_busy = true;
+    s_last_dispatched_session = session_id;
+    s_have_dispatched = true;
 
     // Low power: hold the node awake through the capture + push. Without this,
     // poll_once re-enters CAD light sleep (500ms halt) immediately after the
