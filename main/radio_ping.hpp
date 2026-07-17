@@ -81,6 +81,15 @@ public:
     // poll_once timeout is only a fallback if the capture never reaches TX.
     void notify_capture_starting();
 
+    // Untimed keep-awake for synchronous audio playback (e.g. the post-capture
+    // voice alarm). Unlike pir_push_wake_ (8s safety timeout), this has NO
+    // timeout: light sleep halts both cores and would starve/garble I2S output
+    // and re-sleep the node mid-clip. The caller MUST pair begin/end. While set,
+    // poll_once never enters CAD light sleep, so the node stays awake exactly for
+    // the clip and re-sleeps on the next idle pass after audio_playback_end().
+    void audio_playback_begin() { audio_playing_ = true; }
+    void audio_playback_end() { audio_playing_ = false; }
+
     // Audio ring buffer for pre-capture retrospective recording
     size_t snapshot_audio(int16_t *out, size_t max_samples);
     size_t snapshot_opus(uint8_t *out, size_t max_bytes);
@@ -247,6 +256,10 @@ private:
     // the gateway-request RX window (node received a LoRa wakeup, must RX cmd).
     volatile bool pir_push_wake_ = false;
     uint32_t pir_push_wake_ms_ = 0;
+    // Untimed keep-awake while a synchronous audio clip (post-capture voice
+    // alarm) is playing. Blocks CAD light sleep so I2S output isn't halted and
+    // the node doesn't re-sleep mid-clip. Set/cleared via audio_playback_*().
+    volatile bool audio_playing_ = false;
 
     // Sound/PIR trigger state (shared cooldown)
     uint32_t sound_trigger_level_ = 0;

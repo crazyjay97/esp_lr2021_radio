@@ -545,7 +545,13 @@ void RadioPing::poll_once()
             // sleeps: it must stay in continuous FLRC RX so it can receive a
             // node's self-initiated (PIR-triggered) image push, which arrives
             // with no prior request from the gateway.
-            if (pir_push_wake_) {
+            if (audio_playing_) {
+                // A voice alarm clip is playing (synchronous, in image_capture_
+                // task). Stay awake-but-idle: light sleep would halt both cores
+                // and starve/garble I2S. audio_playback_end() releases this and
+                // the node re-sleeps on the next idle pass. No timeout — the clip
+                // is short and bounded by its own length.
+            } else if (pir_push_wake_) {
                 // PIR push in progress: node is (about to be) the transmitter.
                 // Stay awake-but-idle — do NOT open RX and do NOT sleep to CAD.
                 // image_tx_task will grab the radio (suspended_=true) once the

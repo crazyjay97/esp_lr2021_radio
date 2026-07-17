@@ -615,10 +615,16 @@ void image_capture_task(void *arg)
 #if APP_VOICE_ALARM_ENABLE
     if (g_voice_alarm_enabled && session_id >= 0xC000) {
         ESP_LOGI(TAG, "trigger capture done, playing voice alarm");
+        // Low power: image_tx_task already cleared the PIR keep-awake guard, so
+        // without this the radio task would drop into CAD light sleep and halt
+        // both cores mid-clip. Hold an untimed keep-awake for exactly the clip,
+        // then release so the node re-sleeps on the next idle pass.
+        g_radio.audio_playback_begin();
         uint8_t prev_vol = APP_VOICE_ALARM_VOLUME_PERCENT;
         bsp_audio_set_volume(prev_vol);
         play_audio_clip(warning_voice_opus, warning_voice_opus_len);
         bsp_audio_set_volume(100);
+        g_radio.audio_playback_end();
     }
 #endif
 
