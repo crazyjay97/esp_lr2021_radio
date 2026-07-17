@@ -523,6 +523,22 @@ void RadioPing::poll_once()
         }
     }
 
+    // CAD watchdog: a CAD_DONE IRQ normally arrives within a few ms. If it is
+    // ever lost, mode_ would stay cad_pending forever and the node would be
+    // unrecoverable without a reboot (poll_once and "exit low power" both need
+    // idle). After 2s with no IRQ, force the radio back to standby+idle so the
+    // next pass re-arms CAD (or FLRC RX if low power was turned off meanwhile).
+    if (mode_ == Mode::cad_pending && cad_pending_ms_ != 0 &&
+        (smtc_modem_hal_get_time_in_ms() - cad_pending_ms_) >= 2000) {
+        ESP_LOGW(TAG, "CAD watchdog: no CAD_DONE in 2s, resetting to idle");
+        smtc_modem_hal_protect_api_call();
+        ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+        ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+        smtc_modem_hal_unprotect_api_call();
+        cad_pending_ms_ = 0;
+        mode_ = Mode::idle;
+    }
+
     if (mode_ == Mode::idle) {
         if (g_low_power_enabled && !is_gateway_) {
             // Low-power CAD sleep is a NODE-only behavior. The gateway never
@@ -1929,6 +1945,16 @@ bool RadioPing::low_power_sleep(uint32_t ms)
     return woken_by_pir;
 }
 
+void RadioPing::notify_capture_starting()
+{
+    // Only meaningful for a low-power node (the gateway never CAD-sleeps). Set
+    // the keep-awake guard so the next poll_once idle pass does NOT drop into
+    // CAD light sleep while the capture + push runs.
+    if (!g_low_power_enabled || is_gateway_) return;
+    pir_push_wake_ = true;
+    pir_push_wake_ms_ = smtc_modem_hal_get_time_in_ms();
+}
+
 void RadioPing::enter_low_power_cad()
 {
     if (mode_ != Mode::idle) return;
@@ -1968,12 +1994,14 @@ void RadioPing::enter_low_power_cad()
     lr20xx_radio_lora_set_cad(ctx);
     smtc_modem_hal_unprotect_api_call();
 
+    cad_pending_ms_ = smtc_modem_hal_get_time_in_ms();
     mode_ = Mode::cad_pending;
 }
 
 void RadioPing::handle_cad_irq(ral_irq_t irq)
 {
     mode_ = Mode::idle;
+    cad_pending_ms_ = 0;
 
     if ((irq & RAL_IRQ_CAD_DONE) == 0) {
         ESP_LOGW(TAG, "CAD unexpected irq=0x%08lx", static_cast<unsigned long>(irq));
@@ -2033,6 +2061,7 @@ bool RadioPing::send_lora_wakeup()
     if (mode_ == Mode::rx_pending || mode_ == Mode::cad_pending) {
         ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
         ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+        cad_pending_ms_ = 0;
         mode_ = Mode::idle;
     }
     smtc_modem_hal_unprotect_api_call();

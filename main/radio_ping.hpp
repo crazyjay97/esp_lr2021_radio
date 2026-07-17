@@ -72,6 +72,15 @@ public:
     // of staying deaf to the gateway for the full 8s safety timeout.
     void notify_capture_dropped() { pir_push_wake_ = false; }
 
+    // Called when a capture is actually dispatched (auto-capture timer, gateway
+    // request, or PIR). In low power the node must stay awake-but-idle through
+    // the capture + image push, exactly like the PIR path — otherwise poll_once
+    // re-enters CAD light sleep and halts the whole chip for 500ms at a time,
+    // starving the camera/JPEG task so the capture never completes. This reuses
+    // the PIR keep-awake guard; image_tx_task clears it on completion and the 8s
+    // poll_once timeout is only a fallback if the capture never reaches TX.
+    void notify_capture_starting();
+
     // Audio ring buffer for pre-capture retrospective recording
     size_t snapshot_audio(int16_t *out, size_t max_samples);
     size_t snapshot_opus(uint8_t *out, size_t max_bytes);
@@ -226,6 +235,12 @@ private:
     bool low_power_cad_active_ = false;
     bool is_gateway_ = false;
     uint32_t cad_wakeup_ms_ = 0;
+    // Timestamp (ms) when the radio entered cad_pending. A missed CAD_DONE IRQ
+    // would otherwise leave mode_ stuck in cad_pending forever (poll_once only
+    // acts on idle), and even "exit low power" can't recover it (that path also
+    // needs idle). The task() watchdog resets to idle after a timeout so the
+    // node self-heals instead of requiring a power cycle. 0 = not waiting.
+    uint32_t cad_pending_ms_ = 0;
     // PIR self-push wake: node woke on PIR to CAPTURE+PUSH an image (it is the
     // transmitter, not a receiver). Keeps the loop awake (no RX, no CAD) until
     // image_tx_task takes over the radio. Distinct from cad_wakeup_ms_, which is

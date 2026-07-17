@@ -652,6 +652,12 @@ void on_image_capture_request(uint16_t session_id)
     }
     g_capture_busy = true;
 
+    // Low power: hold the node awake through the capture + push. Without this,
+    // poll_once re-enters CAD light sleep (500ms halt) immediately after the
+    // timer fires, starving the camera/JPEG task so capture never finishes. The
+    // keep-awake guard is cleared on TX completion or 8s timeout, whichever first.
+    g_radio.notify_capture_starting();
+
     auto *ctx = new (std::nothrow) ImageCaptureCtx{ session_id };
     if (!ctx) {
         g_capture_busy = false;
