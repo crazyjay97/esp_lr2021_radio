@@ -145,7 +145,9 @@ void AudioDiagnostics::apply_state()
 
     bool rec = state_ == State::recording;
     bool play = state_ == State::playing;
-    bsp_led_set(false, state_ == State::idle, rec || play);
+    // Green-on-idle removed for low-power testing: idle is the steady state and
+    // the always-lit green LED (D10) is a constant ~mA drain. Keep green off.
+    bsp_led_set(false, false, rec || play);
 }
 
 void AudioDiagnostics::start_record(const char *source)
