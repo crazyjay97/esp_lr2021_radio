@@ -631,10 +631,12 @@ void on_image_capture_request(uint16_t session_id)
 {
     if (g_app_mode != AppMode::camera) {
         ESP_LOGW(TAG, "ImageCmd received but not in camera mode");
+        g_radio.notify_capture_dropped();
         return;
     }
     if (g_capture_busy) {
         ESP_LOGW(TAG, "ImageCmd ignored: capture already busy");
+        g_radio.notify_capture_dropped();
         return;
     }
     if (g_audio_clip_enabled) {
@@ -643,6 +645,7 @@ void on_image_capture_request(uint16_t session_id)
         if (s_last_node_capture_ms != 0 &&
             (now - s_last_node_capture_ms) < APP_AUDIO_CAPTURE_COOLDOWN_MS) {
             ESP_LOGW(TAG, "ImageCmd ignored: audio cooldown");
+            g_radio.notify_capture_dropped();
             return;
         }
         s_last_node_capture_ms = now;

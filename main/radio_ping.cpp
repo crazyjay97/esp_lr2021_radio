@@ -400,6 +400,7 @@ void RadioPing::tx_task()
         if (g_low_power_enabled && !is_gateway_) {
             if (pir_triggered_) {
                 pir_triggered_ = false;
+                bool dispatched = false;
                 if (pir_enabled_) {
                     int64_t now = esp_timer_get_time();
                     if ((now - last_trigger_us_) >= (int64_t)APP_TRIGGER_COOLDOWN_SEC * 1000000LL) {
@@ -407,8 +408,16 @@ void RadioPing::tx_task()
                         ESP_LOGI(TAG, "PIR trigger! (low power)");
                         if (image_capture_cb_) {
                             image_capture_cb_(sound_trigger_session_id_++);
+                            dispatched = true;
                         }
                     }
+                }
+                // Capture not dispatched (PIR disabled, still in 15s cooldown, or
+                // no callback): end the keep-awake guard now so we don't sit deaf
+                // to the gateway for the full 8s safety timeout. on_image_capture_
+                // request handles the dropped-after-dispatch cases.
+                if (!dispatched) {
+                    pir_push_wake_ = false;
                 }
             }
             vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
@@ -1150,6 +1159,13 @@ void RadioPing::image_tx_task()
         image_nack_received_ = false;
         suspended_ = true;
 
+        // We are about to reconfigure the radio to FLRC for the transfer. The
+        // chip is leaving LoRa CAD, so drop the CAD-active flag now: otherwise
+        // enter_low_power_cad() thinks CAD is still configured after the push
+        // and skips the camera DVP power-down (low_power_standby_cb_), leaving
+        // the camera powered — the node looks like it never re-sleeps.
+        low_power_cad_active_ = false;
+
         vTaskDelay(pdMS_TO_TICKS(APP_RADIO_TASK_POLL_MS * 2));
 
         smtc_modem_hal_protect_api_call();
@@ -1225,8 +1241,9 @@ void RadioPing::image_tx_task()
             image_tx_active_ = false;
             suspended_ = false;
             ptt_active_ = was_ptt;
-            if (g_low_power_enabled && !is_gateway_ && cad_wakeup_ms_ != 0) {
+            if (g_low_power_enabled && !is_gateway_ && (cad_wakeup_ms_ != 0 || pir_push_wake_)) {
                 cad_wakeup_ms_ = 0;
+                pir_push_wake_ = false;
                 ESP_LOGI(TAG, "image TX aborted, ending wake window -> CAD sleep");
             }
             if (!ptt_active_) schedule_rx();

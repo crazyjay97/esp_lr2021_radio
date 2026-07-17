@@ -66,6 +66,12 @@ public:
     void IRAM_ATTR set_pir_armed(bool armed) { pir_armed_ = armed; }
     bool pir_armed() const { return pir_armed_; }
 
+    // Called when a PIR-triggered capture is dropped before it can push (not in
+    // camera mode, capture busy, audio cooldown). Ends the PIR keep-awake guard
+    // immediately so the node returns to CAD sleep on the next idle pass instead
+    // of staying deaf to the gateway for the full 8s safety timeout.
+    void notify_capture_dropped() { pir_push_wake_ = false; }
+
     // Audio ring buffer for pre-capture retrospective recording
     size_t snapshot_audio(int16_t *out, size_t max_samples);
     size_t snapshot_opus(uint8_t *out, size_t max_bytes);
