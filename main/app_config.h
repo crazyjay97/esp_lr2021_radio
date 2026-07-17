@@ -257,6 +257,16 @@
 //   wake a node that may have gone back to CAD sleep — 1000ms is comfortable.
 #define APP_IMAGE_REQ_RETRY_INTERVAL_MS    30U
 #define APP_IMAGE_REQ_RETRY_INTERVAL_LP_MS 1000U
+// Low power: length of one gateway request round. A round is one LoRa wakeup
+// (~520ms) + a 30ms ImageCmd flood for the rest, sized to fill the node's 8s
+// wake window (APP_LP_WAKE_WINDOW_MS). If the round ends with no ImageStart, the
+// gateway starts a new round (fresh wakeup). Rounds repeat with no cap until the
+// node replies or the user leaves the transfer page.
+#define APP_IMAGE_REQ_ROUND_MS          8000U
+// Low power: the node's FLRC RX wake window. Refreshed on every received packet;
+// after this long with zero RX activity the node returns to CAD sleep. Also the
+// node TX no-interaction abort budget (no ACK/NACK for this long -> give up).
+#define APP_LP_WAKE_WINDOW_MS           8000U
 #define APP_IMAGE_TASK_STACK_BYTES      16384U
 #define APP_IMAGE_TASK_PRIORITY         3
 #define APP_IMAGE_TASK_CORE             1

@@ -139,10 +139,15 @@ private:
     void handle_image_cmd();
     void handle_image_cmd_ack();
     // len = received packet length, needed to validate the trailing CRC32.
-    // Send one ImageCmd packet for image_req_session_ (does LoRa wakeup +
-    // FLRC reconfig first in low power). Shared by trigger_image_capture and
-    // the retry poll.
+    // Send one ImageCmd packet for image_req_session_ (build + TX only; the
+    // LoRa wakeup + FLRC reconfig is done once per round by
+    // start_image_req_round). Shared by trigger_image_capture and the retry poll.
     void send_image_cmd_once();
+    // Low power: begin a new request round. Sends the ~520ms LoRa wakeup preamble
+    // (to trip the node's CAD scan) + FLRC reconfig, then arms the round so
+    // check_image_req_retry floods ImageCmd every 30ms for the rest of the ~8s
+    // window (matching the node's 8s wake window). No-op wakeup in non-low-power.
+    void start_image_req_round();
     // Called from the radio task loop: resend ImageCmd when the retry interval
     // elapses and the node hasn't acked yet. Runs in the SAME task as poll_once
     // so radio access stays serialized (no IRQ/mode races with an esp_timer).
@@ -255,6 +260,11 @@ private:
     bool image_req_active_ = false;
     uint16_t image_req_session_ = 0;
     uint32_t image_req_next_ms_ = 0;
+    // Low power: end time of the current request round. A round = one LoRa wakeup
+    // + a 30ms ImageCmd flood filling the node's 8s wake window. When the round
+    // ends with no ImageStart, check_image_req_retry starts a fresh round (new
+    // wakeup). Unused in non-low-power (there flooding is continuous, no rounds).
+    uint32_t image_req_round_end_ms_ = 0;
     uint32_t image_cmd_sent_ms_ = 0;
     uint32_t image_rx_start_ms_ = 0;
     uint32_t image_rx_transfer_ms_ = 0;

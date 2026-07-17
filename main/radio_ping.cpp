@@ -567,7 +567,10 @@ void RadioPing::poll_once()
                     enter_low_power_cad();
                 }
             } else if (cad_wakeup_ms_ != 0 &&
-                (smtc_modem_hal_get_time_in_ms() - cad_wakeup_ms_) < 8000) {
+                (smtc_modem_hal_get_time_in_ms() - cad_wakeup_ms_) < APP_LP_WAKE_WINDOW_MS) {
+                // Window is refreshed on every RX packet (handle_rx_packet), so
+                // this stays open as long as there is traffic; it closes only
+                // after APP_LP_WAKE_WINDOW_MS of total silence.
                 schedule_rx();
             } else {
                 cad_wakeup_ms_ = 0;
@@ -861,6 +864,15 @@ void RadioPing::handle_rx_packet()
         return;
     }
 
+    // Low power (node): any valid packet is "activity" — refresh the wake window
+    // so the node stays in FLRC RX as long as the gateway keeps talking to it.
+    // Only extends an already-open window (cad_wakeup_ms_ != 0); it never starts
+    // one during CAD sleep. The window closes after APP_LP_WAKE_WINDOW_MS of
+    // total silence (see the idle branch in poll_once).
+    if (g_low_power_enabled && !is_gateway_ && cad_wakeup_ms_ != 0) {
+        cad_wakeup_ms_ = smtc_modem_hal_get_time_in_ms();
+    }
+
     if (rx_buf_[4] == kPacketTypeVoice) {
         queue_voice_packet(len, rssi);
     } else if (rx_buf_[4] == kPacketTypePing) {
@@ -1119,35 +1131,53 @@ void RadioPing::trigger_image_capture()
     if (image_session_id_ == 0) {
         image_session_id_ = 1;
     }
-    // First send. send_image_cmd_once does the low-power LoRa wakeup + FLRC
-    // reconfig itself; the radio-task retry poll repeats it (the node may have
-    // gone back to CAD sleep between attempts).
-    send_image_cmd_once();
+    // Start the first request round. In low power this sends the LoRa wakeup +
+    // FLRC reconfig, then floods ImageCmd every 30ms for the ~8s round to fill
+    // the node's wake window. In non-low-power it just sends the first ImageCmd
+    // (no wakeup) and floods continuously. check_image_req_retry (radio task
+    // loop) drives the flood and starts fresh rounds until the node replies.
+    image_req_active_ = true;
+    start_image_req_round();
 
     image_rx_pending_ = true;
     image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
     schedule_rx();
-
-    // Mark the request active. check_image_req_retry (radio task loop) resends
-    // ImageCmd once per interval until the node acks (or ImageStart backstop).
-    uint32_t retry_ms = g_low_power_enabled ? APP_IMAGE_REQ_RETRY_INTERVAL_LP_MS
-                                            : APP_IMAGE_REQ_RETRY_INTERVAL_MS;
-    image_req_active_ = true;
-    image_req_next_ms_ = smtc_modem_hal_get_time_in_ms() + retry_ms;
 }
 
-// Send one ImageCmd for image_req_session_. In low power, redo the LoRa wakeup
-// preamble + FLRC reconfig first (the node may have returned to CAD sleep).
-void RadioPing::send_image_cmd_once()
+// Low power: begin a new request round. One LoRa wakeup preamble (~520ms) trips
+// the node's CAD scan and opens its 8s FLRC wake window; then we flood ImageCmd
+// every 30ms (check_image_req_retry) for the rest of the round instead of the
+// old "one ImageCmd per second" that wasted most of the node's window. In
+// non-low-power there is no CAD sleep, so no wakeup — just send the first
+// ImageCmd and let the flood run continuously (round_end unused there).
+void RadioPing::start_image_req_round()
 {
+    uint32_t now = smtc_modem_hal_get_time_in_ms();
     if (g_low_power_enabled) {
         if (!send_lora_wakeup()) {
-            ESP_LOGE(TAG, "LoRa wakeup failed (retry)");
+            ESP_LOGE(TAG, "LoRa wakeup failed (round retry)");
+            // Back off before the next wakeup attempt rather than spinning. Push
+            // round_end out too so the round-timeout check in check_image_req_retry
+            // doesn't re-fire immediately and defeat the backoff.
+            uint32_t backoff = now + APP_IMAGE_REQ_RETRY_INTERVAL_LP_MS;
+            image_req_round_end_ms_ = backoff;
+            image_req_next_ms_ = backoff;
             return;
         }
         configure_flrc();
+        image_req_round_end_ms_ = now + APP_IMAGE_REQ_ROUND_MS;
     }
+    send_image_cmd_once();
+    if (mode_ != Mode::rx_pending) {
+        schedule_rx();
+    }
+    image_req_next_ms_ = smtc_modem_hal_get_time_in_ms() + APP_IMAGE_REQ_RETRY_INTERVAL_MS;
+}
 
+// Send one ImageCmd for image_req_session_ (build + TX only). The LoRa wakeup /
+// FLRC reconfig is handled once per round by start_image_req_round.
+void RadioPing::send_image_cmd_once()
+{
     uint8_t pkt[kHeaderSize];
     std::memcpy(pkt, kMagic, sizeof(kMagic));
     pkt[4] = kPacketTypeImageCmd;
@@ -1185,16 +1215,29 @@ void RadioPing::check_image_req_retry()
         return;
     }
     uint32_t now = smtc_modem_hal_get_time_in_ms();
+
+    // Low power: if the current round's flood window has elapsed with no
+    // ImageStart, start a fresh round (new LoRa wakeup to re-open the node's
+    // wake window). Rounds repeat with no cap until the node replies or the user
+    // leaves the transfer page. Non-low-power has no rounds (round_end stays 0),
+    // so this never fires and the flood is continuous.
+    if (g_low_power_enabled && (int32_t)(now - image_req_round_end_ms_) >= 0) {
+        ESP_LOGI(TAG, "ImageCmd round timed out, new wakeup round (session=%u)",
+                 image_req_session_);
+        start_image_req_round();
+        return;
+    }
+
     if ((int32_t)(now - image_req_next_ms_) < 0) return;
 
-    ESP_LOGI(TAG, "ImageCmd no ack yet, resending (session=%u)", image_req_session_);
+    // Flood cadence: one ImageCmd, then a short RX window to catch the node's
+    // ImageStart. 30ms in both modes (non-harmonic with the node's 50ms
+    // ImageStart retry so they interleave).
     send_image_cmd_once();
     if (mode_ != Mode::rx_pending) {
         schedule_rx();
     }
-    uint32_t retry_ms = g_low_power_enabled ? APP_IMAGE_REQ_RETRY_INTERVAL_LP_MS
-                                            : APP_IMAGE_REQ_RETRY_INTERVAL_MS;
-    image_req_next_ms_ = smtc_modem_hal_get_time_in_ms() + retry_ms;
+    image_req_next_ms_ = smtc_modem_hal_get_time_in_ms() + APP_IMAGE_REQ_RETRY_INTERVAL_MS;
 }
 
 void RadioPing::stop_image_req_retry()
@@ -1386,7 +1429,17 @@ void RadioPing::image_tx_task()
 
         // Step 2-8: EOT + wait ACK + retransmit loop
         bool transfer_done = false;
+        // No-interaction abort: if we go APP_LP_WAKE_WINDOW_MS with no ACK/NACK
+        // at all, the link is dead — stop hammering EOT and let the node fall
+        // back to CAD sleep (in low power) / idle RX. Runs alongside the 400-round
+        // cap; whichever trips first ends the transfer. Reset on every response.
+        uint32_t last_interaction_ms = smtc_modem_hal_get_time_in_ms();
         for (uint16_t round = 0; round < APP_IMAGE_NACK_MAX_RETRIES && !transfer_done; round++) {
+            if (smtc_modem_hal_get_time_in_ms() - last_interaction_ms > APP_LP_WAKE_WINDOW_MS) {
+                ESP_LOGW(TAG, "image TX: no ACK/NACK for %ums, aborting transfer",
+                         static_cast<unsigned>(APP_LP_WAKE_WINDOW_MS));
+                break;
+            }
             // Give R time to process last packets before sending EOT
             vTaskDelay(pdMS_TO_TICKS(30));
 
@@ -1439,9 +1492,13 @@ void RadioPing::image_tx_task()
                 // Just advance to the next round, which re-sends EOT and waits
                 // again. The initial burst already sent every fragment once;
                 // actual retransmission only happens on an explicit NACK
-                // missing-list below.
+                // missing-list below. The no-interaction abort at the top of the
+                // loop ends things if this persists for the whole window.
                 continue;
             }
+
+            // Got a response — the link is alive, reset the no-interaction timer.
+            last_interaction_ms = smtc_modem_hal_get_time_in_ms();
 
             if (image_done_received_ || nack_count_ == 0) {
                 // ESP_LOGI(TAG, "image TX complete: all received");
@@ -2175,7 +2232,7 @@ void RadioPing::handle_cad_irq(ral_irq_t irq)
     ESP_LOGI(TAG, "CAD done: %s", (irq & RAL_IRQ_CAD_OK) ? "activity detected" : "channel clear");
 
     if ((irq & RAL_IRQ_CAD_OK) != 0) {
-        ESP_LOGI(TAG, "CAD detected activity, switching to FLRC RX (8s window)");
+        ESP_LOGI(TAG, "CAD detected activity, switching to FLRC RX (activity-refreshed window)");
         low_power_cad_active_ = false;
         cad_wakeup_ms_ = smtc_modem_hal_get_time_in_ms();
         smtc_modem_hal_protect_api_call();
