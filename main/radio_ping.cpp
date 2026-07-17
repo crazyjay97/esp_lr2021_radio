@@ -382,6 +382,7 @@ void RadioPing::task()
             update_playback_timeout();
             check_image_rx_timeout();
             check_image_req_retry();
+            check_image_rx_abort();
         }
         ulTaskNotifyTake(pdTRUE, ms_to_ticks_min_1(APP_RADIO_TASK_POLL_MS));
     }
@@ -1098,6 +1099,19 @@ void RadioPing::trigger_image_capture()
         return;
     }
 
+    // Abandon any in-progress RX (and its pending ImageCmd retry) before starting
+    // a new request. Otherwise the old session's tail (a few missing frags still
+    // being NACKed) fights the new ImageCmd flood on the half-duplex radio and
+    // neither finishes — both sides deadlock. Starting fresh drops the stale one.
+    if (image_rx_pending_ || image_req_active_) {
+        ESP_LOGI(TAG, "trigger: dropping stale RX (session=%u) for new request",
+                 image_xfer_.rx_session_id());
+        image_req_active_ = false;
+        image_rx_pending_ = false;
+        image_xfer_.rx_reset();
+        image_rx_nack_sent_ = 0;
+    }
+
     // Pick the session ONCE for this whole request. Retries reuse it (they do
     // NOT ++), so a resend can never spawn a second capture / a different JPEG.
     image_req_session_ = image_session_id_++;
@@ -1589,8 +1603,8 @@ void RadioPing::handle_image_start(uint16_t len)
     uint16_t total_frags = get_u16_le(&rx_buf_[8]);
     uint32_t expected_crc32 = get_u32_le(&rx_buf_[10]);
 
-    // ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx",
-    //          session_id, total_frags, static_cast<unsigned long>(expected_crc32));
+    ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx",
+             session_id, total_frags, static_cast<unsigned long>(expected_crc32));
 
     // Backstop: an ImageStart proves the node got our request, so stop resending
     // ImageCmd even if its ImageCmdAck was lost.
@@ -1756,9 +1770,9 @@ void RadioPing::handle_image_eot()
     if (missing_count == 0 && image_rx_expected_crc32_ != 0) {
         uint32_t actual_crc32 = image_xfer_.rx_crc32();
         if (actual_crc32 != image_rx_expected_crc32_) {
-            // ESP_LOGW(TAG, "image RX crc32 mismatch: expected=0x%08lx actual=0x%08lx, requesting full resend",
-            //          static_cast<unsigned long>(image_rx_expected_crc32_),
-            //          static_cast<unsigned long>(actual_crc32));
+            ESP_LOGW(TAG, "image RX crc32 mismatch: expected=0x%08lx actual=0x%08lx, requesting full resend",
+                     static_cast<unsigned long>(image_rx_expected_crc32_),
+                     static_cast<unsigned long>(actual_crc32));
             image_xfer_.rx_begin(session_id, total_frags);
             image_rx_pending_ = true;
             image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
@@ -1833,9 +1847,9 @@ void RadioPing::check_image_rx_timeout()
         if (image_rx_expected_crc32_ != 0) {
             uint32_t actual_crc32 = image_xfer_.rx_crc32();
             if (actual_crc32 != image_rx_expected_crc32_) {
-                // ESP_LOGW(TAG, "image RX complete timeout crc32 mismatch: expected=0x%08lx actual=0x%08lx",
-                //          static_cast<unsigned long>(image_rx_expected_crc32_),
-                //          static_cast<unsigned long>(actual_crc32));
+                ESP_LOGW(TAG, "image RX complete timeout crc32 mismatch: expected=0x%08lx actual=0x%08lx",
+                         static_cast<unsigned long>(image_rx_expected_crc32_),
+                         static_cast<unsigned long>(actual_crc32));
                 image_xfer_.rx_begin(image_xfer_.rx_session_id(), image_xfer_.rx_total_count());
                 image_rx_last_frag_ms_ = now;
                 image_rx_last_progress_ms_ = 0;
@@ -1860,6 +1874,25 @@ void RadioPing::check_image_rx_timeout()
     image_rx_pending_ = false;
     image_xfer_.rx_reset();
     image_rx_nack_sent_ = 0;
+}
+
+// Runs in the radio task. Tears down an in-progress image RX when the UI thread
+// requested an abort (user left the transfer page). Clears both the RX state
+// and the ImageCmd request-retry so the gateway stops sending/expecting anything
+// for this session; the node's TX side self-aborts once its ACKs stop arriving.
+void RadioPing::check_image_rx_abort()
+{
+    if (!image_rx_abort_req_) return;
+    image_rx_abort_req_ = false;
+
+    if (image_rx_pending_ || image_req_active_) {
+        ESP_LOGI(TAG, "image RX aborted by user (left transfer page)");
+    }
+    image_req_active_ = false;
+    image_rx_pending_ = false;
+    image_xfer_.rx_reset();
+    image_rx_nack_sent_ = 0;
+    schedule_rx();
 }
 
 bool RadioPing::send_config(uint8_t key, uint32_t value)

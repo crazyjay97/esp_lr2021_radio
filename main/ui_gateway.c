@@ -139,6 +139,7 @@ static ui_gw_low_power_cb_t s_low_power_cb = NULL;
 static bool s_low_power_on = false;
 static ui_gw_wifi_prov_cb_t s_wifi_prov_cb = NULL;
 static ui_gw_wifi_disconnect_cb_t s_wifi_disconnect_cb = NULL;
+static ui_gw_rx_abort_cb_t s_rx_abort_cb = NULL;
 
 /* PAGE_CONFIG WiFi status panel */
 static lv_obj_t *s_cfg_wifi_btn = NULL;
@@ -1108,12 +1109,15 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
         }
     } else if (key == BSP_BTN_VOL_UP) {
         /* K4 = Link page */
+        if (s_page == UI_PAGE_RX && s_rx_abort_cb) s_rx_abort_cb();
         show_page(UI_PAGE_LINK);
     } else if (key == BSP_BTN_USER1) {
         /* K5 = Config page */
+        if (s_page == UI_PAGE_RX && s_rx_abort_cb) s_rx_abort_cb();
         show_page(UI_PAGE_CONFIG);
     } else if (key == BSP_BTN_PTT) {
         /* K6 = Image page */
+        if (s_page == UI_PAGE_RX && s_rx_abort_cb) s_rx_abort_cb();
         show_page(UI_PAGE_IMAGE);
     }
 
@@ -1282,6 +1286,11 @@ void ui_gw_set_wifi_prov_cb(ui_gw_wifi_prov_cb_t cb)
 void ui_gw_set_wifi_disconnect_cb(ui_gw_wifi_disconnect_cb_t cb)
 {
     s_wifi_disconnect_cb = cb;
+}
+
+void ui_gw_set_rx_abort_cb(ui_gw_rx_abort_cb_t cb)
+{
+    s_rx_abort_cb = cb;
 }
 
 void ui_gw_wifi_update(const char *state_str, const char *ssid, int8_t rssi)

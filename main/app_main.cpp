@@ -1006,6 +1006,16 @@ bool on_gw_capture(void)
     return true;
 }
 
+// Gateway UI: user left the transfer page — abort the in-progress RX so the
+// gateway stops requesting/receiving this image (the node's TX self-aborts once
+// its ACKs stop). Also drop any partial store-side transfer.
+void on_gw_rx_abort(void)
+{
+    ESP_LOGI(TAG, "UI: left transfer page, aborting image RX");
+    g_radio.abort_image_rx();
+    image_store_abort_transfer();
+}
+
 // Gateway UI interval change callback — sends config to camera node
 bool on_gw_interval_change(uint32_t interval_sec)
 {
@@ -1367,6 +1377,7 @@ extern "C" void app_main(void)
                 ui_gw_set_low_power_cb(on_gw_low_power_change);
                 ui_gw_set_wifi_prov_cb(on_wifi_prov_request);
                 ui_gw_set_wifi_disconnect_cb(on_wifi_disconnect_request);
+                ui_gw_set_rx_abort_cb(on_gw_rx_abort);
 
                 wifi_mgr_set_state_cb(on_wifi_state_change);
                 wifi_mgr_init();

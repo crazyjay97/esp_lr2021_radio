@@ -243,9 +243,9 @@
 // replies with a ready-ACK. The interval is deliberately NOT a multiple of the
 // gateway's ImageCmd retry interval (30ms non-LP) so their phases drift instead
 // of locking together and colliding every time on the half-duplex radio.
-// 100 x 50ms = 5s budget: enough to break a phase-lock and ride out RF loss;
+// 600 x 50ms = 30s budget: enough to break a phase-lock and ride out RF loss;
 // past that the node is genuinely unreachable (a "special case" giveup).
-#define APP_IMAGE_START_RETRY_COUNT     100U
+#define APP_IMAGE_START_RETRY_COUNT     600U
 #define APP_IMAGE_START_RETRY_INTERVAL_MS 50U
 // Gateway ImageCmd request: after the first send, resend every this many ms
 // until the node replies with ImageCmdAck (or an ImageStart backstop arrives).

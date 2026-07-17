@@ -37,6 +37,11 @@ public:
 
     // Image transfer: B triggers A to capture
     void trigger_image_capture();
+    // Gateway: abort the in-progress image RX (and any pending ImageCmd retry).
+    // Called from the UI thread when the user leaves the transfer page; only
+    // sets a request flag so the actual radio-state teardown happens in the
+    // radio task (check_image_rx_abort), keeping all radio access serialized.
+    void abort_image_rx() { image_rx_abort_req_ = true; }
     // Image transfer: A sends JPEG fragments to B
     void send_image(const uint8_t *jpeg, size_t jpeg_len, uint16_t session_id);
     // Register callbacks
@@ -150,6 +155,7 @@ private:
     bool send_single_packet(const uint8_t *data, uint16_t len);
     bool wait_for_tx_done(uint32_t timeout_ms);
     void check_image_rx_timeout();
+    void check_image_rx_abort();
     void send_config_ack(uint8_t key, uint32_t value);
     bool configure_lora_cad();
     void enter_low_power_cad();
@@ -233,6 +239,7 @@ private:
     uint32_t image_rx_last_progress_ms_ = 0;
     uint32_t image_rx_expected_crc32_ = 0;
     bool image_rx_pending_ = false;
+    volatile bool image_rx_abort_req_ = false;
     uint16_t image_rx_nack_sent_ = 0;
     uint16_t image_rx_eot_count_ = 0;
     int16_t image_rx_last_rssi_ = 0;
