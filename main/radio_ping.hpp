@@ -131,6 +131,7 @@ private:
     // Image transfer methods
     void handle_image_cmd();
     void handle_image_cmd_ack();
+    // len = received packet length, needed to validate the trailing CRC32.
     // Send one ImageCmd packet for image_req_session_ (does LoRa wakeup +
     // FLRC reconfig first in low power). Shared by trigger_image_capture and
     // the retry poll.
@@ -140,7 +141,7 @@ private:
     // so radio access stays serialized (no IRQ/mode races with an esp_timer).
     void check_image_req_retry();
     void stop_image_req_retry();
-    void handle_image_start();
+    void handle_image_start(uint16_t len);
     void handle_image_data();
     void handle_image_eot();
     void handle_image_nack();

@@ -877,7 +877,7 @@ void RadioPing::handle_rx_packet()
     } else if (rx_buf_[4] == kPacketTypeImageEOT) {
         handle_image_eot();
     } else if (rx_buf_[4] == kPacketTypeImageStart) {
-        handle_image_start();
+        handle_image_start(len);
     } else if (rx_buf_[4] == kPacketTypeImageCmdAck) {
         handle_image_cmd_ack();
     } else if (rx_buf_[4] == kPacketTypeConfig) {
@@ -1267,14 +1267,19 @@ void RadioPing::image_tx_task()
         // gets through within a couple of tries.
         bool r_ready = false;
         for (uint16_t start_try = 0; start_try < APP_IMAGE_START_RETRY_COUNT && !r_ready; start_try++) {
-            uint8_t start_pkt[kHeaderSize];
+            // ImageStart = 14-byte header + a 4-byte software CRC32 over that
+            // header (magic included). The gateway rejects any ImageStart whose
+            // CRC32 doesn't match, so a corrupted total_frags can't sneak past
+            // the weak 2-byte FLRC CRC and poison the transfer (see handle_image_start).
+            uint8_t start_pkt[kHeaderSize + 4];
             std::memcpy(start_pkt, kMagic, sizeof(kMagic));
             start_pkt[4] = kPacketTypeImageStart;
             start_pkt[5] = 1;
             put_u16_le(&start_pkt[6], req.session_id);
             put_u16_le(&start_pkt[8], total_fragments);
             put_u32_le(&start_pkt[10], jpeg_crc32);
-            send_single_packet(start_pkt, kHeaderSize);
+            put_u32_le(&start_pkt[kHeaderSize], crc32_ieee(start_pkt, kHeaderSize));
+            send_single_packet(start_pkt, kHeaderSize + 4);
 
             image_nack_received_ = false;
             image_done_received_ = false;
@@ -1558,8 +1563,28 @@ void RadioPing::handle_image_cmd_ack()
     schedule_rx();
 }
 
-void RadioPing::handle_image_start()
+void RadioPing::handle_image_start(uint16_t len)
 {
+    // ImageStart carries the fragment count that sizes the whole transfer, so a
+    // single corrupted total_frags wrecks it (e.g. a bogus 0/4778). The FLRC
+    // hardware CRC is only 2 bytes and, in variable-length mode, does not cover
+    // the length byte — a rare bad packet can slip through. So ImageStart adds
+    // its own CRC32 over the 14-byte header ([0..13], magic included), appended
+    // as 4 bytes. Recompute and compare; on mismatch drop the packet entirely
+    // (touch no state) — the node keeps resending ImageStart, so we just wait
+    // for a clean one, same as any lost packet.
+    if (len < kHeaderSize + 4) {
+        ESP_LOGW(TAG, "ImageStart too short (len=%u), dropping", len);
+        return;
+    }
+    uint32_t hdr_crc = crc32_ieee(rx_buf_, kHeaderSize);
+    uint32_t rx_hdr_crc = get_u32_le(&rx_buf_[kHeaderSize]);
+    if (hdr_crc != rx_hdr_crc) {
+        ESP_LOGW(TAG, "ImageStart header CRC32 mismatch (calc=0x%08lx rx=0x%08lx), dropping",
+                 static_cast<unsigned long>(hdr_crc), static_cast<unsigned long>(rx_hdr_crc));
+        return;
+    }
+
     uint16_t session_id = get_u16_le(&rx_buf_[6]);
     uint16_t total_frags = get_u16_le(&rx_buf_[8]);
     uint32_t expected_crc32 = get_u32_le(&rx_buf_[10]);
