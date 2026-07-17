@@ -42,7 +42,9 @@ public:
     // sets a request flag so the actual radio-state teardown happens in the
     // radio task (check_image_rx_abort), keeping all radio access serialized.
     void abort_image_rx() { image_rx_abort_req_ = true; }
-    // Image transfer: A sends JPEG fragments to B
+    // Image transfer: A sends JPEG fragments to B.
+    // Takes ownership of `jpeg` (must be a heap_caps allocation): the tx task
+    // frees it when the transfer completes/aborts. Callers must not free it.
     void send_image(const uint8_t *jpeg, size_t jpeg_len, uint16_t session_id);
     // Register callbacks
     void set_image_capture_cb(image_capture_cb_t cb) { image_capture_cb_ = cb; }

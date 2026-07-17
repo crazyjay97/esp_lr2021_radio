@@ -581,20 +581,41 @@ void image_capture_task(void *arg)
 
     g_radio.send_image(blob, blob_len, tx_session);
 
+    // Ownership of `blob` has been handed to send_image / image_tx_task, which
+    // frees it when the transfer finishes or aborts. Do NOT free it here: the
+    // tx task may still be reading it (its own handshake budget is up to 30s,
+    // which used to race this wait and cause a use-after-free). We wait only to
+    // sequence the post-tx cleanup after TX, not to govern the buffer lifetime.
+    bool tx_done = false;
     uint32_t wait_start = xTaskGetTickCount();
     while (xTaskGetTickCount() - wait_start < pdMS_TO_TICKS(30000)) {
         if (!g_radio.image_tx_busy()) {
+            tx_done = true;
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    heap_caps_free(blob);
 
     uint32_t t_tx_done = static_cast<uint32_t>(esp_log_timestamp());
     ESP_LOGI(TAG, "[TIMING] total +%lums | img_prep=%lu tx=%lums",
              static_cast<unsigned long>(t_tx_done - t_cmd),
              static_cast<unsigned long>(t_jpeg_done - t_cmd),
              static_cast<unsigned long>(t_tx_done - t_jpeg_done));
+
+    if (!tx_done) {
+        // TX outran our 30s wait and is still running. Do NOT run the post-tx
+        // block: resume_audio_capture() clears image_tx_active_ (which the tx
+        // task still depends on) and the voice alarm plays a clip — both would
+        // race the still-active tx task on the radio from this thread. The tx
+        // task cleans up after itself when it finishes (clears image_tx_active_,
+        // ends the wake window, resumes audio capture). The camera node has no
+        // LCD, so there is nothing else to restore here. Just release the
+        // capture guard and exit.
+        ESP_LOGW(TAG, "image tx still active after 30s; skipping post-tx cleanup (tx task finishes on its own)");
+        g_capture_busy = false;
+        vTaskDelete(nullptr);
+        return;
+    }
 
     // Reinit LCD now that transmission is done
 #if APP_CAMERA_NODE_LCD_ENABLE

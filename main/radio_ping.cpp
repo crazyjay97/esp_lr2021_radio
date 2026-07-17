@@ -6,6 +6,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "esp_rom_sys.h"
 #include "esp_sleep.h"
 #include "driver/gpio.h"
@@ -1201,15 +1202,24 @@ void RadioPing::stop_image_req_retry()
     image_req_active_ = false;
 }
 
+// Takes ownership of `jpeg`: image_tx_task frees it (heap_caps_free) once the
+// transfer finishes or aborts. The caller must NOT free it — the previous
+// scheme (caller frees after a fixed 30s wait) raced the tx task's own 30s
+// handshake budget and could free the buffer while a data burst was still
+// reading from it (use-after-free). If the queue is full the request never
+// reaches the task, so we free here to avoid leaking. `jpeg` must be a
+// heap_caps allocation.
 void RadioPing::send_image(const uint8_t *jpeg, size_t jpeg_len, uint16_t session_id)
 {
     if (!image_tx_queue_) {
         ESP_LOGE(TAG, "image_tx_queue not initialized");
+        heap_caps_free(const_cast<uint8_t *>(jpeg));
         return;
     }
     ImageTxRequest req = { .jpeg = jpeg, .jpeg_len = jpeg_len, .session_id = session_id };
     if (xQueueSend(image_tx_queue_, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGE(TAG, "image_tx_queue full");
+        heap_caps_free(const_cast<uint8_t *>(jpeg));
     }
 }
 
@@ -1337,6 +1347,10 @@ void RadioPing::image_tx_task()
                 ESP_LOGI(TAG, "image TX aborted, ending wake window -> CAD sleep");
             }
             if (!ptt_active_) schedule_rx();
+            // We own req.jpeg (see send_image) — free before looping for the
+            // next request, even on the abort path.
+            heap_caps_free(const_cast<uint8_t *>(req.jpeg));
+            req.jpeg = nullptr;
             continue;
         }
 
@@ -1488,6 +1502,13 @@ void RadioPing::image_tx_task()
         if (mode_ != Mode::rx_pending && !ptt_active_) {
             schedule_rx();
         }
+
+        // Transfer complete (or gave up after the retransmit rounds). We own
+        // req.jpeg (see send_image) — free it here so the buffer lives exactly
+        // as long as the tx task needs it, with no dependency on the producer's
+        // wait loop.
+        heap_caps_free(const_cast<uint8_t *>(req.jpeg));
+        req.jpeg = nullptr;
     }
 }
 
