@@ -64,7 +64,6 @@ int64_t g_ptt_press_time_us = 0;
 bool g_ptt_held_long = false;
 esp_timer_handle_t g_cooldown_retry_timer = nullptr;
 esp_timer_handle_t g_ptt_timer = nullptr;
-constexpr int64_t kShortPressMaxUs = 300000; // 300ms
 
 const char *mode_name(AppMode mode)
 {
@@ -400,14 +399,10 @@ void switch_mode_and_restart()
 void ptt_long_press_cb(void *arg)
 {
     (void)arg;
+    // Only gateway mode arms this timer now (K6 long-press >1.5s -> mode switch,
+    // handled in on_button on release). Camera mode no longer binds K6/PTT, so
+    // there is no camera voice activation here anymore.
     g_ptt_held_long = true;
-    // In camera mode, long K6 activates voice PTT
-    // In radio mode, long K6 triggers mode switch (handled in on_button release)
-#if APP_RADIO_FEATURES_ENABLE && APP_RADIO_TASKS_ENABLE
-    if (g_app_mode == AppMode::camera && g_radio_active) {
-        g_radio.handle_button(APP_PTT_BUTTON, true);
-    }
-#endif
 }
 
 void play_audio_clip(const uint8_t *opus_packed, size_t total_len);
@@ -1170,43 +1165,16 @@ void on_button(bsp_btn_id_t id, bool pressed, void *user)
         return;
     }
 
-    // Camera mode: keep legacy behavior
+    // Camera mode: only K5/USER1 is bound (mode switch). K6/PTT voice, K2/BOOT
+    // and K3/K4 volume are intentionally unbound here. The PTT voice-chat path
+    // (RadioPing::handle_button, voice queues, encode/play tasks) is kept intact
+    // in the codebase, just no longer driven by a key in camera mode.
     if (id == BSP_BTN_USER1) {
         if (pressed) {
             switch_mode_and_restart();
         }
         return;
     }
-
-    if (id == BSP_BTN_PTT) {
-        if (pressed) {
-            g_ptt_press_time_us = esp_timer_get_time();
-            g_ptt_held_long = false;
-            if (g_ptt_timer) {
-                esp_timer_start_once(g_ptt_timer, kShortPressMaxUs);
-            }
-        } else {
-            if (g_ptt_timer) {
-                esp_timer_stop(g_ptt_timer);
-            }
-            if (g_ptt_held_long) {
-#if APP_RADIO_FEATURES_ENABLE && APP_RADIO_TASKS_ENABLE
-                if (g_radio_active) {
-                    g_radio.handle_button(id, false);
-                }
-#endif
-            }
-            g_ptt_held_long = false;
-        }
-        return;
-    }
-
-    if (id == BSP_BTN_BOOT && pressed) {
-        ESP_LOGI(TAG, "boot pressed");
-        return;
-    }
-
-    g_audio.handle_button(id, pressed);
 }
 } // namespace
 

@@ -59,14 +59,6 @@ void AudioDiagnostics::handle_button(bsp_btn_id_t id, bool pressed)
         }
         break;
 
-    case BSP_BTN_VOL_UP:
-        if (pressed) set_volume_delta(10);
-        break;
-
-    case BSP_BTN_VOL_DN:
-        if (pressed) set_volume_delta(-10);
-        break;
-
     default:
         break;
     }
