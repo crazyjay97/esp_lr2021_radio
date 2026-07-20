@@ -52,6 +52,12 @@ static uint8_t gw_nvs_load_u8(const char *key, uint8_t def)
 #define COL_KV_BORDER   lv_color_hex(0xE2EBE6)
 #define COL_MUTED       lv_color_hex(0x6A7D75)
 
+/* Battery voltage level colors (bright, for the dark status bar background):
+ *   > 3.5V  green, 3.3~3.5V amber, < 3.3V red. */
+#define COL_VBAT_GREEN  lv_color_hex(0x4CD98A)
+#define COL_VBAT_AMBER  lv_color_hex(0xF2C14E)
+#define COL_VBAT_RED    lv_color_hex(0xF25C54)
+
 /* ─── Layout ─── */
 #define STATUS_H    22
 #define TITLE_H     28
@@ -74,8 +80,12 @@ static const char *s_interval_labels[] = {"Off", "10s", "30s", "1min", "5min", "
 #define INTERVAL_PRESET_COUNT 10
 static int s_cfg_interval_idx = 4; /* default = 5 min */
 
-/* Latest node (camera) battery voltage in mV, 0 = unknown. Shown in status bar. */
+/* Latest node (camera) battery voltage in mV, 0 = unknown. Shown in status bar right. */
 static uint16_t s_node_vbat_mv = 0;
+/* Gateway's own supply voltage in mV, 0 = unknown. Shown in status bar left,
+ * refreshed once at boot and then every minute from the bsp_vbat cache. */
+static uint16_t s_gw_vbat_mv = 0;
+static lv_timer_t *s_gw_vbat_timer = NULL;
 
 /* Shared layout objects */
 static lv_obj_t *s_scr = NULL;
@@ -166,6 +176,9 @@ static void create_config_page(void);
 static void create_qr_page(void);
 static void destroy_body_children(void);
 static void update_title(const char *text, const char *chip, lv_color_t chip_bg);
+static lv_color_t vbat_level_color(uint16_t mv);
+static void gw_vbat_refresh(void);
+static void gw_vbat_timer_cb(lv_timer_t *t);
 
 /* PLACEHOLDER_IMPL */
 
@@ -188,13 +201,13 @@ static void create_shared_layout(void)
     s_status_lbl_l = lv_label_create(s_status_bar);
     lv_obj_set_style_text_color(s_status_lbl_l, COL_TEXT_LIGHT, 0);
     lv_obj_set_style_text_font(s_status_lbl_l, &lv_font_montserrat_10, 0);
-    lv_label_set_text(s_status_lbl_l, "");
+    lv_label_set_text(s_status_lbl_l, "GW --V");
     lv_obj_align(s_status_lbl_l, LV_ALIGN_LEFT_MID, 7, 0);
 
     s_status_lbl_r = lv_label_create(s_status_bar);
     lv_obj_set_style_text_color(s_status_lbl_r, COL_TEXT_LIGHT, 0);
     lv_obj_set_style_text_font(s_status_lbl_r, &lv_font_montserrat_10, 0);
-    lv_label_set_text(s_status_lbl_r, "GW --% / CAM --%");
+    lv_label_set_text(s_status_lbl_r, "CAM --V");
     lv_obj_align(s_status_lbl_r, LV_ALIGN_RIGHT_MID, -7, 0);
 
     /* Title bar */
@@ -1050,6 +1063,14 @@ esp_err_t ui_gw_init(void)
     lv_obj_add_event_cb(s_scr, gesture_cb, LV_EVENT_GESTURE, NULL);
     lv_obj_clear_flag(s_scr, LV_OBJ_FLAG_GESTURE_BUBBLE);
     show_page(UI_PAGE_IMAGE);
+
+    /* Read our own supply voltage once at boot, then refresh every minute.
+     * Force a fresh read here so the bar isn't blank until the 15 s background
+     * sampler fires; afterwards the timer just re-reads the cache. */
+    (void)bsp_vbat_read_mv();
+    gw_vbat_refresh();
+    s_gw_vbat_timer = lv_timer_create(gw_vbat_timer_cb, 60000, NULL);
+
     xSemaphoreGiveRecursive(s_lock);
 
     ESP_LOGI(TAG, "Gateway UI initialized");
@@ -1324,6 +1345,47 @@ void ui_gw_wifi_update(const char *state_str, const char *ssid, int8_t rssi)
     xSemaphoreGiveRecursive(s_lock);
 }
 
+/* Map a supply voltage (mV) to its status-bar text color.
+ *   > 3.5V green, 3.3~3.5V amber, < 3.3V red. Unknown (0) stays light. */
+static lv_color_t vbat_level_color(uint16_t mv)
+{
+    if (mv == 0)      return COL_TEXT_LIGHT;
+    if (mv > 3500)    return COL_VBAT_GREEN;
+    if (mv >= 3300)   return COL_VBAT_AMBER;
+    return COL_VBAT_RED;
+}
+
+/* Refresh the gateway's own voltage on the status bar left label from the
+ * bsp_vbat cache. Caller must hold s_lock. */
+static void gw_vbat_refresh(void)
+{
+    if (!s_status_lbl_l) return;
+
+    uint16_t mv = bsp_vbat_get_cached();
+    s_gw_vbat_mv = mv;
+
+    char buf[32];
+    if (mv > 0) {
+        /* e.g. 3982 mV -> "GW 3.98V" */
+        snprintf(buf, sizeof(buf), "GW %u.%02uV", mv / 1000, (mv % 1000) / 10);
+    } else {
+        snprintf(buf, sizeof(buf), "GW --V");
+    }
+    lv_label_set_text(s_status_lbl_l, buf);
+    lv_obj_set_style_text_color(s_status_lbl_l, vbat_level_color(mv), 0);
+}
+
+static void gw_vbat_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    /* LVGL timers run in the LVGL task which already owns the lock, but take it
+     * recursively to be safe against other call sites. */
+    if (!s_lock) return;
+    xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+    gw_vbat_refresh();
+    xSemaphoreGiveRecursive(s_lock);
+}
+
 void ui_gw_update_vbat(uint16_t vbat_mv)
 {
     if (!s_lock) return;
@@ -1341,6 +1403,7 @@ void ui_gw_update_vbat(uint16_t vbat_mv)
             snprintf(buf, sizeof(buf), "CAM --V");
         }
         lv_label_set_text(s_status_lbl_r, buf);
+        lv_obj_set_style_text_color(s_status_lbl_r, vbat_level_color(vbat_mv), 0);
     }
 
     xSemaphoreGiveRecursive(s_lock);
