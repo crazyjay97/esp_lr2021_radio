@@ -104,6 +104,16 @@
 
 #define BSP_BOOT_KEY_GPIO           GPIO_NUM_0
 
+/* ---------- Battery / external supply voltage sense ---------------------- *
+ * VBAT_ADC on GPIO11 (= ADC2 channel 0). The battery voltage is fed through a
+ * 1M/1M divider (R114/R115), so the pin sees VBAT/2: multiply the reading by 2
+ * to recover the real voltage. NOTE: ADC2 is shared with the Wi-Fi radio; a
+ * read may fail (ESP_ERR_TIMEOUT) while Wi-Fi is active. */
+#define BSP_VBAT_ADC_GPIO           GPIO_NUM_11
+#define BSP_VBAT_ADC_UNIT           ADC_UNIT_2
+#define BSP_VBAT_ADC_CHANNEL        ADC_CHANNEL_0   /* GPIO11 = ADC2_CH0      */
+#define BSP_VBAT_DIVIDER_RATIO      2               /* R114/R115 = 1M/1M      */
+
 /* ---------- LR2021 radio (internal to the module, pre-wired) ------------- *
  * Configured by esp_lora_driver when CONFIG_LIERDA_BOARD_LRMAM36_FANN4 = y:
  *   SPI host   : SPI2

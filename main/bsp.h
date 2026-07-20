@@ -92,6 +92,17 @@ typedef void (*bsp_btn_cb_t)(bsp_btn_id_t id, bool pressed, void *user);
 
 esp_err_t bsp_button_init(bsp_btn_cb_t cb, void *user);
 
+/* ---------- Battery / supply voltage --------------------------------------
+ * Sample VBAT_ADC (GPIO11 / ADC2_CH0) once and return the real supply voltage
+ * in millivolts, i.e. the divider is already compensated (reading * 2). Returns
+ * a negative esp_err_t on failure (e.g. ESP_ERR_TIMEOUT when Wi-Fi owns ADC2).
+ */
+int bsp_vbat_read_mv(void);
+
+/* Start a background task that reads bsp_vbat_read_mv() every `period_ms` and
+ * logs the value over the console. Pass 0 to use the 3000 ms default. */
+esp_err_t bsp_vbat_monitor_start(uint32_t period_ms);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1405,6 +1405,12 @@ extern "C" void app_main(void)
     };
     esp_timer_create(&ptt_timer_args, &g_ptt_timer);
 
+    // Battery / external-supply voltage monitor: read VBAT_ADC (GPIO11) every
+    // 3 s and print the (divider-compensated) voltage to the console.
+    if ((e = bsp_vbat_monitor_start(3000)) != ESP_OK) {
+        ESP_LOGW(TAG, "vbat monitor start: %s", esp_err_to_name(e));
+    }
+
     g_audio.play_startup_chime();
 
     ESP_LOGI(TAG, "audio config: %u Hz local record/playback",
