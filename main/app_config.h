@@ -214,6 +214,13 @@
 #define APP_SOUND_TRIGGER_THRESH_MED    5000
 #define APP_SOUND_TRIGGER_THRESH_HIGH   12000
 
+/* Sound trigger fires the capture this many ms AFTER the threshold is crossed,
+ * so the Opus pre-encode ring keeps filling and the snapshot captures the audio
+ * at and just after the trigger moment (not only the pre-trigger tail).
+ * 500ms = 50 frames at APP_AUDIO_FRAME_MS. PIR is a physical event with no such
+ * "record the moment" need, so only the sound path uses this delay. */
+#define APP_SOUND_TRIGGER_DELAY_MS      500U
+
 /* ----- Voice alarm (speaker playback on trigger) ------------------------- */
 
 #define APP_VOICE_ALARM_ENABLE          1

@@ -307,4 +307,12 @@ private:
     uint16_t sound_trigger_session_id_ = 0xC000;
     volatile bool pir_triggered_ = false;
     volatile bool pir_armed_ = false;
+
+    // Delayed sound trigger: on threshold crossing we don't dispatch the capture
+    // immediately (that pauses audio capture before the trigger moment is Opus-
+    // encoded). Instead we mark it pending and fire APP_SOUND_TRIGGER_DELAY_MS
+    // later, so the Opus ring accumulates the frames at/after the trigger first.
+    bool sound_trigger_pending_ = false;
+    int64_t sound_trigger_fire_us_ = 0;
+    uint16_t sound_trigger_pending_session_ = 0;
 };

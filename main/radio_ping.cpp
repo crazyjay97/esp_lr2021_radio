@@ -447,12 +447,17 @@ void RadioPing::tx_task()
                                                            APP_SOUND_TRIGGER_THRESH_HIGH;
             if (rms >= thresh) {
                 int64_t now = esp_timer_get_time();
-                if ((now - last_trigger_us_) >= (int64_t)APP_TRIGGER_COOLDOWN_SEC * 1000000LL) {
+                // Arm a delayed trigger (don't dispatch yet). last_trigger_us_ is
+                // stamped now so the cooldown covers the detection instant, and
+                // sound_trigger_pending_ blocks re-arming while one is in flight.
+                if (!sound_trigger_pending_ &&
+                    (now - last_trigger_us_) >= (int64_t)APP_TRIGGER_COOLDOWN_SEC * 1000000LL) {
                     last_trigger_us_ = now;
-                    ESP_LOGI(TAG, "sound trigger! rms=%u thresh=%u", rms, thresh);
-                    if (image_capture_cb_) {
-                        image_capture_cb_(sound_trigger_session_id_++);
-                    }
+                    sound_trigger_fire_us_ = now + (int64_t)APP_SOUND_TRIGGER_DELAY_MS * 1000LL;
+                    sound_trigger_pending_session_ = sound_trigger_session_id_++;
+                    sound_trigger_pending_ = true;
+                    ESP_LOGI(TAG, "sound trigger detected! rms=%u thresh=%u, fire in %ums",
+                             rms, thresh, (unsigned)APP_SOUND_TRIGGER_DELAY_MS);
                 }
             }
         }
@@ -477,6 +482,21 @@ void RadioPing::tx_task()
                                         enc_buf, APP_OPUS_MAX_PACKET_BYTES);
             if (enc_len > 0 && enc_len <= 255) {
                 opus_ringbuf_.write(enc_buf, static_cast<uint8_t>(enc_len));
+            }
+        }
+
+        // Fire a pending sound trigger once the delay has elapsed. By now the
+        // Opus ring holds the frames at/after the trigger moment, so the capture
+        // task's snapshot_opus() includes the sound that caused the trigger.
+        // Dispatched here (after the encode) rather than at detection time so the
+        // capture task's pause_audio_capture() can't stop the ring from filling
+        // during the delay window.
+        if (sound_trigger_pending_ && esp_timer_get_time() >= sound_trigger_fire_us_) {
+            sound_trigger_pending_ = false;
+            ESP_LOGI(TAG, "sound trigger firing (delayed %ums)",
+                     (unsigned)APP_SOUND_TRIGGER_DELAY_MS);
+            if (image_capture_cb_) {
+                image_capture_cb_(sound_trigger_pending_session_);
             }
         }
     }
