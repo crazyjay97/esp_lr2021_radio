@@ -74,6 +74,9 @@ static const char *s_interval_labels[] = {"Off", "10s", "30s", "1min", "5min", "
 #define INTERVAL_PRESET_COUNT 10
 static int s_cfg_interval_idx = 4; /* default = 5 min */
 
+/* Latest node (camera) battery voltage in mV, 0 = unknown. Shown in status bar. */
+static uint16_t s_node_vbat_mv = 0;
+
 /* Shared layout objects */
 static lv_obj_t *s_scr = NULL;
 static lv_obj_t *s_status_bar = NULL;
@@ -1316,6 +1319,28 @@ void ui_gw_wifi_update(const char *state_str, const char *ssid, int8_t rssi)
 
     if (s_page == UI_PAGE_QR && s_wifi_connected) {
         show_page(UI_PAGE_CONFIG);
+    }
+
+    xSemaphoreGiveRecursive(s_lock);
+}
+
+void ui_gw_update_vbat(uint16_t vbat_mv)
+{
+    if (!s_lock) return;
+    xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+
+    s_node_vbat_mv = vbat_mv;
+
+    if (s_status_lbl_r) {
+        char buf[32];
+        if (vbat_mv > 0) {
+            /* e.g. 3982 mV -> "CAM 3.98V" */
+            snprintf(buf, sizeof(buf), "CAM %u.%02uV",
+                     vbat_mv / 1000, (vbat_mv % 1000) / 10);
+        } else {
+            snprintf(buf, sizeof(buf), "CAM --V");
+        }
+        lv_label_set_text(s_status_lbl_r, buf);
     }
 
     xSemaphoreGiveRecursive(s_lock);

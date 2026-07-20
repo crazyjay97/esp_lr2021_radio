@@ -8,7 +8,11 @@
  *
  * Caveat: ADC2 is shared with the Wi-Fi radio on the ESP32-S3. When Wi-Fi is
  * active a read can fail with ESP_ERR_TIMEOUT; we surface that as a negative
- * return and the monitor task just logs a skip.
+ * return and just skip that sample (the cache keeps the last good value).
+ *
+ * The background task samples silently to keep bsp_vbat_get_cached() fresh; the
+ * voltage is reported to the gateway over the air (ImageStart / broadcast), not
+ * printed to the console.
  */
 
 #include "bsp.h"
@@ -28,13 +32,18 @@ static const char *TAG = "bsp_vbat";
 #define ADC_ATTEN       ADC_ATTEN_DB_12        /* full 0..3.1 V input range */
 #define ADC_BITWIDTH    ADC_BITWIDTH_DEFAULT
 
-#define VBAT_DEFAULT_PERIOD_MS  3000
+#define VBAT_DEFAULT_PERIOD_MS  15000   /* non-low-power maintenance cadence */
 #define VBAT_SAMPLES            8       /* raw conversions averaged per read */
 
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t         s_cal;
 static bool                      s_cal_valid;
 static bool                      s_ready;
+
+/* Latest good reading in mV (real supply voltage, divider already undone).
+ * Updated by every successful bsp_vbat_read_mv(); read lock-free via
+ * bsp_vbat_get_cached() from the radio path. 0 = no valid reading yet. */
+static volatile uint16_t s_cached_mv;
 
 static esp_err_t vbat_adc_setup(void)
 {
@@ -101,7 +110,16 @@ int bsp_vbat_read_mv(void)
     }
 
     /* Undo the on-board 1M/1M divider to recover the real supply voltage. */
-    return pin_mv * BSP_VBAT_DIVIDER_RATIO;
+    int mv = pin_mv * BSP_VBAT_DIVIDER_RATIO;
+
+    /* Refresh the cache so radio callers can grab it without touching ADC2. */
+    s_cached_mv = (uint16_t)mv;
+    return mv;
+}
+
+uint16_t bsp_vbat_get_cached(void)
+{
+    return s_cached_mv;
 }
 
 static void vbat_task(void *arg)
@@ -109,15 +127,11 @@ static void vbat_task(void *arg)
     uint32_t period_ms = (uint32_t)(uintptr_t)arg;
     TickType_t next = xTaskGetTickCount();
 
+    // Silently sample every period_ms to keep bsp_vbat_get_cached() fresh for
+    // the radio path (ImageStart first packet + periodic broadcast). No console
+    // printing — the value reaches the gateway over the air, not the serial log.
     while (1) {
-        int mv = bsp_vbat_read_mv();
-        if (mv >= 0) {
-            ESP_LOGI(TAG, "VBAT = %d mV (%d.%03d V)",
-                     mv, mv / 1000, mv % 1000);
-        } else {
-            ESP_LOGW(TAG, "VBAT read failed (%s) - skip",
-                     esp_err_to_name(-mv));
-        }
+        (void)bsp_vbat_read_mv();
         vTaskDelayUntil(&next, pdMS_TO_TICKS(period_ms));
     }
 }

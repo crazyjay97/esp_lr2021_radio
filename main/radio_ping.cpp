@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 
 #include "app_config.h"
+#include "bsp.h"
 
 #include "lr20xx_radio_lora.h"
 #include "lr20xx_radio_common.h"
@@ -43,7 +44,12 @@ constexpr uint8_t kPacketTypeImageStart = 8;
 constexpr uint8_t kPacketTypeConfig = 9;
 constexpr uint8_t kPacketTypeConfigAck = 10;
 constexpr uint8_t kPacketTypeImageCmdAck = 11;
+constexpr uint8_t kPacketTypeVbat = 12;
 constexpr uint16_t kHeaderSize = 14;
+
+/* Low-power node battery voltage maintenance cadence and broadcast interval. */
+constexpr uint32_t kVbatLowPowerSampleIntervalMs = 60000;     /* 60 s */
+constexpr uint32_t kVbatBroadcastIntervalMs = 300000;         /* 5 min */
 constexpr uint32_t kConfigAckTimeoutMs = 500;
 
 int32_t abs16(int16_t v)
@@ -594,6 +600,10 @@ void RadioPing::poll_once()
                 schedule_rx();
             } else {
                 cad_wakeup_ms_ = 0;
+                // Node is awake and idle here; do voltage sampling / broadcast
+                // now (before dropping into CAD light sleep) so we never spin up
+                // the chip just for VBAT. Broadcast goes out on this awake window.
+                vbat_maintenance_tick();
                 enter_low_power_cad();
             }
         } else if (tx_burst_active_) {
@@ -607,6 +617,9 @@ void RadioPing::poll_once()
                 configure_flrc();
                 ESP_LOGI(TAG, "low power off, back to FLRC RX");
             }
+            // Non-low-power node: periodic 5-min voltage broadcast. Guarded
+            // internally by timestamp so this is cheap to call every idle pass.
+            vbat_maintenance_tick();
             schedule_rx();
         }
     }
@@ -931,6 +944,19 @@ void RadioPing::handle_rx_packet()
     } else if (rx_buf_[4] == kPacketTypeConfigAck) {
         ESP_LOGI(TAG, "RX ConfigAck");
         config_ack_received_ = true;
+    } else if (rx_buf_[4] == kPacketTypeVbat) {
+        // Battery voltage broadcast: [14..15] vbat_mv, [16..19] CRC32 over [0..15].
+        if (len >= kHeaderSize + 6) {
+            uint32_t hdr_crc = crc32_ieee(rx_buf_, 16);
+            uint32_t rx_crc = get_u32_le(&rx_buf_[16]);
+            if (hdr_crc == rx_crc) {
+                uint16_t vbat_mv = get_u16_le(&rx_buf_[14]);
+                ESP_LOGI(TAG, "RX Vbat: %u mV (%u.%02u V)", vbat_mv, vbat_mv / 1000, (vbat_mv % 1000) / 10);
+                if (vbat_mv > 0 && vbat_received_cb_) vbat_received_cb_(vbat_mv);
+            } else {
+                ESP_LOGW(TAG, "RX Vbat CRC mismatch, dropping");
+            }
+        }
     } else {
         ESP_LOGW(TAG, "RX unsupported packet type=%u len=%u rssi=%d", rx_buf_[4], len, rssi);
     }
@@ -1354,19 +1380,20 @@ void RadioPing::image_tx_task()
         // gets through within a couple of tries.
         bool r_ready = false;
         for (uint16_t start_try = 0; start_try < APP_IMAGE_START_RETRY_COUNT && !r_ready; start_try++) {
-            // ImageStart = 14-byte header + a 4-byte software CRC32 over that
-            // header (magic included). The gateway rejects any ImageStart whose
-            // CRC32 doesn't match, so a corrupted total_frags can't sneak past
+            // ImageStart = 14-byte header + 2-byte vbat + 4-byte software CRC32
+            // covering [0..15]. The gateway rejects any ImageStart whose CRC32
+            // doesn't match, so a corrupted total_frags or vbat can't sneak past
             // the weak 2-byte FLRC CRC and poison the transfer (see handle_image_start).
-            uint8_t start_pkt[kHeaderSize + 4];
+            uint8_t start_pkt[kHeaderSize + 6];
             std::memcpy(start_pkt, kMagic, sizeof(kMagic));
             start_pkt[4] = kPacketTypeImageStart;
             start_pkt[5] = 1;
             put_u16_le(&start_pkt[6], req.session_id);
             put_u16_le(&start_pkt[8], total_fragments);
             put_u32_le(&start_pkt[10], jpeg_crc32);
-            put_u32_le(&start_pkt[kHeaderSize], crc32_ieee(start_pkt, kHeaderSize));
-            send_single_packet(start_pkt, kHeaderSize + 4);
+            put_u16_le(&start_pkt[14], bsp_vbat_get_cached());  // battery voltage mV
+            put_u32_le(&start_pkt[16], crc32_ieee(start_pkt, 16));
+            send_single_packet(start_pkt, kHeaderSize + 6);
 
             image_nack_received_ = false;
             image_done_received_ = false;
@@ -1681,16 +1708,23 @@ void RadioPing::handle_image_start(uint16_t len)
     // single corrupted total_frags wrecks it (e.g. a bogus 0/4778). The FLRC
     // hardware CRC is only 2 bytes and, in variable-length mode, does not cover
     // the length byte — a rare bad packet can slip through. So ImageStart adds
-    // its own CRC32 over the 14-byte header ([0..13], magic included), appended
-    // as 4 bytes. Recompute and compare; on mismatch drop the packet entirely
-    // (touch no state) — the node keeps resending ImageStart, so we just wait
-    // for a clean one, same as any lost packet.
-    if (len < kHeaderSize + 4) {
+    // its own CRC32 over the header + vbat ([0..15]), appended as 4 bytes.
+    // Recompute and compare; on mismatch drop the packet entirely (touch no
+    // state) — the node keeps resending ImageStart, so we just wait for a
+    // clean one, same as any lost packet.
+    //
+    // Backward compat: old nodes send 18 bytes (no vbat, CRC over [0..13]);
+    // new nodes send 20 bytes (vbat at [14..15], CRC over [0..15]).
+    bool has_vbat = (len >= kHeaderSize + 6);
+    uint16_t crc_len = has_vbat ? 16 : kHeaderSize;
+    uint16_t crc_offset = has_vbat ? 16 : kHeaderSize;
+
+    if (len < crc_offset + 4) {
         ESP_LOGW(TAG, "ImageStart too short (len=%u), dropping", len);
         return;
     }
-    uint32_t hdr_crc = crc32_ieee(rx_buf_, kHeaderSize);
-    uint32_t rx_hdr_crc = get_u32_le(&rx_buf_[kHeaderSize]);
+    uint32_t hdr_crc = crc32_ieee(rx_buf_, crc_len);
+    uint32_t rx_hdr_crc = get_u32_le(&rx_buf_[crc_offset]);
     if (hdr_crc != rx_hdr_crc) {
         ESP_LOGW(TAG, "ImageStart header CRC32 mismatch (calc=0x%08lx rx=0x%08lx), dropping",
                  static_cast<unsigned long>(hdr_crc), static_cast<unsigned long>(rx_hdr_crc));
@@ -1700,9 +1734,17 @@ void RadioPing::handle_image_start(uint16_t len)
     uint16_t session_id = get_u16_le(&rx_buf_[6]);
     uint16_t total_frags = get_u16_le(&rx_buf_[8]);
     uint32_t expected_crc32 = get_u32_le(&rx_buf_[10]);
+    uint16_t vbat_mv = has_vbat ? get_u16_le(&rx_buf_[14]) : 0;
 
-    ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx",
-             session_id, total_frags, static_cast<unsigned long>(expected_crc32));
+    if (has_vbat) {
+        ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx vbat=%u mV (%u.%02u V)",
+                 session_id, total_frags, static_cast<unsigned long>(expected_crc32),
+                 vbat_mv, vbat_mv / 1000, (vbat_mv % 1000) / 10);
+        if (vbat_mv > 0 && vbat_received_cb_) vbat_received_cb_(vbat_mv);
+    } else {
+        ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx",
+                 session_id, total_frags, static_cast<unsigned long>(expected_crc32));
+    }
 
     // Backstop: an ImageStart proves the node got our request, so stop resending
     // ImageCmd even if its ImageCmdAck was lost.
@@ -2346,3 +2388,53 @@ bool RadioPing::send_lora_wakeup()
     }
     return ok;
 }
+
+void RadioPing::send_vbat_broadcast()
+{
+    // Battery voltage broadcast: minimal FLRC packet with current cached voltage.
+    // Layout: [0..13] 14-byte header (magic + type=12, rest zeroed)
+    //         [14..15] vbat_mv (u16 LE)
+    //         [16..19] CRC32 covering [0..15]
+    uint8_t pkt[kHeaderSize + 6];
+    std::memset(pkt, 0, sizeof(pkt));
+    std::memcpy(pkt, kMagic, sizeof(kMagic));
+    pkt[4] = kPacketTypeVbat;
+    put_u16_le(&pkt[14], bsp_vbat_get_cached());
+    put_u32_le(&pkt[16], crc32_ieee(pkt, 16));
+
+    send_single_packet(pkt, kHeaderSize + 6);
+    ESP_LOGI(TAG, "vbat broadcast sent: %u mV", bsp_vbat_get_cached());
+}
+
+void RadioPing::vbat_maintenance_tick()
+{
+    // Gateway never broadcasts its voltage, only receives from nodes.
+    if (is_gateway_) return;
+
+    uint32_t now = smtc_modem_hal_get_time_in_ms();
+
+    if (g_low_power_enabled) {
+        // Low-power node: only refresh the cached voltage every 60s (搭 CAD 唤醒
+        // 的车，不额外唤醒). No periodic broadcast — the voltage is carried back
+        // to the gateway inside the ImageStart first packet when the node is
+        // woken to push a photo. This also avoids having to switch the radio from
+        // LoRa CAD to FLRC just for a broadcast.
+        if ((int32_t)(now - vbat_last_sample_ms_) >= (int32_t)kVbatLowPowerSampleIntervalMs) {
+            int mv = bsp_vbat_read_mv();
+            if (mv >= 0) {
+                ESP_LOGD(TAG, "vbat sample: %d mV", mv);
+            }
+            vbat_last_sample_ms_ = now;
+        }
+        return;
+    }
+
+    // Non-low-power node: sampling is handled by the bsp_vbat background task
+    // (15s). Broadcast the cached voltage every 5 minutes (radio is already in
+    // FLRC RX here, so send_single_packet is safe).
+    if ((int32_t)(now - vbat_last_broadcast_ms_) >= (int32_t)kVbatBroadcastIntervalMs) {
+        send_vbat_broadcast();
+        vbat_last_broadcast_ms_ = now;
+    }
+}
+

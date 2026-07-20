@@ -21,6 +21,9 @@ typedef void (*image_rx_complete_cb_t)(ImageTransfer *xfer);
 typedef void (*image_rx_progress_cb_t)(uint16_t received, uint16_t total, int16_t rssi);
 typedef void (*image_rx_eot_cb_t)(uint16_t missing_count, bool is_first_eot);
 typedef void (*config_received_cb_t)(uint8_t key, uint32_t value);
+// Called on the gateway when a node's battery voltage arrives (via ImageStart
+// or a periodic Vbat broadcast), so the app can push it to the UI.
+typedef void (*vbat_received_cb_t)(uint16_t vbat_mv);
 // Low power: called when the node enters (true) / leaves (false) CAD sleep
 // standby, so the app can release/restore power-hungry peripherals (camera, I2S).
 typedef void (*low_power_standby_cb_t)(bool entering);
@@ -50,6 +53,7 @@ public:
     void set_image_capture_cb(image_capture_cb_t cb) { image_capture_cb_ = cb; }
     void set_image_rx_complete_cb(image_rx_complete_cb_t cb) { image_rx_complete_cb_ = cb; }
     void set_image_rx_progress_cb(image_rx_progress_cb_t cb) { image_rx_progress_cb_ = cb; }
+    void set_vbat_received_cb(vbat_received_cb_t cb) { vbat_received_cb_ = cb; }
     void set_image_rx_eot_cb(image_rx_eot_cb_t cb) { image_rx_eot_cb_ = cb; }
     void set_config_received_cb(config_received_cb_t cb) { config_received_cb_ = cb; }
     void set_low_power_standby_cb(low_power_standby_cb_t cb) { low_power_standby_cb_ = cb; }
@@ -171,6 +175,11 @@ private:
     // standby to save whole-chip power.
     bool low_power_sleep(uint32_t ms);
     void handle_cad_irq(ral_irq_t irq);
+
+    // Battery voltage broadcast: send a small FLRC packet with current cached voltage.
+    void send_vbat_broadcast();
+    // Maintenance tick for low-power nodes: sample voltage every 60s, broadcast every 5min.
+    void vbat_maintenance_tick();
     bool send_lora_wakeup();
 
     struct VoicePacket {
@@ -235,6 +244,7 @@ private:
     image_capture_cb_t image_capture_cb_ = nullptr;
     image_rx_complete_cb_t image_rx_complete_cb_ = nullptr;
     image_rx_progress_cb_t image_rx_progress_cb_ = nullptr;
+    vbat_received_cb_t vbat_received_cb_ = nullptr;
     image_rx_eot_cb_t image_rx_eot_cb_ = nullptr;
     config_received_cb_t config_received_cb_ = nullptr;
     low_power_standby_cb_t low_power_standby_cb_ = nullptr;
@@ -315,4 +325,9 @@ private:
     bool sound_trigger_pending_ = false;
     int64_t sound_trigger_fire_us_ = 0;
     uint16_t sound_trigger_pending_session_ = 0;
+
+    // Battery voltage maintenance (low-power node only): last sample timestamp
+    // and last broadcast timestamp. Non-low-power nodes use the bsp_vbat task.
+    uint32_t vbat_last_sample_ms_ = 0;
+    uint32_t vbat_last_broadcast_ms_ = 0;
 };

@@ -56,6 +56,9 @@ void ui_gw_wifi_update(const char *state_str, const char *ssid, int8_t rssi);
 void ui_gw_show_qr(const char *payload);
 void ui_gw_hide_qr(void);
 
+/* Update the node's battery voltage display (mV). Call with 0 to hide. */
+void ui_gw_update_vbat(uint16_t vbat_mv);
+
 #ifdef __cplusplus
 }
 #endif

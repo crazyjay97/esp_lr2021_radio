@@ -99,8 +99,15 @@ esp_err_t bsp_button_init(bsp_btn_cb_t cb, void *user);
  */
 int bsp_vbat_read_mv(void);
 
-/* Start a background task that reads bsp_vbat_read_mv() every `period_ms` and
- * logs the value over the console. Pass 0 to use the 3000 ms default. */
+/* Return the most recent successful voltage reading cached by bsp_vbat_read_mv(),
+ * or 0 if no valid reading has been taken yet. Safe to call from the radio path
+ * without touching ADC2 (lock-free read). */
+uint16_t bsp_vbat_get_cached(void);
+
+/* Start a background task that silently samples the voltage every `period_ms`
+ * to keep bsp_vbat_get_cached() fresh (no console output). Pass 0 for the
+ * 15000 ms default. Used by non-low-power nodes; low-power nodes sample on the
+ * CAD wake window instead. */
 esp_err_t bsp_vbat_monitor_start(uint32_t period_ms);
 
 #ifdef __cplusplus

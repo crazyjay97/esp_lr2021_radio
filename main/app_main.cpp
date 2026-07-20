@@ -972,6 +972,14 @@ void on_image_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
     }
 }
 
+// Radio mode (gateway): a node reported its battery voltage -> push to UI.
+void on_vbat_received(uint16_t vbat_mv)
+{
+    if (g_app_mode == AppMode::radio) {
+        ui_gw_update_vbat(vbat_mv);
+    }
+}
+
 void on_image_rx_eot_nack(uint16_t missing_count, bool is_first_eot)
 {
     if (g_app_mode == AppMode::radio) {
@@ -1272,6 +1280,7 @@ extern "C" void app_main(void)
             g_radio.set_image_capture_cb(on_image_capture_request);
             g_radio.set_image_rx_complete_cb(on_image_rx_complete);
             g_radio.set_image_rx_progress_cb(on_image_rx_progress);
+            g_radio.set_vbat_received_cb(on_vbat_received);
             g_radio.set_image_rx_eot_cb(on_image_rx_eot_nack);
             g_radio.set_config_received_cb(on_config_received);
             g_radio.set_low_power_standby_cb(on_low_power_standby);
@@ -1406,8 +1415,9 @@ extern "C" void app_main(void)
     esp_timer_create(&ptt_timer_args, &g_ptt_timer);
 
     // Battery / external-supply voltage monitor: read VBAT_ADC (GPIO11) every
-    // 3 s and print the (divider-compensated) voltage to the console.
-    if ((e = bsp_vbat_monitor_start(3000)) != ESP_OK) {
+    // 15 s and cache the result. Radio path grabs the cached value to embed in
+    // ImageStart and periodic broadcast packets.
+    if ((e = bsp_vbat_monitor_start(0)) != ESP_OK) {
         ESP_LOGW(TAG, "vbat monitor start: %s", esp_err_to_name(e));
     }
 
