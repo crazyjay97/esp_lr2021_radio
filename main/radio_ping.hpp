@@ -226,6 +226,11 @@ private:
     bool tx_burst_active_ = false;
     bool tx_flush_pending_ = false;
     volatile bool irq_pending_ = false;
+    // When a task is inside send_single_packet waiting for TX_DONE, the ISR
+    // notifies THIS task directly (instead of the main radio task) so it can
+    // block-wait and free the CPU for the burst's idle airtime. nullptr => the
+    // ISR falls back to notifying task_handle_ (RX path / main loop wakeups).
+    volatile TaskHandle_t tx_done_waiter_ = nullptr;
 
     uint8_t tx_buf_[APP_FLRC_MAX_PAYLOAD_BYTES] = {};
     uint8_t rx_buf_[APP_FLRC_MAX_PAYLOAD_BYTES] = {};

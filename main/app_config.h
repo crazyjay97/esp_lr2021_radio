@@ -277,6 +277,13 @@
 #define APP_IMAGE_TASK_STACK_BYTES      16384U
 #define APP_IMAGE_TASK_PRIORITY         3
 #define APP_IMAGE_TASK_CORE             1
+// The radio image-TX task runs one priority above the image-capture/encode task
+// (APP_IMAGE_TASK_PRIORITY) so a TX_DONE wakeup preempts an in-progress
+// downsample/JPEG loop immediately. This lets img_tx reclaim the CPU to load the
+// next packet without relying on those (library) loops to yield voluntarily —
+// the precondition for overlapping next-frame encode with the current TX burst.
+// Stays below the voice tasks (5) so real-time audio is unaffected.
+#define APP_IMAGE_TX_TASK_PRIORITY      4
 
 /* Continuous video stream: after a frame finishes displaying, wait this long
  * before auto-requesting the next one. Small gap lets the half-duplex radio

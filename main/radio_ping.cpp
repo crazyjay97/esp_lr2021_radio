@@ -287,7 +287,7 @@ esp_err_t RadioPing::start()
 
     ok = xTaskCreatePinnedToCore(image_tx_task_trampoline, "img_tx",
                                  APP_IMAGE_TASK_STACK_BYTES, this,
-                                 APP_IMAGE_TASK_PRIORITY, nullptr,
+                                 APP_IMAGE_TX_TASK_PRIORITY, nullptr,
                                  APP_IMAGE_TASK_CORE);
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
@@ -639,9 +639,15 @@ void RadioPing::irq_callback(void *context)
     auto *self = static_cast<RadioPing *>(context);
     if (self != nullptr) {
         self->irq_pending_ = true;
-        if (self->task_handle_ != nullptr) {
+        // If a task is block-waiting for TX_DONE inside send_single_packet, wake
+        // that task directly; otherwise wake the main radio task (RX / poll loop).
+        TaskHandle_t target = self->tx_done_waiter_;
+        if (target == nullptr) {
+            target = self->task_handle_;
+        }
+        if (target != nullptr) {
             BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-            vTaskNotifyGiveFromISR(self->task_handle_, &xHigherPriorityTaskWoken);
+            vTaskNotifyGiveFromISR(target, &xHigherPriorityTaskWoken);
             portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
         }
     }
@@ -1626,6 +1632,13 @@ void RadioPing::image_tx_task()
 
 bool RadioPing::send_single_packet(const uint8_t *data, uint16_t len)
 {
+    // Register this task as the TX_DONE notify target and drop any stale
+    // notification BEFORE arming TX, so a fast TX_DONE (which can fire the
+    // instant set_tx runs) still lands as a pending notification wait_for_tx_done
+    // will consume — no lost-wakeup window.
+    tx_done_waiter_ = xTaskGetCurrentTaskHandle();
+    xTaskNotifyStateClear(nullptr);
+
     smtc_modem_hal_protect_api_call();
     smtc_modem_hal_start_radio_tcxo();
     smtc_modem_hal_set_ant_switch(true);
@@ -1636,11 +1649,14 @@ bool RadioPing::send_single_packet(const uint8_t *data, uint16_t len)
     smtc_modem_hal_unprotect_api_call();
 
     if (status != RAL_STATUS_OK) {
+        tx_done_waiter_ = nullptr;
         return false;
     }
 
     mode_ = Mode::tx_pending;
-    return wait_for_tx_done(50);
+    bool ok = wait_for_tx_done(50);
+    tx_done_waiter_ = nullptr;
+    return ok;
 }
 
 bool RadioPing::wait_for_tx_done(uint32_t timeout_ms)
@@ -1662,7 +1678,13 @@ bool RadioPing::wait_for_tx_done(uint32_t timeout_ms)
             mode_ = Mode::idle;
             return false;
         }
-        taskYIELD();
+        // Block instead of spinning: the TX_DONE ISR notifies this task
+        // (tx_done_waiter_), so the CPU is freed for the ~1.7ms of packet
+        // airtime instead of burning it in a taskYIELD loop. The short poll
+        // timeout is a safety net — if a notification is ever missed we still
+        // re-check irq_pending_ / the hardware IRQ status and the overall
+        // timeout_ms guard, so we can never dead-wait here.
+        ulTaskNotifyTake(pdTRUE, ms_to_ticks_min_1(APP_RADIO_TASK_POLL_MS));
     }
 }
 
