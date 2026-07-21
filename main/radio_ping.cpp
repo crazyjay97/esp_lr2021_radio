@@ -1782,7 +1782,14 @@ void RadioPing::handle_image_start(uint16_t len)
         ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx vbat=%u mV (%u.%02u V)",
                  session_id, total_frags, static_cast<unsigned long>(expected_crc32),
                  vbat_mv, vbat_mv / 1000, (vbat_mv % 1000) / 10);
-        if (vbat_mv > 0 && vbat_received_cb_) vbat_received_cb_(vbat_mv);
+        // NOTE: deliberately NOT calling vbat_received_cb_ here. This is the
+        // per-frame image RX hot path and the callback grabs the LVGL render
+        // lock (s_lock) with portMAX_DELAY; if the LVGL task is mid-flush on the
+        // other core it can block the radio task ~100ms, delaying the ready-ACK
+        // and inflating prepare_ms. Battery voltage is instead delivered by the
+        // low-power node inside this same ImageStart packet only for logging,
+        // and by the non-low-power node via the periodic kPacketTypeVbat
+        // broadcast (see line ~2476), which updates the UI off the hot path.
     } else {
         ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx",
                  session_id, total_frags, static_cast<unsigned long>(expected_crc32));
