@@ -1668,26 +1668,38 @@ void RadioPing::handle_image_cmd()
     // retransmits of the same session (their ack was lost) — so a lost ack
     // self-heals. The capture-side dedup (image_capture_cb_) drops the duplicate
     // dispatch, so re-acking never triggers a second capture.
-    uint8_t ack[kHeaderSize];
-    std::memcpy(ack, kMagic, sizeof(kMagic));
-    ack[4] = kPacketTypeImageCmdAck;
-    ack[5] = 1;
-    put_u16_le(&ack[6], session_id);
-    ack[8] = 0; ack[9] = 0; ack[10] = 0; ack[11] = 0; ack[12] = 0; ack[13] = 0;
-
-    if (mode_ == Mode::rx_pending) {
-        smtc_modem_hal_protect_api_call();
-        (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
-        (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
-        smtc_modem_hal_unprotect_api_call();
-        mode_ = Mode::idle;
-    }
-    send_single_packet(ack, kHeaderSize);
-    schedule_rx();
-
+    // Ask the app whether it accepts this request BEFORE acking. The callback
+    // only spawns the capture task (non-blocking, does not touch the radio here;
+    // the task reconfigures FLRC ~110ms later), so running it while still in
+    // rx_pending is safe. We ack only on acceptance: if the node is busy (e.g. a
+    // stream's next-frame request landing in the brief post-TX busy tail) it
+    // returns false and we stay silent, so the gateway's ImageCmd flood keeps
+    // going and the node accepts as soon as it is free — no deadlock. A
+    // same-session retransmit whose earlier ack was lost returns true again, so
+    // lost acks still self-heal without launching a second capture.
+    bool accepted = true;
     if (image_capture_cb_) {
-        image_capture_cb_(session_id);
+        accepted = image_capture_cb_(session_id);
     }
+
+    if (accepted) {
+        uint8_t ack[kHeaderSize];
+        std::memcpy(ack, kMagic, sizeof(kMagic));
+        ack[4] = kPacketTypeImageCmdAck;
+        ack[5] = 1;
+        put_u16_le(&ack[6], session_id);
+        ack[8] = 0; ack[9] = 0; ack[10] = 0; ack[11] = 0; ack[12] = 0; ack[13] = 0;
+
+        if (mode_ == Mode::rx_pending) {
+            smtc_modem_hal_protect_api_call();
+            (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+            (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+            smtc_modem_hal_unprotect_api_call();
+            mode_ = Mode::idle;
+        }
+        send_single_packet(ack, kHeaderSize);
+    }
+    schedule_rx();
 }
 
 // Gateway side: node acknowledged the ImageCmd. Stop the request-retry timer.

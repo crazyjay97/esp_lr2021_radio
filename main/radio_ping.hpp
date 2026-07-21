@@ -16,7 +16,14 @@
 #include "audio_ringbuf.hpp"
 #include "opus_ringbuf.hpp"
 
-typedef void (*image_capture_cb_t)(uint16_t session_id);
+// Returns true if the node accepted the request (or is legitimately re-acking a
+// same-session retransmit), false if it dropped it (busy / cooldown / wrong
+// mode). handle_image_cmd only sends the ImageCmdAck when this is true, so a
+// dropped request does NOT stop the gateway's ImageCmd flood — the gateway keeps
+// requesting until the node is free and accepts, which self-heals the
+// stream-restart race where a next-frame request lands in the node's brief
+// post-TX busy tail.
+typedef bool (*image_capture_cb_t)(uint16_t session_id);
 typedef void (*image_rx_complete_cb_t)(ImageTransfer *xfer);
 typedef void (*image_rx_progress_cb_t)(uint16_t received, uint16_t total, int16_t rssi);
 typedef void (*image_rx_eot_cb_t)(uint16_t missing_count, bool is_first_eot);

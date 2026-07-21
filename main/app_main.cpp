@@ -169,7 +169,7 @@ uint8_t load_config_u8(const char *key, uint8_t def)
     return val;
 }
 
-void on_image_capture_request(uint16_t session_id);
+bool on_image_capture_request(uint16_t session_id);
 void stream_next_frame_cb(void *arg);
 
 void auto_capture_timer_cb(void *arg)
@@ -185,7 +185,7 @@ void auto_capture_timer_cb(void *arg)
     if (g_auto_session_id == 0) g_auto_session_id = 0x8000;
     ESP_LOGI(TAG, "auto-capture trigger: session=%u interval=%lus",
              sid, static_cast<unsigned long>(g_capture_interval_sec));
-    on_image_capture_request(sid);
+    (void)on_image_capture_request(sid);
 }
 
 void start_auto_capture_timer()
@@ -655,17 +655,22 @@ void image_capture_task(void *arg)
 }
 
 // Callback: device A receives ImageCmd from B
-void on_image_capture_request(uint16_t session_id)
+// Returns true if the request was accepted (or is a same-session retransmit we
+// already dispatched — re-ack it), false if dropped (not camera / busy /
+// cooldown / task-create failed). The radio layer only sends ImageCmdAck when
+// this returns true, so a dropped request leaves the gateway flooding until the
+// node is free — see image_capture_cb_t in radio_ping.hpp.
+bool on_image_capture_request(uint16_t session_id)
 {
     if (g_app_mode != AppMode::camera) {
         ESP_LOGW(TAG, "ImageCmd received but not in camera mode");
         g_radio.notify_capture_dropped();
-        return;
+        return false;
     }
     if (g_capture_busy) {
         ESP_LOGW(TAG, "ImageCmd ignored: capture already busy");
         g_radio.notify_capture_dropped();
-        return;
+        return false;
     }
     // Dedup gateway ImageCmd retransmits of the same session. The gateway resends
     // ImageCmd until it gets an ack; if an ack is lost for the whole capture, a
@@ -675,8 +680,11 @@ void on_image_capture_request(uint16_t session_id)
     static uint16_t s_last_dispatched_session = 0;
     static bool s_have_dispatched = false;
     if (s_have_dispatched && session_id == s_last_dispatched_session) {
+        // Retransmit of a session we already handled: re-ack it (return true) so
+        // the gateway's lost-ack self-heal still works, but do not launch a
+        // second capture.
         ESP_LOGW(TAG, "ImageCmd ignored: session %u already dispatched", session_id);
-        return;
+        return true;
     }
     if (g_audio_clip_enabled) {
         static uint32_t s_last_node_capture_ms = 0;
@@ -685,7 +693,7 @@ void on_image_capture_request(uint16_t session_id)
             (now - s_last_node_capture_ms) < APP_AUDIO_CAPTURE_COOLDOWN_MS) {
             ESP_LOGW(TAG, "ImageCmd ignored: audio cooldown");
             g_radio.notify_capture_dropped();
-            return;
+            return false;
         }
         s_last_node_capture_ms = now;
     }
@@ -702,7 +710,7 @@ void on_image_capture_request(uint16_t session_id)
     auto *ctx = new (std::nothrow) ImageCaptureCtx{ session_id };
     if (!ctx) {
         g_capture_busy = false;
-        return;
+        return false;
     }
 
     BaseType_t ok = xTaskCreatePinnedToCore(image_capture_task, "img_cap",
@@ -713,7 +721,9 @@ void on_image_capture_request(uint16_t session_id)
         delete ctx;
         g_capture_busy = false;
         ESP_LOGE(TAG, "image capture task create failed");
+        return false;
     }
+    return true;
 }
 
 // Callback: device B receives complete image
