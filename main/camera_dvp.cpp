@@ -17,9 +17,52 @@
 #include "bsp.h"
 
 #include "esp_cache.h"
+#include "esp_timer.h"
 #include "sp0a39_regs.h"
 
 namespace {
+
+// 2x box/decimation downsample of a YUV422 (UYVY/YUYV/VYUY) frame, preserving
+// the full field of view. Source is kept as-is byte-for-byte in each retained
+// 4-byte macro-pixel group (2 pixels), so the output stays valid YUV422 and the
+// downstream swizzle in ImageTransfer::encode_frame needs no change.
+//   src: src_w x src_h, stride src_w*2   ->   dst: (src_w/2) x (src_h/2)
+// Keeps even rows and every other macro-pixel group (horizontal 2x decimation).
+void downsample_yuv422_2x(const uint8_t *src, uint8_t *dst,
+                          uint32_t src_w, uint32_t src_h)
+{
+    const uint32_t src_stride = src_w * 2;          // bytes per source row
+    const uint32_t dst_w = src_w / 2;
+    const uint32_t dst_h = src_h / 2;
+    for (uint32_t dy = 0; dy < dst_h; dy++) {
+        const uint8_t *srow = src + (size_t)(dy * 2) * src_stride;  // even rows
+        uint8_t *drow = dst + (size_t)dy * (dst_w * 2);
+        // Take macro-pixel groups 0,2,4,... : copy 4 bytes, skip 4 bytes.
+        for (uint32_t dx = 0; dx < dst_w / 2; dx++) {
+            const uint8_t *s = srow + (size_t)(dx * 2) * 4;
+            uint8_t *d = drow + (size_t)dx * 4;
+            d[0] = s[0];
+            d[1] = s[1];
+            d[2] = s[2];
+            d[3] = s[3];
+        }
+    }
+}
+
+// 2x decimation of a GRAY8 frame (1 byte/pixel): keep even rows, even columns.
+void downsample_gray_2x(const uint8_t *src, uint8_t *dst,
+                        uint32_t src_w, uint32_t src_h)
+{
+    const uint32_t dst_w = src_w / 2;
+    const uint32_t dst_h = src_h / 2;
+    for (uint32_t dy = 0; dy < dst_h; dy++) {
+        const uint8_t *srow = src + (size_t)(dy * 2) * src_w;
+        uint8_t *drow = dst + (size_t)dy * dst_w;
+        for (uint32_t dx = 0; dx < dst_w; dx++) {
+            drow[dx] = srow[dx * 2];
+        }
+    }
+}
 
 constexpr const char *TAG = "camera_dvp";
 constexpr TickType_t kPwdnSettleTicks = pdMS_TO_TICKS(100);
@@ -499,7 +542,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     s_dvp_ctx.received = 0;
     s_dvp_ctx.captured_buffer = nullptr;
     xQueueReset(capture_sem_);
-    s_dvp_ctx.capture_target = s_dvp_ctx.frame_count + 3;
+    s_dvp_ctx.capture_target = s_dvp_ctx.frame_count + 1;
 
     bool got_frame = xSemaphoreTake(capture_sem_, pdMS_TO_TICKS(5000)) == pdTRUE;
 
@@ -507,11 +550,13 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
         ESP_LOGI(TAG, "captured frame: %u bytes (skipped %d)",
                  (unsigned)s_dvp_ctx.received, s_dvp_ctx.frame_count - 1);
 
+        // Allocate the downsampled (320x240) output, not the full frame.
+        constexpr size_t kOutBytes = APP_IMAGE_OUTPUT_BYTES;
         uint8_t *copy = static_cast<uint8_t *>(
-            heap_caps_malloc(kFrameBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            heap_caps_malloc(kOutBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (!copy) {
             copy = static_cast<uint8_t *>(
-                heap_caps_malloc(kFrameBytes, MALLOC_CAP_8BIT));
+                heap_caps_malloc(kOutBytes, MALLOC_CAP_8BIT));
         }
         if (!copy) {
             ESP_LOGE(TAG, "frame copy alloc failed");
@@ -519,14 +564,30 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
         }
         esp_cache_msync((void *)s_dvp_ctx.captured_buffer, kFrameBytes,
                         ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-        memcpy(copy, (void *)s_dvp_ctx.captured_buffer, kFrameBytes);
+
+        // 2x decimate straight from the DMA buffer into the output buffer. This
+        // replaces the old full-frame memcpy: it moves LESS memory than a plain
+        // copy (reads half the source, writes a quarter) so it is not extra cost.
+        int64_t t_ds0 = esp_timer_get_time();
+#if APP_CAMERA_COLOR_ENABLE
+        downsample_yuv422_2x((const uint8_t *)s_dvp_ctx.captured_buffer, copy,
+                             APP_CAMERA_SENSOR_WIDTH, APP_CAMERA_SENSOR_HEIGHT);
+#else
+        downsample_gray_2x((const uint8_t *)s_dvp_ctx.captured_buffer, copy,
+                           APP_CAMERA_SENSOR_WIDTH, APP_CAMERA_SENSOR_HEIGHT);
+#endif
+        int64_t t_ds1 = esp_timer_get_time();
+        ESP_LOGI(TAG, "[TIMING] downsample %ux%u -> %ux%u : %lld us",
+                 (unsigned)APP_CAMERA_SENSOR_WIDTH, (unsigned)APP_CAMERA_SENSOR_HEIGHT,
+                 (unsigned)APP_IMAGE_OUTPUT_WIDTH, (unsigned)APP_IMAGE_OUTPUT_HEIGHT,
+                 (long long)(t_ds1 - t_ds0));
 
         s_dvp_ctx.captured_buffer = nullptr;
 
         *out_data = copy;
-        *out_len = kFrameBytes;
-        *out_width = APP_CAMERA_SENSOR_WIDTH;
-        *out_height = APP_CAMERA_SENSOR_HEIGHT;
+        *out_len = kOutBytes;
+        *out_width = APP_IMAGE_OUTPUT_WIDTH;
+        *out_height = APP_IMAGE_OUTPUT_HEIGHT;
         *out_pixelformat = kOutputPixelformat;
         return ESP_OK;
     }

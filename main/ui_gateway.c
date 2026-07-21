@@ -1238,40 +1238,22 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
         s_link_rate = 0;
     }
 
-    /* Scale 640x480 → 320x240, then rotate 90° CW into 240x320 canvas (+ R↔B for BGR panel) */
+    /* Rotate decoded RGB565 90° CW into 240x320 canvas (+ R↔B swap for BGR panel).
+     * Node now sends 320x240, so no scaling needed — direct rotate from decode output. */
     if (s_img_canvas_buf && rgb565 && w > 0 && h > 0) {
-        const int16_t scale_w = 320;
-        const int16_t scale_h = 240;
-        esp_imgfx_scale_cfg_t scale_cfg = {
-            .in_res = { .width = (int16_t)w, .height = (int16_t)h },
-            .in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB565_LE,
-            .scale_res = { .width = scale_w, .height = scale_h },
-            .filter_type = ESP_IMGFX_SCALE_FILTER_TYPE_BILINEAR,
-        };
-        esp_imgfx_scale_handle_t scaler = NULL;
-        esp_imgfx_err_t ret = esp_imgfx_scale_open(&scale_cfg, &scaler);
-        if (ret == ESP_IMGFX_ERR_OK && scaler) {
-            uint32_t out_size = scale_w * scale_h * 2;
-            uint8_t *scale_buf = heap_caps_malloc(out_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (scale_buf) {
-                esp_imgfx_data_t in_img = { .data = (uint8_t *)rgb565, .data_len = w * h * 2 };
-                esp_imgfx_data_t out_img = { .data = scale_buf, .data_len = out_size };
-                ret = esp_imgfx_scale_process(scaler, &in_img, &out_img);
-                if (ret == ESP_IMGFX_ERR_OK) {
-                    const uint16_t *src = (const uint16_t *)scale_buf;
-                    for (int out_y = 0; out_y < IMG_H; out_y++) {
-                        for (int out_x = 0; out_x < IMG_W; out_x++) {
-                            uint16_t px = src[(scale_h - 1 - out_x) * scale_w + out_y];
-                            uint16_t r = (px >> 11) & 0x1F;
-                            uint16_t g = (px >> 5) & 0x3F;
-                            uint16_t b = px & 0x1F;
-                            s_img_canvas_buf[out_y * IMG_W + out_x].full = (b << 11) | (g << 5) | r;
-                        }
-                    }
+        const uint16_t *src = rgb565;
+        // Expect 320x240 input; if dimension mismatch just skip to avoid out-of-bounds.
+        if (w == 320 && h == 240) {
+            for (int out_y = 0; out_y < IMG_H; out_y++) {
+                for (int out_x = 0; out_x < IMG_W; out_x++) {
+                    // Rotate 90° CW: output[out_y, out_x] = input[239 - out_x, out_y]
+                    uint16_t px = src[(239 - out_x) * 320 + out_y];
+                    uint16_t r = (px >> 11) & 0x1F;
+                    uint16_t g = (px >> 5) & 0x3F;
+                    uint16_t b = px & 0x1F;
+                    s_img_canvas_buf[out_y * IMG_W + out_x].full = (b << 11) | (g << 5) | r;
                 }
-                heap_caps_free(scale_buf);
             }
-            esp_imgfx_scale_close(scaler);
         }
         s_has_image = true;
     }

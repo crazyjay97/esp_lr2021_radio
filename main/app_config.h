@@ -62,7 +62,7 @@
 /* ----- FLRC radio link ------------------------------------------------------- */
 
 /* Center frequency. Confirm the exact channel is legal for the deployment area. */
-#define APP_FLRC_FREQUENCY_HZ           903000000UL
+#define APP_FLRC_FREQUENCY_HZ           915120000UL
 
 /* LR2021 FLRC high-rate mode requested for this project. */
 #define APP_FLRC_BITRATE_BPS            2600000UL
@@ -236,7 +236,7 @@
 
 /* ----- Image transfer over FLRC ------------------------------------------ */
 
-#define APP_IMAGE_JPEG_QUALITY          90
+#define APP_IMAGE_JPEG_QUALITY          60
 #define APP_IMAGE_FRAGMENT_DATA_SIZE    (APP_FLRC_MAX_PAYLOAD_BYTES - 16U)
 #define APP_IMAGE_TX_INTER_PACKET_US    0U
 #define APP_IMAGE_RX_TIMEOUT_MS         3000U
@@ -305,10 +305,18 @@
 /* LCD_CAM DVP PCLK sampling edge. 0 = rising, 1 = falling. */
 #define APP_CAMERA_DVP_PCLK_INVERT      0
 
-/* VGA 640x480 from DVP. */
+/* VGA 640x480 from DVP. The sensor always outputs this native resolution; the
+ * DVP controller and DMA capture buffers are sized to it and must not shrink. */
 #define APP_CAMERA_SENSOR_WIDTH         640U
 #define APP_CAMERA_SENSOR_HEIGHT        480U
 #define APP_CAMERA_FRAME_BYTES          (APP_CAMERA_SENSOR_WIDTH * APP_CAMERA_SENSOR_HEIGHT * (APP_CAMERA_COLOR_ENABLE ? 2U : 1U))
+
+/* Downsampled output fed to the JPEG encoder / radio. The captured 640x480
+ * YUV422 frame is 2x-decimated to this size in capture_frame() to preserve the
+ * full field of view (a sensor register crop would only take the center). */
+#define APP_IMAGE_OUTPUT_WIDTH          320U
+#define APP_IMAGE_OUTPUT_HEIGHT         240U
+#define APP_IMAGE_OUTPUT_BYTES          (APP_IMAGE_OUTPUT_WIDTH * APP_IMAGE_OUTPUT_HEIGHT * (APP_CAMERA_COLOR_ENABLE ? 2U : 1U))
 
 /* DMA buffer configuration for DVP capture. */
 #define APP_CAMERA_DVP_DMA_WINDOW_BYTES (16U * 1024U)
