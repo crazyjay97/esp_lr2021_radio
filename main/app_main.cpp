@@ -9,6 +9,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
@@ -418,6 +419,128 @@ struct ImageCaptureCtx {
     uint16_t session_id;
 };
 
+// --- Frame prefetch (pipelining) --------------------------------------------
+// The gateway drives the stream serially: it only requests frame N+1 after it
+// has fully received frame N. On the node the per-frame work is
+// capture+downsample+JPEG (~100ms, CPU) followed by the radio push (~140ms,
+// SPI + airtime) — done back to back that is ~240ms/frame. But the two use
+// independent hardware (LCD_CAM/DMA vs the radio SPI) and, since the TX wait now
+// blocks (layer 2), the CPU is idle during most of the push. So while frame N is
+// being transmitted we pre-capture+encode frame N+1 into this cache. When the
+// next ImageCmd arrives we send the cached blob immediately, moving the ~100ms
+// prep off the per-frame critical path. Video-only: an opus clip must be
+// snapshotted at the capture instant, so prefetch is skipped when audio clips
+// are enabled (default off) and that path stays fully serial.
+static SemaphoreHandle_t g_prefetch_mutex = nullptr;
+static uint8_t *g_prefetch_jpeg = nullptr;   // heap_caps blob, owned by cache
+static size_t g_prefetch_jpeg_len = 0;
+static uint32_t g_prefetch_ready_ms = 0;     // esp_log_timestamp() when produced
+// A prefetched frame older than this is stale (stream stopped / manual capture
+// gap): discard it and capture fresh so we never send a second-old image.
+#define APP_PREFETCH_MAX_AGE_MS 800U
+
+static void prefetch_cache_init()
+{
+    if (!g_prefetch_mutex) {
+        g_prefetch_mutex = xSemaphoreCreateMutex();
+    }
+}
+
+// Drop any cached prefetch blob. Caller must NOT hold g_prefetch_mutex.
+static void prefetch_discard()
+{
+    if (!g_prefetch_mutex) return;
+    xSemaphoreTake(g_prefetch_mutex, portMAX_DELAY);
+    if (g_prefetch_jpeg) {
+        heap_caps_free(g_prefetch_jpeg);
+        g_prefetch_jpeg = nullptr;
+        g_prefetch_jpeg_len = 0;
+        g_prefetch_ready_ms = 0;
+    }
+    xSemaphoreGive(g_prefetch_mutex);
+}
+
+// Capture one frame and JPEG-encode it into a freshly heap_caps-allocated blob.
+// Returns the blob (caller owns / frees) or nullptr on any failure. Assumes the
+// camera is powered and the LCD is already released (true inside the capture
+// task; the camera node has no LCD anyway). Video-only — no opus. Used by both
+// the cold path (no prefetch available) and the prefetch producer.
+static uint8_t *prepare_jpeg_blob(size_t *out_len)
+{
+    *out_len = 0;
+    uint8_t *frame = nullptr;
+    size_t len = 0;
+    uint32_t width = 0, height = 0, pixfmt = 0;
+    esp_err_t capture_e = g_camera_uart.capture_frame(&frame, &len, &width, &height, &pixfmt);
+    if (capture_e != ESP_OK || !frame) {
+        return nullptr;
+    }
+    uint8_t *jpeg = nullptr;
+    size_t jpeg_len = 0;
+    esp_err_t e = g_radio.image_xfer().encode_frame(frame, len, width, height, pixfmt,
+                                                    &jpeg, &jpeg_len);
+    heap_caps_free(frame);
+    if (e != ESP_OK || !jpeg) {
+        return nullptr;
+    }
+    *out_len = jpeg_len;
+    return jpeg;
+}
+
+// Producer: called from the TX-wait loop while the radio is pushing the current
+// frame. Captures+encodes the next frame and stashes it in the cache. Runs at
+// most once per capture task (guarded by the caller). Skipped if a prefetch is
+// already cached.
+static void prefetch_produce()
+{
+    if (!g_prefetch_mutex) return;
+    // Already have one cached? Don't stack.
+    xSemaphoreTake(g_prefetch_mutex, portMAX_DELAY);
+    bool have = (g_prefetch_jpeg != nullptr);
+    xSemaphoreGive(g_prefetch_mutex);
+    if (have) return;
+
+    size_t jpeg_len = 0;
+    uint8_t *jpeg = prepare_jpeg_blob(&jpeg_len);
+    if (!jpeg) return;
+
+    xSemaphoreTake(g_prefetch_mutex, portMAX_DELAY);
+    if (g_prefetch_jpeg) {
+        // Raced with another producer (shouldn't happen — single capture task) —
+        // keep the existing one, drop ours.
+        heap_caps_free(jpeg);
+    } else {
+        g_prefetch_jpeg = jpeg;
+        g_prefetch_jpeg_len = jpeg_len;
+        g_prefetch_ready_ms = static_cast<uint32_t>(esp_log_timestamp());
+    }
+    xSemaphoreGive(g_prefetch_mutex);
+}
+
+// Consumer: try to take a fresh cached prefetch blob. Returns the blob (caller
+// owns / frees) or nullptr if none / stale. On success *out_len is set.
+static uint8_t *prefetch_take(size_t *out_len)
+{
+    *out_len = 0;
+    if (!g_prefetch_mutex) return nullptr;
+    xSemaphoreTake(g_prefetch_mutex, portMAX_DELAY);
+    uint8_t *blob = nullptr;
+    if (g_prefetch_jpeg) {
+        uint32_t age = static_cast<uint32_t>(esp_log_timestamp()) - g_prefetch_ready_ms;
+        if (age <= APP_PREFETCH_MAX_AGE_MS) {
+            blob = g_prefetch_jpeg;
+            *out_len = g_prefetch_jpeg_len;
+        } else {
+            heap_caps_free(g_prefetch_jpeg);  // stale, drop
+        }
+        g_prefetch_jpeg = nullptr;
+        g_prefetch_jpeg_len = 0;
+        g_prefetch_ready_ms = 0;
+    }
+    xSemaphoreGive(g_prefetch_mutex);
+    return blob;
+}
+
 void image_capture_task(void *arg)
 {
     auto *ctx = static_cast<ImageCaptureCtx *>(arg);
@@ -460,6 +583,7 @@ void image_capture_task(void *arg)
 #endif
 
     esp_err_t e = ESP_OK;
+    (void)e;
 #if APP_CAMERA_NODE_LCD_ENABLE
     e = bsp_lcd_release_for_camera();
     if (e != ESP_OK) {
@@ -477,61 +601,76 @@ void image_capture_task(void *arg)
     }
 #endif
 
-    uint32_t t_cam_start = static_cast<uint32_t>(esp_log_timestamp());
-    ESP_LOGI(TAG, "[TIMING] camera init start +%lums", static_cast<unsigned long>(t_cam_start - t_cmd));
-
-    esp_err_t capture_e = g_camera_uart.capture_frame(&frame, &len, &width, &height, &pixfmt);
-
-    uint32_t t_cam_done = static_cast<uint32_t>(esp_log_timestamp());
-    ESP_LOGI(TAG, "[TIMING] capture done +%lums (camera=%lums) %lux%lu %u bytes",
-             static_cast<unsigned long>(t_cam_done - t_cmd),
-             static_cast<unsigned long>(t_cam_done - t_cam_start),
-             static_cast<unsigned long>(width),
-             static_cast<unsigned long>(height),
-             static_cast<unsigned>(len));
-
-    // LCD reinit and audio resume deferred until after transmission
-
-    if (capture_e != ESP_OK || !frame) {
-#if APP_CAMERA_NODE_LCD_ENABLE
-        bsp_lcd_reinit_after_camera();
-#endif
-#if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
-        bsp_audio_resume();
-#endif
-        bsp_lcd_set_camera_status("Capture failed");
-        heap_caps_free(opus_buf);
-        g_radio.resume_audio_capture();
-        g_capture_busy = false;
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    // JPEG encode
+    // JPEG blob for this frame. Fast path: a prefetched frame produced during
+    // the previous frame's TX is ready (video-only stream) — use it and skip
+    // capture+encode entirely, moving that ~100ms off the per-frame critical
+    // path. Cold path (first frame, audio clips enabled, or stale prefetch):
+    // capture + encode now, as before.
     uint8_t *jpeg = nullptr;
     size_t jpeg_len = 0;
-    uint32_t t_jpeg_start = static_cast<uint32_t>(esp_log_timestamp());
-    e = g_radio.image_xfer().encode_frame(frame, len, width, height, pixfmt, &jpeg, &jpeg_len);
-    heap_caps_free(frame);
-    uint32_t t_jpeg_done = static_cast<uint32_t>(esp_log_timestamp());
-    ESP_LOGI(TAG, "[TIMING] JPEG done +%lums (jpeg=%lums) %u bytes",
-             static_cast<unsigned long>(t_jpeg_done - t_cmd),
-             static_cast<unsigned long>(t_jpeg_done - t_jpeg_start),
-             static_cast<unsigned>(jpeg_len));
+    uint32_t t_jpeg_done;
+    if (!g_audio_clip_enabled) {
+        jpeg = prefetch_take(&jpeg_len);
+    }
+    if (jpeg) {
+        t_jpeg_done = static_cast<uint32_t>(esp_log_timestamp());
+        ESP_LOGI(TAG, "[TIMING] prefetch hit +%lums (jpeg=%u bytes)",
+                 static_cast<unsigned long>(t_jpeg_done - t_cmd),
+                 static_cast<unsigned>(jpeg_len));
+    } else {
+        uint32_t t_cam_start = static_cast<uint32_t>(esp_log_timestamp());
+        ESP_LOGI(TAG, "[TIMING] camera init start +%lums", static_cast<unsigned long>(t_cam_start - t_cmd));
 
-    if (e != ESP_OK || !jpeg) {
+        esp_err_t capture_e = g_camera_uart.capture_frame(&frame, &len, &width, &height, &pixfmt);
+
+        uint32_t t_cam_done = static_cast<uint32_t>(esp_log_timestamp());
+        ESP_LOGI(TAG, "[TIMING] capture done +%lums (camera=%lums) %lux%lu %u bytes",
+                 static_cast<unsigned long>(t_cam_done - t_cmd),
+                 static_cast<unsigned long>(t_cam_done - t_cam_start),
+                 static_cast<unsigned long>(width),
+                 static_cast<unsigned long>(height),
+                 static_cast<unsigned>(len));
+
+        // LCD reinit and audio resume deferred until after transmission
+        if (capture_e != ESP_OK || !frame) {
 #if APP_CAMERA_NODE_LCD_ENABLE
-        bsp_lcd_reinit_after_camera();
+            bsp_lcd_reinit_after_camera();
 #endif
 #if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
-        bsp_audio_resume();
+            bsp_audio_resume();
 #endif
-        bsp_lcd_set_camera_status("JPEG encode failed");
-        heap_caps_free(opus_buf);
-        g_radio.resume_audio_capture();
-        g_capture_busy = false;
-        vTaskDelete(nullptr);
-        return;
+            bsp_lcd_set_camera_status("Capture failed");
+            heap_caps_free(opus_buf);
+            g_radio.resume_audio_capture();
+            g_capture_busy = false;
+            vTaskDelete(nullptr);
+            return;
+        }
+
+        // JPEG encode
+        uint32_t t_jpeg_start = static_cast<uint32_t>(esp_log_timestamp());
+        e = g_radio.image_xfer().encode_frame(frame, len, width, height, pixfmt, &jpeg, &jpeg_len);
+        heap_caps_free(frame);
+        t_jpeg_done = static_cast<uint32_t>(esp_log_timestamp());
+        ESP_LOGI(TAG, "[TIMING] JPEG done +%lums (jpeg=%lums) %u bytes",
+                 static_cast<unsigned long>(t_jpeg_done - t_cmd),
+                 static_cast<unsigned long>(t_jpeg_done - t_jpeg_start),
+                 static_cast<unsigned>(jpeg_len));
+
+        if (e != ESP_OK || !jpeg) {
+#if APP_CAMERA_NODE_LCD_ENABLE
+            bsp_lcd_reinit_after_camera();
+#endif
+#if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
+            bsp_audio_resume();
+#endif
+            bsp_lcd_set_camera_status("JPEG encode failed");
+            heap_caps_free(opus_buf);
+            g_radio.resume_audio_capture();
+            g_capture_busy = false;
+            vTaskDelete(nullptr);
+            return;
+        }
     }
 
     // --- Build blob: [4-byte jpeg_len][jpeg][opus] and send once ---
@@ -581,6 +720,19 @@ void image_capture_task(void *arg)
              static_cast<unsigned>(jpeg_len), static_cast<unsigned>(opus_len));
 
     g_radio.send_image(blob, blob_len, tx_session);
+
+    // Pipeline: the radio is now pushing this frame on the img_tx task (~140ms,
+    // SPI + airtime) with the CPU otherwise idle (layer-2 blocking TX wait). Use
+    // that window to pre-capture+encode the NEXT frame into the prefetch cache so
+    // the next ImageCmd can send it immediately. Camera (LCD_CAM/DMA) and radio
+    // (SPI) are independent buses, and img_tx runs one priority above this task,
+    // so a TX_DONE wakeup preempts the encode and the burst never stalls. Skipped
+    // when audio clips are on (opus must be snapshotted at the capture instant).
+    // A prefetch that no next-frame request consumes is dropped by the staleness
+    // guard in prefetch_take, so a single/auto capture only costs one idle encode.
+    if (!g_audio_clip_enabled) {
+        prefetch_produce();
+    }
 
     // Ownership of `blob` has been handed to send_image / image_tx_task, which
     // frees it when the transfer finishes or aborts. Do NOT free it here: the
@@ -1242,6 +1394,7 @@ void on_button(bsp_btn_id_t id, bool pressed, void *user)
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "Lierda L-LRMAM36-FANN4-DK01 booting");
+    prefetch_cache_init();
     esp_log_level_set("RALF_LR20XX", ESP_LOG_WARN);
     // Suppress noisy but harmless HTTP server warnings: /favicon.ico 404s
     // (browser auto-requests it) and recv errno 104 (client closed connection).
