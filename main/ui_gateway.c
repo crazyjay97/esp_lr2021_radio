@@ -111,6 +111,14 @@ static lv_obj_t *s_img_link_lbl = NULL;
 static lv_obj_t *s_img_status_lbl = NULL;
 static bool s_has_image = false;
 
+/* Continuous video stream state. When the user starts a capture we enter stream
+ * mode: the FIRST frame shows the RX progress page as before; once it displays,
+ * every subsequent frame skips the RX page and just refreshes the image canvas
+ * in place, and app_main auto-requests the next frame. Cleared when the user
+ * leaves the image page (which also aborts the in-flight RX). */
+static bool s_stream_mode = false;
+static bool s_stream_first_shown = false;
+
 /* PAGE_RX objects */
 static lv_obj_t *s_rx_pct_lbl = NULL;
 static lv_obj_t *s_rx_bar = NULL;
@@ -1011,6 +1019,23 @@ static void show_page(ui_page_t page)
     }
 }
 
+/* End the video stream: stop auto-requesting frames and abort any in-flight RX.
+ * Safe to call when no stream is active. */
+static void stream_stop(void)
+{
+    bool was_streaming = s_stream_mode;
+    s_stream_mode = false;
+    s_stream_first_shown = false;
+    if (was_streaming && s_rx_abort_cb) {
+        s_rx_abort_cb();
+    }
+}
+
+bool ui_gw_stream_active(void)
+{
+    return s_stream_mode;
+}
+
 /* ─── Swipe gesture ─── */
 static const ui_page_t s_swipe_order[] = {UI_PAGE_IMAGE, UI_PAGE_LINK, UI_PAGE_CONFIG};
 #define SWIPE_PAGE_COUNT 3
@@ -1035,6 +1060,10 @@ static void gesture_cb(lv_event_t *e)
         next = (cur + SWIPE_PAGE_COUNT - 1) % SWIPE_PAGE_COUNT;
     }
 
+    /* Swiping off the image page ends the video stream. */
+    if (s_swipe_order[next] != UI_PAGE_IMAGE) {
+        stream_stop();
+    }
     show_page(s_swipe_order[next]);
 }
 
@@ -1120,8 +1149,12 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
 
     if (key == BSP_BTN_VOL_DN) {
-        /* K3 = Capture (works from any page) */
+        /* K3 = Capture: start a continuous video stream. Frame 1 uses the RX
+         * progress page; later frames refresh in place (see ui_gw_rx_begin /
+         * ui_gw_rx_complete). */
         if (s_capture_cb) {
+            s_stream_mode = true;
+            s_stream_first_shown = false;
             if (s_page != UI_PAGE_RX) {
                 show_page(UI_PAGE_RX);
             }
@@ -1133,15 +1166,15 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
         }
     } else if (key == BSP_BTN_VOL_UP) {
         /* K4 = Link page */
-        if (s_page == UI_PAGE_RX && s_rx_abort_cb) s_rx_abort_cb();
+        stream_stop();
         show_page(UI_PAGE_LINK);
     } else if (key == BSP_BTN_USER1) {
         /* K5 = Config page */
-        if (s_page == UI_PAGE_RX && s_rx_abort_cb) s_rx_abort_cb();
+        stream_stop();
         show_page(UI_PAGE_CONFIG);
     } else if (key == BSP_BTN_PTT) {
         /* K6 = Image page */
-        if (s_page == UI_PAGE_RX && s_rx_abort_cb) s_rx_abort_cb();
+        stream_stop();
         show_page(UI_PAGE_IMAGE);
     }
 
@@ -1161,6 +1194,14 @@ void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags)
     s_stats_first_missing = 0;
     s_stats_total_retransmitted = 0;
     s_stats_first_eot_seen = false;
+
+    // Stream mode after the first frame: don't switch to the RX progress page,
+    // keep the live image on screen and let it refresh in place. Progress
+    // updates (ui_gw_rx_progress) already no-op unless we're on the RX page.
+    if (s_stream_mode && s_stream_first_shown) {
+        xSemaphoreGiveRecursive(s_lock);
+        return;
+    }
 
     if (s_page != UI_PAGE_RX) {
         show_page(UI_PAGE_RX);
@@ -1258,7 +1299,16 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
         s_has_image = true;
     }
 
-    show_page(UI_PAGE_IMAGE);
+    // If already showing the image page with a live canvas (stream frames 2+),
+    // just repaint the canvas in place — rebuilding the whole page every frame
+    // flickers and is slow. Otherwise build the image page (first frame / after
+    // being on another page).
+    if (s_page == UI_PAGE_IMAGE && s_img_canvas) {
+        lv_obj_invalidate(s_img_canvas);
+    } else {
+        show_page(UI_PAGE_IMAGE);
+    }
+    s_stream_first_shown = true;
 
     xSemaphoreGiveRecursive(s_lock);
 }

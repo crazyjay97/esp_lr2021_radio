@@ -41,6 +41,10 @@ void ui_gw_rx_failed(const char *reason);
 
 void ui_gw_rx_eot_nack(uint16_t missing_count, bool is_first_eot);
 
+/* True while a continuous video stream is running (user pressed capture and has
+ * not left the image page). app_main uses this to auto-request the next frame. */
+bool ui_gw_stream_active(void);
+
 void ui_gw_set_capture_cb(ui_gw_capture_cb_t cb);
 void ui_gw_set_interval_cb(ui_gw_interval_cb_t cb);
 void ui_gw_set_audio_clip_cb(ui_gw_audio_clip_cb_t cb);

@@ -278,6 +278,11 @@
 #define APP_IMAGE_TASK_PRIORITY         3
 #define APP_IMAGE_TASK_CORE             1
 
+/* Continuous video stream: after a frame finishes displaying, wait this long
+ * before auto-requesting the next one. Small gap lets the half-duplex radio
+ * settle and the UI repaint; 0 = request immediately. Tune for frame rate. */
+#define APP_STREAM_NEXT_FRAME_DELAY_MS  30U
+
 /* ----- Camera node LCD (set 0 to skip LCD release/reinit for faster capture) */
 #define APP_CAMERA_NODE_LCD_ENABLE      0
 

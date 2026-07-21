@@ -65,6 +65,11 @@ bool g_ptt_held_long = false;
 esp_timer_handle_t g_cooldown_retry_timer = nullptr;
 esp_timer_handle_t g_ptt_timer = nullptr;
 
+// Continuous video stream: one-shot timer that fires the next capture request a
+// short delay after a frame finishes, so the re-trigger runs off the radio task
+// (not re-entrant inside the rx-complete callback).
+esp_timer_handle_t g_stream_next_timer = nullptr;
+
 const char *mode_name(AppMode mode)
 {
     return mode == AppMode::radio ? "radio" : "camera";
@@ -165,6 +170,7 @@ uint8_t load_config_u8(const char *key, uint8_t def)
 }
 
 void on_image_capture_request(uint16_t session_id);
+void stream_next_frame_cb(void *arg);
 
 void auto_capture_timer_cb(void *arg)
 {
@@ -834,6 +840,25 @@ void on_image_rx_complete(ImageTransfer *xfer)
 
     heap_caps_free(raw);
     xfer->rx_reset();
+
+    // Continuous video stream: if the gateway UI is still streaming, auto-request
+    // the next frame after a short delay. Scheduled on a one-shot timer so the
+    // new request runs off the radio task instead of re-entering it here.
+    if (g_app_mode == AppMode::radio && ui_gw_stream_active()) {
+        if (!g_stream_next_timer) {
+            const esp_timer_create_args_t args = {
+                .callback = stream_next_frame_cb,
+                .arg = nullptr,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "stream_next",
+                .skip_unhandled_events = true,
+            };
+            esp_timer_create(&args, &g_stream_next_timer);
+        }
+        esp_timer_stop(g_stream_next_timer);
+        esp_timer_start_once(g_stream_next_timer,
+                             (uint64_t)APP_STREAM_NEXT_FRAME_DELAY_MS * 1000);
+    }
 }
 
 void camera_capture_task(void *arg)
@@ -993,6 +1018,19 @@ void cooldown_retry_cb(void *arg)
 {
     ESP_LOGI(TAG, "Cooldown expired, auto-triggering capture");
     s_last_gw_capture_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    image_store_abort_transfer();
+    g_radio.trigger_image_capture();
+}
+
+// Continuous video stream: request the next frame. Runs in the esp_timer task,
+// scheduled by on_image_rx_complete. Re-checks ui_gw_stream_active() so a stream
+// the user just stopped (left the image page) does not fire one extra request.
+void stream_next_frame_cb(void *arg)
+{
+    (void)arg;
+    if (g_app_mode != AppMode::radio) return;
+    if (!ui_gw_stream_active()) return;
+    ESP_LOGI(TAG, "stream: request next frame");
     image_store_abort_transfer();
     g_radio.trigger_image_capture();
 }
