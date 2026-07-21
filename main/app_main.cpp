@@ -587,6 +587,11 @@ void image_capture_task(void *arg)
     // tx task may still be reading it (its own handshake budget is up to 30s,
     // which used to race this wait and cause a use-after-free). We wait only to
     // sequence the post-tx cleanup after TX, not to govern the buffer lifetime.
+    // Poll at a fine granularity: this wait sits in the per-frame critical path,
+    // so a coarse poll adds dead time between the real TX finishing and this task
+    // clearing g_capture_busy (which also widens the window where the next
+    // ImageCmd lands while still "busy"). 5ms keeps the [TIMING] tx= number
+    // honest and lets the next frame start almost immediately after TX.
     bool tx_done = false;
     uint32_t wait_start = xTaskGetTickCount();
     while (xTaskGetTickCount() - wait_start < pdMS_TO_TICKS(30000)) {
@@ -594,7 +599,7 @@ void image_capture_task(void *arg)
             tx_done = true;
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 
     uint32_t t_tx_done = static_cast<uint32_t>(esp_log_timestamp());
