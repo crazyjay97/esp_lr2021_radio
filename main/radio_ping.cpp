@@ -161,7 +161,11 @@ esp_err_t RadioPing::init()
     ral_status_t status = ral_reset(&radio_.ral);
     if (status == RAL_STATUS_OK) status = ral_init(&radio_.ral);
     if (status == RAL_STATUS_OK) {
-        status = ral_set_rx_tx_fallback_mode(&radio_.ral, RAL_FALLBACK_STDBY_XOSC);
+        // Land in FS (frequency synthesis) after every TX/RX instead of dropping
+        // to standby. The image push sends dozens of packets back-to-back; from
+        // FS the next set_tx skips the PLL re-lock/ramp that a standby fallback
+        // would repeat per packet, cutting per-packet turnaround in the burst.
+        status = ral_set_rx_tx_fallback_mode(&radio_.ral, RAL_FALLBACK_FS);
     }
     if (status == RAL_STATUS_OK) status = ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
     if (status == RAL_STATUS_OK && !configure_flrc()) status = RAL_STATUS_ERROR;
@@ -211,7 +215,11 @@ esp_err_t RadioPing::init_gateway()
     ral_status_t status = ral_reset(&radio_.ral);
     if (status == RAL_STATUS_OK) status = ral_init(&radio_.ral);
     if (status == RAL_STATUS_OK) {
-        status = ral_set_rx_tx_fallback_mode(&radio_.ral, RAL_FALLBACK_STDBY_XOSC);
+        // Land in FS (frequency synthesis) after every TX/RX instead of dropping
+        // to standby. The image push sends dozens of packets back-to-back; from
+        // FS the next set_tx skips the PLL re-lock/ramp that a standby fallback
+        // would repeat per packet, cutting per-packet turnaround in the burst.
+        status = ral_set_rx_tx_fallback_mode(&radio_.ral, RAL_FALLBACK_FS);
     }
     if (status == RAL_STATUS_OK) status = ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
     if (status == RAL_STATUS_OK && !configure_flrc()) status = RAL_STATUS_ERROR;
