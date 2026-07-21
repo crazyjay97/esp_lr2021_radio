@@ -918,9 +918,16 @@ void play_audio_clip(const uint8_t *opus_packed, size_t total_len)
 
 void on_image_rx_complete(ImageTransfer *xfer)
 {
-    ESP_LOGI(TAG, "on_image_rx_complete: xfer=%p complete=%d",
-             xfer, xfer ? xfer->rx_complete() : -1);
     if (!xfer || !xfer->rx_complete()) return;
+
+    // Per-frame consumption timing (gateway side). The node cannot push faster
+    // than the gateway can decode + rotate + flush to the LCD + persist; this
+    // breakdown measures that ceiling so the stream cadence (and any future node
+    // self-push flow control) can be sized against it. period = wall-clock gap
+    // between consecutive completed frames = the real end-to-end frame rate.
+    uint32_t t_rx = static_cast<uint32_t>(esp_log_timestamp());
+    uint32_t t_decode_ms = 0, t_display_ms = 0, t_save_ms = 0;
+    static uint32_t s_last_frame_ms = 0;
 
     if (g_audio_clip_enabled) {
         s_last_gw_capture_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -956,11 +963,6 @@ void on_image_rx_complete(ImageTransfer *xfer)
             opus_len = raw_len - 4 - jlen;
         }
     }
-    ESP_LOGI(TAG, "transfer received: %u bytes (jpeg=%u opus=%u)",
-             static_cast<unsigned>(raw_len),
-             static_cast<unsigned>(jpeg_len),
-             static_cast<unsigned>(opus_len));
-
     // Decode and display JPEG
     jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
     dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
@@ -980,16 +982,23 @@ void on_image_rx_complete(ImageTransfer *xfer)
             if (rgb565) {
                 io.outbuf = rgb565;
                 jerr = jpeg_dec_process(decoder, &io);
+                t_decode_ms = static_cast<uint32_t>(esp_log_timestamp()) - t_rx;
                 if (jerr == JPEG_ERR_OK) {
                     uint32_t w = header.width;
                     uint32_t h = header.height;
+                    uint32_t t_disp0 = static_cast<uint32_t>(esp_log_timestamp());
                     if (g_app_mode == AppMode::radio) {
+                        // Synchronous cost only: rotate into the canvas + mark
+                        // dirty. The actual LCD flush happens asynchronously on
+                        // the LVGL task (core 1), overlapping the next frame's
+                        // transfer, so it is NOT included in t_display_ms.
                         ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565), w, h,
                                           static_cast<uint32_t>(raw_len), g_radio.last_transfer_ms());
                     } else {
                         bsp_lcd_show_rgb565_photo(reinterpret_cast<const uint16_t *>(rgb565), w, h);
                         bsp_lcd_set_camera_status("Photo received");
                     }
+                    t_display_ms = static_cast<uint32_t>(esp_log_timestamp()) - t_disp0;
                 }
                 jpeg_free_align(rgb565);
             }
@@ -998,7 +1007,9 @@ void on_image_rx_complete(ImageTransfer *xfer)
     }
 
     // Save to image store for HTTP gallery
+    uint32_t t_save0 = static_cast<uint32_t>(esp_log_timestamp());
     image_store_save(jpeg_data, jpeg_len, opus_data, opus_len, sid);
+    t_save_ms = static_cast<uint32_t>(esp_log_timestamp()) - t_save0;
 
     // Play audio if present
     if (opus_data && opus_len > 0) {
@@ -1007,6 +1018,23 @@ void on_image_rx_complete(ImageTransfer *xfer)
 
     heap_caps_free(raw);
     xfer->rx_reset();
+
+    // One line per frame: radio transfer (airtime + handshake, from the node's
+    // ImageStart to last fragment) vs gateway consume (decode + display + save),
+    // and the wall-clock period between frames = the real achieved fps.
+    uint32_t transfer_ms = g_radio.last_transfer_ms();
+    uint32_t now_ms = static_cast<uint32_t>(esp_log_timestamp());
+    uint32_t period_ms = (s_last_frame_ms != 0) ? (now_ms - s_last_frame_ms) : 0;
+    s_last_frame_ms = now_ms;
+    uint32_t consume_ms = t_decode_ms + t_display_ms + t_save_ms;
+    if (period_ms > 0) {
+        ESP_LOGI(TAG, "[FRAME] period=%lums (%lu.%lu fps) | transfer=%lums consume=%lums "
+                      "(decode=%lu display=%lu save=%lu)",
+                 (unsigned long)period_ms,
+                 (unsigned long)(1000 / period_ms), (unsigned long)((10000 / period_ms) % 10),
+                 (unsigned long)transfer_ms, (unsigned long)consume_ms,
+                 (unsigned long)t_decode_ms, (unsigned long)t_display_ms, (unsigned long)t_save_ms);
+    }
 
     // Continuous video stream: if the gateway UI is still streaming, auto-request
     // the next frame after a short delay. Scheduled on a one-shot timer so the

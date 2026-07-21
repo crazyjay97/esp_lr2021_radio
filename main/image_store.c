@@ -331,7 +331,7 @@ esp_err_t image_store_save(const uint8_t *jpeg, size_t jpeg_len,
     s_head = (s_head + 1) % IMAGE_STORE_MAX_SLOTS;
     if (s_count < IMAGE_STORE_MAX_SLOTS) s_count++;
 
-    ESP_LOGI(TAG, "saved image #%d: jpeg=%u opus=%u total_used=%uKB",
+    ESP_LOGD(TAG, "saved image #%d: jpeg=%u opus=%u total_used=%uKB",
              s_count, (unsigned)jpeg_len, (unsigned)opus_len,
              (unsigned)(s_total_bytes / 1024));
 

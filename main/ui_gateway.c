@@ -1308,6 +1308,12 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
     } else {
         show_page(UI_PAGE_IMAGE);
     }
+    /* Only mark dirty; the LVGL task flushes to the panel asynchronously on core
+     * 1. In the gateway-driven pull model this is deliberate: the paint overlaps
+     * the next frame's ~210ms transfer and finishes long before it arrives, so
+     * the display never gates the frame rate. Forcing a synchronous lv_refr_now
+     * here would push the flush onto the per-frame critical path and slow the
+     * stream for no benefit. */
     s_stream_first_shown = true;
 
     xSemaphoreGiveRecursive(s_lock);

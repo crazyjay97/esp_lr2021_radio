@@ -284,11 +284,23 @@
 // the precondition for overlapping next-frame encode with the current TX burst.
 // Stays below the voice tasks (5) so real-time audio is unaffected.
 #define APP_IMAGE_TX_TASK_PRIORITY      4
+// Pin the radio image-TX task to core 0 (the main radio task's core), away from
+// the image-capture/encode task on core 1. During a stream the capture task
+// pre-encodes the NEXT frame (downsample+JPEG, ~90ms of pure CPU) while img_tx
+// pushes the CURRENT frame packet-by-packet over SPI. The camera (LCD_CAM/DMA)
+// and radio (SPI) are independent buses, so splitting the two tasks across cores
+// makes them run in true parallel: otherwise they time-share core 1 and each
+// packet's SPI load fights the encode loop, inflating the burst (measured
+// tx ~140ms -> ~200ms). The main radio task on core 0 is quiescent (blocked on
+// its notify wait / suspended_) throughout the transfer, so img_tx does not
+// starve it. All radio SPI is already serialized by the HAL API mutex, so
+// co-locating img_tx with the main radio task on core 0 adds no new race.
+#define APP_IMAGE_TX_TASK_CORE          0
 
 /* Continuous video stream: after a frame finishes displaying, wait this long
  * before auto-requesting the next one. Small gap lets the half-duplex radio
  * settle and the UI repaint; 0 = request immediately. Tune for frame rate. */
-#define APP_STREAM_NEXT_FRAME_DELAY_MS  30U
+#define APP_STREAM_NEXT_FRAME_DELAY_MS  10U
 
 /* ----- Camera node LCD (set 0 to skip LCD release/reinit for faster capture) */
 #define APP_CAMERA_NODE_LCD_ENABLE      0

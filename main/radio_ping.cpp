@@ -288,7 +288,7 @@ esp_err_t RadioPing::start()
     ok = xTaskCreatePinnedToCore(image_tx_task_trampoline, "img_tx",
                                  APP_IMAGE_TASK_STACK_BYTES, this,
                                  APP_IMAGE_TX_TASK_PRIORITY, nullptr,
-                                 APP_IMAGE_TASK_CORE);
+                                 APP_IMAGE_TX_TASK_CORE);
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
@@ -1993,8 +1993,7 @@ void RadioPing::handle_image_eot()
         uint32_t total_ms = now_ms - image_cmd_sent_ms_;
         image_rx_transfer_ms_ = transfer_ms;
         image_rx_done_ms_ = now_ms;
-        ESP_LOGI(TAG, "RX complete: session=%u | prepare=%lums transfer=%lums total=%lums",
-                 session_id,
+        ESP_LOGI(TAG, "RX done | prepare=%lums transfer=%lums total=%lums",
                  static_cast<unsigned long>(prepare_ms),
                  static_cast<unsigned long>(transfer_ms),
                  static_cast<unsigned long>(total_ms));
