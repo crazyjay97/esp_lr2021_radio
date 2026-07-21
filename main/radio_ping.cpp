@@ -1496,7 +1496,7 @@ void RadioPing::image_tx_task()
                 break;
             }
             // Give R time to process last packets before sending EOT
-            vTaskDelay(pdMS_TO_TICKS(30));
+            vTaskDelay(pdMS_TO_TICKS(10));
 
             // Send EOT, retry if no response
             bool got_response = false;
