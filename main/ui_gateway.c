@@ -1184,7 +1184,13 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
 void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags)
 {
     if (!s_lock) return;
-    xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+    // Non-blocking lock: if LVGL is mid-flush, skip this update and let the
+    // next per-fragment progress call (ui_gw_rx_progress) catch up. This is
+    // called from the radio RX hot path (ImageStart handling); blocking here
+    // delays the ready-ACK and inflates prepare_ms when LVGL holds the lock.
+    if (xSemaphoreTakeRecursive(s_lock, 0) != pdTRUE) {
+        return;
+    }
 
     s_rx_total = total_frags;
     s_rx_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -1226,7 +1232,13 @@ void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags)
 void ui_gw_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
 {
     if (!s_lock || s_page != UI_PAGE_RX) return;
-    xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+    // Non-blocking lock: if LVGL is mid-flush, skip this progress update. The
+    // next fragment will retry, and the completion callback (ui_gw_rx_done)
+    // ensures the final state is shown. This is called from the radio RX path
+    // (per-fragment and completion); blocking here can delay NACK sends.
+    if (xSemaphoreTakeRecursive(s_lock, 0) != pdTRUE) {
+        return;
+    }
 
     s_rx_last_rssi = rssi;
     uint32_t pct = total > 0 ? (uint32_t)received * 100 / total : 0;

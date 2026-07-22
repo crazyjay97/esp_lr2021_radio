@@ -1834,13 +1834,15 @@ void RadioPing::handle_image_start(uint16_t len)
     image_rx_last_progress_ms_ = smtc_modem_hal_get_time_in_ms();
     image_rx_expected_crc32_ = expected_crc32;
 
-    // Update UI first (before sending ACK), so LVGL work finishes
-    // before node starts blasting data
-    if (image_rx_progress_cb_) {
-        image_rx_progress_cb_(0, total_frags, 0);
-    }
-
-    // Send ACK (ready) — missing_count=0 means "ready"
+    // Send the ready-ACK FIRST (missing_count=0 means "ready"). The node starts
+    // its data burst the instant it sees this, so prepare_ms is measured from
+    // here — nothing that can block (LVGL lock, etc.) may run before this send.
+    // The old code updated the UI first "so LVGL work finishes before the node
+    // blasts data", but ui_gw_rx_begin takes the LVGL render lock with
+    // portMAX_DELAY; when the LVGL task was mid-flush on the other core it
+    // stalled the radio task ~100ms and inflated prepare_ms (same failure mode
+    // as the vbat hot-path note above). Audio UI raised the flush rate and made
+    // it frequent again. Fix: ACK first, then re-arm RX, then best-effort UI.
     uint8_t pkt[kHeaderSize];
     std::memcpy(pkt, kMagic, sizeof(kMagic));
     pkt[4] = kPacketTypeImageNack;
@@ -1851,8 +1853,16 @@ void RadioPing::handle_image_start(uint16_t len)
     pkt[12] = 0; pkt[13] = 0;
     send_single_packet(pkt, kHeaderSize);
 
-    // Enter RX for incoming data
+    // Enter RX for incoming data immediately after the ACK, before any UI work,
+    // so we are listening before the node's first fragment can arrive.
     schedule_rx();
+
+    // Update UI last, off the critical path. The callback acquires the LVGL lock
+    // non-blocking (see ui_gw_rx_begin / ui_gw_rx_progress); if LVGL is mid-flush
+    // the update is skipped and the next per-fragment progress refresh catches up.
+    if (image_rx_progress_cb_) {
+        image_rx_progress_cb_(0, total_frags, 0);
+    }
 }
 
 void RadioPing::handle_image_data()
