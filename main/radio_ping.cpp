@@ -143,11 +143,7 @@ esp_err_t RadioPing::init()
         return ESP_ERR_NO_MEM;
     }
 
-    if (!audio_ringbuf_.init(APP_AUDIO_RINGBUF_SAMPLES)) {
-        ESP_LOGW(TAG, "audio ring buffer alloc failed (PSRAM?)");
-    }
-
-    size_t opus_ring_frames = APP_AUDIO_RINGBUF_SECONDS * 1000 / APP_AUDIO_FRAME_MS;
+    size_t opus_ring_frames = APP_OPUS_RING_SECONDS * 1000 / APP_AUDIO_FRAME_MS;
     if (!opus_ringbuf_.init(opus_ring_frames)) {
         ESP_LOGW(TAG, "opus ring buffer alloc failed (PSRAM?)");
     }
@@ -406,7 +402,15 @@ void RadioPing::task()
 void RadioPing::tx_task()
 {
     while (true) {
-        if (suspended_ || image_tx_active_) {
+        // NOTE: only `suspended_` gates the whole loop. image_tx_active_ is
+        // deliberately NOT gated here: mic sampling + Opus pre-encoding must keep
+        // running while an image is being captured/transmitted so the streaming
+        // drain() sees a continuous, gap-free audio timeline. This path touches
+        // no radio state (all ral_* / TX-queue access lives in task()/schedule_tx,
+        // a separate task) and only writes the SPSC opus ring, so it cannot race
+        // the radio core. Trigger DISPATCH is still gated on !image_tx_active_
+        // below, since firing a new capture mid-transfer is pointless.
+        if (suspended_) {
             vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
             continue;
         }
@@ -447,49 +451,9 @@ void RadioPing::tx_task()
             continue;
         }
 
-        audio_ringbuf_.write(tx_pcm_, APP_AUDIO_FRAME_SAMPLES);
-
-        if (sound_trigger_level_ > 0) {
-            int64_t sum_sq = 0;
-            for (size_t i = 0; i < APP_AUDIO_FRAME_SAMPLES; i++) {
-                int32_t s = tx_pcm_[i];
-                sum_sq += s * s;
-            }
-            uint16_t rms = (uint16_t)sqrtf((float)sum_sq / APP_AUDIO_FRAME_SAMPLES);
-            uint16_t thresh = (sound_trigger_level_ == 1) ? APP_SOUND_TRIGGER_THRESH_LOW :
-                              (sound_trigger_level_ == 2) ? APP_SOUND_TRIGGER_THRESH_MED :
-                                                           APP_SOUND_TRIGGER_THRESH_HIGH;
-            if (rms >= thresh) {
-                int64_t now = esp_timer_get_time();
-                // Arm a delayed trigger (don't dispatch yet). last_trigger_us_ is
-                // stamped now so the cooldown covers the detection instant, and
-                // sound_trigger_pending_ blocks re-arming while one is in flight.
-                if (!sound_trigger_pending_ &&
-                    (now - last_trigger_us_) >= (int64_t)APP_TRIGGER_COOLDOWN_SEC * 1000000LL) {
-                    last_trigger_us_ = now;
-                    sound_trigger_fire_us_ = now + (int64_t)APP_SOUND_TRIGGER_DELAY_MS * 1000LL;
-                    sound_trigger_pending_session_ = sound_trigger_session_id_++;
-                    sound_trigger_pending_ = true;
-                    ESP_LOGI(TAG, "sound trigger detected! rms=%u thresh=%u, fire in %ums",
-                             rms, thresh, (unsigned)APP_SOUND_TRIGGER_DELAY_MS);
-                }
-            }
-        }
-
-        if (pir_triggered_) {
-            pir_triggered_ = false;
-            if (pir_enabled_) {
-                int64_t now = esp_timer_get_time();
-                if ((now - last_trigger_us_) >= (int64_t)APP_TRIGGER_COOLDOWN_SEC * 1000000LL) {
-                    last_trigger_us_ = now;
-                    ESP_LOGI(TAG, "PIR trigger!");
-                    if (image_capture_cb_) {
-                        image_capture_cb_(sound_trigger_session_id_++);
-                    }
-                }
-            }
-        }
-
+        // Opus pre-encode ALWAYS runs (not gated on image_tx_active_) so the
+        // streaming ring keeps filling during image capture/TX and drain() gets a
+        // continuous timeline. Writes only the SPSC ring; no radio access.
         if (opus_preenc_enabled_) {
             uint8_t enc_buf[APP_OPUS_MAX_PACKET_BYTES];
             int enc_len = codec_.encode(tx_pcm_, APP_AUDIO_FRAME_SAMPLES,
@@ -499,18 +463,62 @@ void RadioPing::tx_task()
             }
         }
 
-        // Fire a pending sound trigger once the delay has elapsed. By now the
-        // Opus ring holds the frames at/after the trigger moment, so the capture
-        // task's snapshot_opus() includes the sound that caused the trigger.
-        // Dispatched here (after the encode) rather than at detection time so the
-        // capture task's pause_audio_capture() can't stop the ring from filling
-        // during the delay window.
-        if (sound_trigger_pending_ && esp_timer_get_time() >= sound_trigger_fire_us_) {
-            sound_trigger_pending_ = false;
-            ESP_LOGI(TAG, "sound trigger firing (delayed %ums)",
-                     (unsigned)APP_SOUND_TRIGGER_DELAY_MS);
-            if (image_capture_cb_) {
-                image_capture_cb_(sound_trigger_pending_session_);
+        // Trigger DETECTION + DISPATCH is gated on !image_tx_active_: firing a new
+        // capture while one is already being captured/transmitted is pointless (the
+        // capture path is single-flight) and would race the in-flight transfer. The
+        // encode above already ran, so the ring is up to date regardless.
+        if (!image_tx_active_) {
+            if (sound_trigger_level_ > 0) {
+                int64_t sum_sq = 0;
+                for (size_t i = 0; i < APP_AUDIO_FRAME_SAMPLES; i++) {
+                    int32_t s = tx_pcm_[i];
+                    sum_sq += s * s;
+                }
+                uint16_t rms = (uint16_t)sqrtf((float)sum_sq / APP_AUDIO_FRAME_SAMPLES);
+                uint16_t thresh = (sound_trigger_level_ == 1) ? APP_SOUND_TRIGGER_THRESH_LOW :
+                                  (sound_trigger_level_ == 2) ? APP_SOUND_TRIGGER_THRESH_MED :
+                                                               APP_SOUND_TRIGGER_THRESH_HIGH;
+                if (rms >= thresh) {
+                    int64_t now = esp_timer_get_time();
+                    // Arm a delayed trigger (don't dispatch yet). last_trigger_us_ is
+                    // stamped now so the cooldown covers the detection instant, and
+                    // sound_trigger_pending_ blocks re-arming while one is in flight.
+                    if (!sound_trigger_pending_ &&
+                        (now - last_trigger_us_) >= (int64_t)APP_TRIGGER_COOLDOWN_SEC * 1000000LL) {
+                        last_trigger_us_ = now;
+                        sound_trigger_fire_us_ = now + (int64_t)APP_SOUND_TRIGGER_DELAY_MS * 1000LL;
+                        sound_trigger_pending_session_ = sound_trigger_session_id_++;
+                        sound_trigger_pending_ = true;
+                        ESP_LOGI(TAG, "sound trigger detected! rms=%u thresh=%u, fire in %ums",
+                                 rms, thresh, (unsigned)APP_SOUND_TRIGGER_DELAY_MS);
+                    }
+                }
+            }
+
+            if (pir_triggered_) {
+                pir_triggered_ = false;
+                if (pir_enabled_) {
+                    int64_t now = esp_timer_get_time();
+                    if ((now - last_trigger_us_) >= (int64_t)APP_TRIGGER_COOLDOWN_SEC * 1000000LL) {
+                        last_trigger_us_ = now;
+                        ESP_LOGI(TAG, "PIR trigger!");
+                        if (image_capture_cb_) {
+                            image_capture_cb_(sound_trigger_session_id_++);
+                        }
+                    }
+                }
+            }
+
+            // Fire a pending sound trigger once the delay has elapsed. By now the
+            // Opus ring holds the frames at/after the trigger moment, so the
+            // capture task's snapshot_opus() includes the sound that caused it.
+            if (sound_trigger_pending_ && esp_timer_get_time() >= sound_trigger_fire_us_) {
+                sound_trigger_pending_ = false;
+                ESP_LOGI(TAG, "sound trigger firing (delayed %ums)",
+                         (unsigned)APP_SOUND_TRIGGER_DELAY_MS);
+                if (image_capture_cb_) {
+                    image_capture_cb_(sound_trigger_pending_session_);
+                }
             }
         }
     }
@@ -2188,9 +2196,17 @@ void RadioPing::send_config_ack(uint8_t key, uint32_t value)
     }
 }
 
-size_t RadioPing::snapshot_audio(int16_t *out, size_t max_samples)
+size_t RadioPing::drain_opus(uint8_t *out, size_t max_bytes)
 {
-    return audio_ringbuf_.snapshot(out, max_samples);
+    size_t drained = opus_ringbuf_.drain(out, max_bytes);
+    uint32_t total_dropped = opus_ringbuf_.dropped_count();
+    uint32_t delta = total_dropped - opus_dropped_last_;
+    if (delta > 0) {
+        opus_dropped_last_ = total_dropped;
+        ESP_LOGW(TAG, "opus drain: dropped %lu oldest frames (backlog overflow)",
+                 static_cast<unsigned long>(delta));
+    }
+    return drained;
 }
 
 size_t RadioPing::snapshot_opus(uint8_t *out, size_t max_bytes)

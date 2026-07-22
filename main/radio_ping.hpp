@@ -13,7 +13,6 @@
 #include "opus_codec.hpp"
 #include "audio_processor.hpp"
 #include "image_transfer.hpp"
-#include "audio_ringbuf.hpp"
 #include "opus_ringbuf.hpp"
 
 // Returns true if the node accepted the request (or is legitimately re-acking a
@@ -108,9 +107,11 @@ public:
     void audio_playback_begin() { audio_playing_ = true; }
     void audio_playback_end() { audio_playing_ = false; }
 
-    // Audio ring buffer for pre-capture retrospective recording
-    size_t snapshot_audio(int16_t *out, size_t max_samples);
+    // Opus pre-encode ring: snapshot() dumps the whole ring (sound-trigger
+    // retrospective path); drain() returns only frames written since the last
+    // drain and advances the read cursor (continuous streaming path).
     size_t snapshot_opus(uint8_t *out, size_t max_bytes);
+    size_t drain_opus(uint8_t *out, size_t max_bytes);
 
 private:
     enum class Mode {
@@ -215,7 +216,6 @@ private:
     OpusCodec codec_;
     AudioProcessor audio_proc_;
     ImageTransfer image_xfer_;
-    AudioRingBuf audio_ringbuf_;
     OpusRingBuf opus_ringbuf_;
     QueueHandle_t voice_queue_ = nullptr;
     QueueHandle_t tx_queue_ = nullptr;
@@ -263,6 +263,9 @@ private:
     uint16_t image_session_id_ = 1;
     volatile bool image_tx_active_ = false;
     bool opus_preenc_enabled_ = false;
+    // Last cumulative opus-ring drop count seen by drain_opus(), so we only log
+    // the per-drain delta instead of the running total on every frame.
+    uint32_t opus_dropped_last_ = 0;
     uint32_t image_tx_inter_packet_us_ = APP_IMAGE_TX_INTER_PACKET_US;
     uint32_t image_rx_last_frag_ms_ = 0;
     uint32_t image_rx_last_progress_ms_ = 0;

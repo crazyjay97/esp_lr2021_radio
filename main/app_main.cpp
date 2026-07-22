@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
@@ -70,6 +71,21 @@ esp_timer_handle_t g_ptt_timer = nullptr;
 // short delay after a frame finishes, so the re-trigger runs off the radio task
 // (not re-entrant inside the rx-complete callback).
 esp_timer_handle_t g_stream_next_timer = nullptr;
+
+// Gateway continuous audio playback. Each received frame's opus segment is
+// copied into g_audio_queue by the rx-complete callback (non-blocking) and
+// drained by gateway_audio_task, which decodes + writes I2S continuously. A
+// small prebuffer absorbs the retransmit-induced jitter of the pull stream.
+struct AudioSegment {
+    uint8_t *opus_packed;   // heap_caps blob, player task frees it
+    size_t   len;
+};
+QueueHandle_t g_audio_queue = nullptr;
+TaskHandle_t g_audio_task = nullptr;
+bool g_audio_playing_state = false;
+#define APP_GW_AUDIO_QUEUE_SIZE     20      /* ~ a few seconds of frame segments */
+#define APP_GW_AUDIO_PREBUFFER_MS   400U    /* jitter buffer depth before playback */
+#define APP_GW_AUDIO_SEG_EST_MS     220U    /* rough per-segment duration estimate */
 
 const char *mode_name(AppMode mode)
 {
@@ -563,17 +579,12 @@ void image_capture_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(APP_AUDIO_FRAME_MS + 5));
 #endif
 
-    // Snapshot pre-encoded Opus ring buffer (tx_task already stopped, no race)
+    // Opus audio is drained fresh from the ring right before the blob is built
+    // (see below), NOT snapshotted here. The ring keeps filling during this whole
+    // capture+TX (tx_task no longer pauses on image_tx_active_), so draining at
+    // send time yields a continuous, gap-free stream across frames.
     uint8_t *opus_buf = nullptr;
     size_t opus_len = 0;
-    if (g_audio_clip_enabled) {
-        opus_buf = static_cast<uint8_t *>(
-            heap_caps_malloc(APP_AUDIO_CLIP_MAX_OPUS_BYTES, MALLOC_CAP_SPIRAM));
-        if (opus_buf) {
-            opus_len = g_radio.snapshot_opus(opus_buf, APP_AUDIO_CLIP_MAX_OPUS_BYTES);
-            ESP_LOGI(TAG, "opus snapshot: %u bytes", static_cast<unsigned>(opus_len));
-        }
-    }
 
 #if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
     esp_err_t audio_e = bsp_audio_suspend();
@@ -602,16 +613,15 @@ void image_capture_task(void *arg)
 #endif
 
     // JPEG blob for this frame. Fast path: a prefetched frame produced during
-    // the previous frame's TX is ready (video-only stream) — use it and skip
-    // capture+encode entirely, moving that ~100ms off the per-frame critical
-    // path. Cold path (first frame, audio clips enabled, or stale prefetch):
-    // capture + encode now, as before.
+    // the previous frame's TX is ready — use it and skip capture+encode entirely,
+    // moving that ~100ms off the per-frame critical path. Cold path (first frame
+    // or stale prefetch): capture + encode now. Prefetch is no longer gated on
+    // audio: opus is drained separately at send time, so JPEG being slightly old
+    // no longer breaks audio continuity.
     uint8_t *jpeg = nullptr;
     size_t jpeg_len = 0;
     uint32_t t_jpeg_done;
-    if (!g_audio_clip_enabled) {
-        jpeg = prefetch_take(&jpeg_len);
-    }
+    jpeg = prefetch_take(&jpeg_len);
     if (jpeg) {
         t_jpeg_done = static_cast<uint32_t>(esp_log_timestamp());
         ESP_LOGI(TAG, "[TIMING] prefetch hit +%lums (jpeg=%u bytes)",
@@ -673,6 +683,21 @@ void image_capture_task(void *arg)
         }
     }
 
+    // --- Drain fresh Opus audio accumulated since the previous send ---
+    // Done here (just before the blob is built) so the segment is as fresh as
+    // possible. drain_opus() advances the ring's read cursor, so successive
+    // frames carry a continuous, non-overlapping audio timeline. Capped at
+    // APP_STREAM_OPUS_MAX_BYTES so a slow retransmit round can't bloat the blob.
+    opus_buf = static_cast<uint8_t *>(
+        heap_caps_malloc(APP_STREAM_OPUS_MAX_BYTES, MALLOC_CAP_SPIRAM));
+    if (opus_buf) {
+        opus_len = g_radio.drain_opus(opus_buf, APP_STREAM_OPUS_MAX_BYTES);
+        if (opus_len == 0) {
+            heap_caps_free(opus_buf);
+            opus_buf = nullptr;
+        }
+    }
+
     // --- Build blob: [4-byte jpeg_len][jpeg][opus] and send once ---
     bool has_opus = (opus_buf && opus_len > 0);
     uint8_t *blob;
@@ -726,13 +751,12 @@ void image_capture_task(void *arg)
     // that window to pre-capture+encode the NEXT frame into the prefetch cache so
     // the next ImageCmd can send it immediately. Camera (LCD_CAM/DMA) and radio
     // (SPI) are independent buses, and img_tx runs one priority above this task,
-    // so a TX_DONE wakeup preempts the encode and the burst never stalls. Skipped
-    // when audio clips are on (opus must be snapshotted at the capture instant).
+    // so a TX_DONE wakeup preempts the encode and the burst never stalls. Always
+    // runs now: opus is drained separately at send time (not tied to the capture
+    // instant), so prefetch no longer needs to be gated on audio.
     // A prefetch that no next-frame request consumes is dropped by the staleness
     // guard in prefetch_take, so a single/auto capture only costs one idle encode.
-    if (!g_audio_clip_enabled) {
-        prefetch_produce();
-    }
+    prefetch_produce();
 
     // Ownership of `blob` has been handed to send_image / image_tx_task, which
     // frees it when the transfer finishes or aborts. Do NOT free it here: the
@@ -883,6 +907,102 @@ bool on_image_capture_request(uint16_t session_id)
     return true;
 }
 
+// Push one opus segment (copied) into the gateway playback queue. Non-blocking:
+// returns immediately so the rx-complete path / pull loop is never stalled by
+// audio. On a full queue the OLDEST segment is dropped to make room, keeping
+// playback close to real time rather than backing up unbounded latency.
+static void audio_queue_push(const uint8_t *opus_data, size_t opus_len)
+{
+    if (!g_audio_queue || !opus_data || opus_len == 0) return;
+
+    AudioSegment seg;
+    seg.opus_packed = static_cast<uint8_t *>(heap_caps_malloc(opus_len, MALLOC_CAP_SPIRAM));
+    if (!seg.opus_packed) {
+        ESP_LOGW(TAG, "audio queue push: alloc failed %u bytes",
+                 static_cast<unsigned>(opus_len));
+        return;
+    }
+    memcpy(seg.opus_packed, opus_data, opus_len);
+    seg.len = opus_len;
+
+    if (xQueueSend(g_audio_queue, &seg, 0) != pdTRUE) {
+        AudioSegment old;
+        if (xQueueReceive(g_audio_queue, &old, 0) == pdTRUE) {
+            heap_caps_free(old.opus_packed);
+        }
+        if (xQueueSend(g_audio_queue, &seg, 0) != pdTRUE) {
+            heap_caps_free(seg.opus_packed);   // still no room; drop ours
+        }
+    }
+}
+
+// Rough estimate of queued audio duration, used only to gate the prebuffer.
+static uint32_t audio_queue_ms(void)
+{
+    if (!g_audio_queue) return 0;
+    return uxQueueMessagesWaiting(g_audio_queue) * APP_GW_AUDIO_SEG_EST_MS;
+}
+
+// Gateway continuous audio playback task. Dequeues opus segments, decodes each
+// frame, and writes to I2S back to back. PA stays on (gateway is mains-powered),
+// so there is no PA enable/disable bookkeeping. Jitter buffer: before starting
+// (or after an underrun) it waits until PREBUFFER_MS of audio is queued, then
+// drains continuously; if the queue empties it re-prebuffers -> brief silence.
+void gateway_audio_task(void *arg)
+{
+    (void)arg;
+
+    OpusCodec codec;
+    if (codec.init_decoder_only() != ESP_OK) {
+        ESP_LOGE(TAG, "gateway_audio_task: codec init failed");
+        vTaskDelete(nullptr);
+        return;
+    }
+    // PA is NOT left on continuously: a class-D amp switching next to the LR2021
+    // front-end raises the packet error rate. It is enabled only while actually
+    // draining audio (playing state) and disabled during prebuffer/underrun, so
+    // the radio sees a quiet front-end whenever no sound is being produced.
+    ESP_LOGI(TAG, "gateway audio task started (PA gated on playback)");
+
+    int16_t pcm[APP_AUDIO_FRAME_SAMPLES];
+    int16_t stereo[APP_AUDIO_FRAME_SAMPLES * 2];
+
+    for (;;) {
+        if (!g_audio_playing_state) {
+            if (audio_queue_ms() < APP_GW_AUDIO_PREBUFFER_MS) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+            g_audio_playing_state = true;
+            bsp_audio_pa_enable(true);   // enable just before the first write
+            ESP_LOGI(TAG, "audio playback started (prebuffer reached), PA on");
+        }
+
+        AudioSegment seg;
+        if (xQueueReceive(g_audio_queue, &seg, pdMS_TO_TICKS(300)) != pdTRUE) {
+            g_audio_playing_state = false;   // underrun -> re-prebuffer
+            bsp_audio_pa_enable(false);      // silence the amp while we refill
+            continue;
+        }
+
+        size_t pos = 0;
+        while (pos < seg.len) {
+            uint8_t flen = seg.opus_packed[pos++];
+            if (flen == 0 || pos + flen > seg.len) break;
+            int n = codec.decode(&seg.opus_packed[pos], flen, pcm, APP_AUDIO_FRAME_SAMPLES);
+            pos += flen;
+            if (n <= 0) continue;
+            for (int i = 0; i < n; i++) {
+                stereo[2 * i] = pcm[i];
+                stereo[2 * i + 1] = pcm[i];
+            }
+            size_t written = 0;
+            bsp_audio_write(stereo, n * 2 * sizeof(int16_t), &written);
+        }
+        heap_caps_free(seg.opus_packed);
+    }
+}
+
 // Callback: device B receives complete image
 void play_audio_clip(const uint8_t *opus_packed, size_t total_len)
 {
@@ -1011,9 +1131,12 @@ void on_image_rx_complete(ImageTransfer *xfer)
     image_store_save(jpeg_data, jpeg_len, opus_data, opus_len, sid);
     t_save_ms = static_cast<uint32_t>(esp_log_timestamp()) - t_save0;
 
-    // Play audio if present
+    // Enqueue audio for continuous playback. Non-blocking: the old blocking
+    // play_audio_clip() ran the whole segment inline on the rx path and stalled
+    // the pull loop (rx done -> 10ms -> request next frame), which capped the
+    // frame rate. gateway_audio_task now decodes/plays off this thread.
     if (opus_data && opus_len > 0) {
-        play_audio_clip(opus_data, opus_len);
+        audio_queue_push(opus_data, opus_len);
     }
 
     heap_caps_free(raw);
@@ -1531,6 +1654,24 @@ extern "C" void app_main(void)
                     nvs_get_u8(gw_nvs, "lowpwr", &lp);
                     g_low_power_enabled = (lp != 0);
                     nvs_close(gw_nvs);
+                }
+
+                // Continuous audio playback (gateway only): create the segment
+                // queue and start the player task. Pinned to core 1 (with LVGL)
+                // at a priority below the UI so display refresh stays smooth.
+                g_audio_queue = xQueueCreate(APP_GW_AUDIO_QUEUE_SIZE, sizeof(AudioSegment));
+                if (!g_audio_queue) {
+                    ESP_LOGE(TAG, "gateway audio queue create failed");
+                } else {
+                    // 8KB stack: the Opus decoder uses several KB internally,
+                    // plus the pcm/stereo frame buffers are on-stack locals.
+                    // 4KB overflows and corrupts adjacent memory (crashes at the
+                    // next tick, not at the write, so it looks like a scheduler
+                    // fault). play_audio_clip never hit this because it ran on a
+                    // larger task stack.
+                    xTaskCreatePinnedToCore(gateway_audio_task, "gw_audio", 8192,
+                                            nullptr, 4, &g_audio_task, 1);
+                    ESP_LOGI(TAG, "gateway audio task created");
                 }
             }
 #else

@@ -226,13 +226,19 @@
 #define APP_VOICE_ALARM_ENABLE          1
 #define APP_VOICE_ALARM_VOLUME_PERCENT  80U   /* gateway level 8 → 80% → REG32=0xCC */
 
-/* ----- Audio ring buffer (pre-capture retrospective recording) ----------- */
+/* ----- Opus pre-encode ring buffer --------------------------------------- */
 
-#define APP_AUDIO_RINGBUF_SECONDS       5U
-#define APP_AUDIO_RINGBUF_SAMPLES       (APP_AUDIO_SAMPLE_RATE_HZ * APP_AUDIO_RINGBUF_SECONDS)
-#define APP_AUDIO_RINGBUF_BYTES         (APP_AUDIO_RINGBUF_SAMPLES * 2U)
+/* Depth of the Opus pre-encode ring in seconds. Sized to cover the worst-case
+ * retransmit window between two consecutive frame sends so the drain() cursor
+ * never runs dry mid-stream. */
+#define APP_OPUS_RING_SECONDS           5U
 #define APP_AUDIO_CLIP_MAX_OPUS_BYTES   20000U
 #define APP_AUDIO_SESSION_FLAG          0x8000U
+
+/* Continuous audio streaming alongside video. Max opus bytes packed into one
+ * frame blob. Normal ~220ms/frame is ~22 opus frames ~550-650 bytes; cap at
+ * ~1.5s so a slow retransmit round can't bloat the blob. */
+#define APP_STREAM_OPUS_MAX_BYTES       3000U
 
 /* ----- Image transfer over FLRC ------------------------------------------ */
 
