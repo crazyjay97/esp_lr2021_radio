@@ -102,9 +102,11 @@
 /* FreeRTOS priority for the radio engine task. */
 #define APP_RADIO_TASK_PRIORITY         4
 
-/* Stack for RAC callbacks plus Opus encode/decode. Opus needs much more than
- * the old ping-only path, so keep this conservative during bring-up. */
-#define APP_RADIO_TASK_STACK_BYTES      32768U
+/* Stack for RAC callbacks plus the radio poll loop. Was 32768; the 32KB
+ * instruction cache steals 16KB of internal SRAM, so the node (which runs
+ * several such tasks + camera DMA) hit ESP_ERR_NO_MEM at radio task creation.
+ * Measured high-water usage is ~2.2KB, so 8KB leaves ~5.8KB headroom. */
+#define APP_RADIO_TASK_STACK_BYTES      8192U
 
 /* Keep direct RAL radio control on CPU0. */
 #define APP_RADIO_TASK_CORE             0
@@ -143,14 +145,18 @@
 
 /* Opus decode plus I2S write run here so radio RX can re-arm quickly. */
 #define APP_VOICE_PLAY_TASK_PRIORITY    5
-#define APP_VOICE_PLAY_TASK_STACK_BYTES 32768U
+/* Was 32768; cut to 16KB to reclaim internal SRAM under 32KB I-cache. See
+ * APP_RADIO_TASK_STACK_BYTES note. STACK-probe logs verify real usage. */
+#define APP_VOICE_PLAY_TASK_STACK_BYTES 16384U
 
 /* Run Opus decode/playback away from direct radio control. */
 #define APP_VOICE_PLAY_TASK_CORE        1
 
 /* Opus encode plus I2S read run here so RAC polling is not blocked by audio. */
 #define APP_VOICE_TX_TASK_PRIORITY      5
-#define APP_VOICE_TX_TASK_STACK_BYTES   32768U
+/* Was 32768; cut to 16KB to reclaim internal SRAM under 32KB I-cache. See
+ * APP_RADIO_TASK_STACK_BYTES note. STACK-probe logs verify real usage. */
+#define APP_VOICE_TX_TASK_STACK_BYTES   16384U
 
 /* Keep Opus encode away from the radio/control task on CPU0. */
 #define APP_VOICE_TX_TASK_CORE          1
