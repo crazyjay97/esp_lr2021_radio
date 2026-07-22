@@ -208,7 +208,7 @@ static void decode_slot_pcm(image_slot_t *slot)
     slot->opus = NULL;
     slot->meta.opus_len = 0;
 
-    ESP_LOGI(TAG, "PCM decoded: %u samples, peak=%d, %uKB", (unsigned)soff, peak, (unsigned)(actual_pcm_bytes / 1024));
+    ESP_LOGD(TAG, "PCM decoded: %u samples, peak=%d, %uKB", (unsigned)soff, peak, (unsigned)(actual_pcm_bytes / 1024));
 }
 
 static void decode_task(void *arg)
@@ -224,7 +224,7 @@ static void decode_task(void *arg)
                 int64_t t0 = esp_timer_get_time();
                 decode_slot_pcm(slot);
                 uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
-                ESP_LOGI(TAG, "bg decode slot %d: %lu ms", i, (unsigned long)ms);
+                ESP_LOGD(TAG, "bg decode slot %d: %lu ms", i, (unsigned long)ms);
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
         }

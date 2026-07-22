@@ -547,7 +547,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     bool got_frame = xSemaphoreTake(capture_sem_, pdMS_TO_TICKS(5000)) == pdTRUE;
 
     if (got_frame && s_dvp_ctx.received >= kFrameBytes && s_dvp_ctx.captured_buffer) {
-        ESP_LOGI(TAG, "captured frame: %u bytes (skipped %d)",
+        ESP_LOGD(TAG, "captured frame: %u bytes (skipped %d)",
                  (unsigned)s_dvp_ctx.received, s_dvp_ctx.frame_count - 1);
 
         // Allocate the downsampled (320x240) output, not the full frame.
@@ -577,7 +577,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
                            APP_CAMERA_SENSOR_WIDTH, APP_CAMERA_SENSOR_HEIGHT);
 #endif
         int64_t t_ds1 = esp_timer_get_time();
-        ESP_LOGI(TAG, "[TIMING] downsample %ux%u -> %ux%u : %lld us",
+        ESP_LOGD(TAG, "[TIMING] downsample %ux%u -> %ux%u : %lld us",
                  (unsigned)APP_CAMERA_SENSOR_WIDTH, (unsigned)APP_CAMERA_SENSOR_HEIGHT,
                  (unsigned)APP_IMAGE_OUTPUT_WIDTH, (unsigned)APP_IMAGE_OUTPUT_HEIGHT,
                  (long long)(t_ds1 - t_ds0));

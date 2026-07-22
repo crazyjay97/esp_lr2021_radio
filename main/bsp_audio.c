@@ -208,7 +208,15 @@ static esp_err_t i2s_init(uint32_t sample_rate_hz)
         return ESP_ERR_INVALID_STATE;
     }
 
+    // Larger RX DMA buffer: camera capture + JPEG encode takes ~80-100ms on core 1.
+    // Although voice_tx (priority 5) preempts the capture task (priority 3), the
+    // blocking read in read_mono_frame waits for the DMA to fill a chunk, so if
+    // the JPEG encoder holds the CPU for too long the DMA ring can wrap and
+    // overwrite old data before voice_tx drains it. Default config (6 desc × 240
+    // frames) gives only ~45ms of buffer; doubling to 12 descriptors (~90ms) lets
+    // the ring survive the capture window without loss. TX side stays at default.
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = 24;  // double the RX buffer depth (affects both TX/RX)
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_tx, &s_rx), TAG, "chan");
 
     ESP_LOGI(TAG, "I2S0 config: Fs=%" PRIu32 " MCLK=%d BCLK=%d LRCK=%d DOUT=%d DIN=%d",

@@ -113,7 +113,8 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "JPEG encoded: %lux%lu → %d bytes (Q=%d)",
+    // Per-frame encode on the capture hot path — DEBUG to keep the stream quiet.
+    ESP_LOGD(TAG, "JPEG encoded: %lux%lu → %d bytes (Q=%d)",
              static_cast<unsigned long>(width), static_cast<unsigned long>(height),
              out_size, APP_IMAGE_JPEG_QUALITY);
 
@@ -158,7 +159,7 @@ void ImageTransfer::rx_begin(uint16_t session_id, uint16_t total_fragments)
     rx_received_ = 0;
     rx_jpeg_size_ = 0;
 
-    ESP_LOGI(TAG, "rx_begin: session=%u total=%u bytes=%u caps=%s",
+    ESP_LOGD(TAG, "rx_begin: session=%u total=%u bytes=%u caps=%s",
              session_id, total_fragments, static_cast<unsigned>(buf_size),
              using_psram ? "psram" : "internal");
 }
@@ -198,7 +199,7 @@ bool ImageTransfer::rx_fragment(uint16_t session_id, uint16_t frag_index,
         for (uint16_t i = 0; i < rx_total_; i++) {
             rx_jpeg_size_ += rx_frag_lens_[i];
         }
-        ESP_LOGI(TAG, "rx complete: session=%u size=%u",
+        ESP_LOGD(TAG, "rx complete: session=%u size=%u",
                  rx_session_id_, static_cast<unsigned>(rx_jpeg_size_));
         return true;
     }

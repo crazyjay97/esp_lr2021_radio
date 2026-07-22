@@ -912,7 +912,9 @@ void RadioPing::handle_rx_packet()
     if (len < kHeaderSize || std::memcmp(rx_buf_, kMagic, sizeof(kMagic)) != 0) {
         rx_unknown_packets_++;
         if ((rx_unknown_packets_ % 50U) == 1U) {
-            ESP_LOGW(TAG, "RX unknown packets=%lu len=%u rssi=%d hdr=%02x%02x%02x%02x",
+            // On the RX hot path; kept at DEBUG so it never floods the critical
+            // receive loop (raise the log level to see it when debugging EMI).
+            ESP_LOGD(TAG, "RX unknown packets=%lu len=%u rssi=%d hdr=%02x%02x%02x%02x",
                      static_cast<unsigned long>(rx_unknown_packets_), len, rssi,
                      rx_buf_[0], rx_buf_[1], rx_buf_[2], rx_buf_[3]);
         }
@@ -1787,7 +1789,9 @@ void RadioPing::handle_image_start(uint16_t len)
     uint16_t vbat_mv = has_vbat ? get_u16_le(&rx_buf_[14]) : 0;
 
     if (has_vbat) {
-        ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx vbat=%u mV (%u.%02u V)",
+        // Start of a frame's RX — DEBUG so the per-frame transfer stays quiet;
+        // the completion summary ("RX done") carries the useful outcome.
+        ESP_LOGD(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx vbat=%u mV (%u.%02u V)",
                  session_id, total_frags, static_cast<unsigned long>(expected_crc32),
                  vbat_mv, vbat_mv / 1000, (vbat_mv % 1000) / 10);
         // NOTE: deliberately NOT calling vbat_received_cb_ here. This is the
@@ -1799,7 +1803,7 @@ void RadioPing::handle_image_start(uint16_t len)
         // and by the non-low-power node via the periodic kPacketTypeVbat
         // broadcast (see line ~2476), which updates the UI off the hot path.
     } else {
-        ESP_LOGI(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx",
+        ESP_LOGD(TAG, "RX ImageStart: session=%u total=%u crc32=0x%08lx",
                  session_id, total_frags, static_cast<unsigned long>(expected_crc32));
     }
 
@@ -2016,7 +2020,10 @@ void RadioPing::handle_image_eot()
             image_rx_complete_cb_(&image_xfer_);
         }
     } else {
-        ESP_LOGW(TAG, "image RX: sent ACK with %u missing, waiting for retransmit", missing_count);
+        // On the RX/NACK hot path — this fires once per retransmit round mid
+        // transfer. Kept at DEBUG so it does not stall reception; the per-frame
+        // outcome is still visible in the "RX done" line after completion.
+        ESP_LOGI(TAG, "image RX: sent ACK with %u missing, waiting for retransmit", missing_count);
         if (image_rx_eot_count_ == 1) {
             for (uint16_t i = 0; i < missing_count; i += 16) {
                 char line[128];
@@ -2024,7 +2031,7 @@ void RadioPing::handle_image_eot()
                 for (uint16_t j = i; j < missing_count && j < i + 16; j++) {
                     pos += snprintf(line + pos, sizeof(line) - pos, "%u ", missing_indices[j]);
                 }
-                ESP_LOGW(TAG, "  missing: %s", line);
+                ESP_LOGD(TAG, "  missing: %s", line);
             }
         }
         image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
@@ -2206,6 +2213,28 @@ size_t RadioPing::drain_opus(uint8_t *out, size_t max_bytes)
         ESP_LOGW(TAG, "opus drain: dropped %lu oldest frames (backlog overflow)",
                  static_cast<unsigned long>(delta));
     }
+
+    // DIAGNOSTIC (temporary): measure the real audio production rate. Count frames
+    // in the drained [len][data]... stream and the wall time since the previous
+    // drain. frames*10ms should ~= dt_ms if the mic->encode path runs at realtime;
+    // frames << dt_ms/10 means the node is under-producing (I2S reads failing
+    // during capture) and the gap is a supply problem, not a gateway buffering one.
+    uint32_t frames = 0;
+    for (size_t p = 0; p < drained; ) {
+        uint8_t flen = out[p];
+        if (flen == 0 || p + 1 + flen > drained) break;
+        frames++;
+        p += 1 + flen;
+    }
+    static uint32_t s_last_drain_ms = 0;
+    uint32_t now_ms = static_cast<uint32_t>(esp_log_timestamp());
+    uint32_t dt_ms = (s_last_drain_ms != 0) ? (now_ms - s_last_drain_ms) : 0;
+    s_last_drain_ms = now_ms;
+    ESP_LOGI(TAG, "opus drain: %lu frames (%lums audio) over dt=%lums -> %lu%% realtime",
+             (unsigned long)frames, (unsigned long)(frames * APP_AUDIO_FRAME_MS),
+             (unsigned long)dt_ms,
+             (unsigned long)(dt_ms ? (frames * APP_AUDIO_FRAME_MS * 100 / dt_ms) : 0));
+
     return drained;
 }
 

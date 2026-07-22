@@ -570,7 +570,9 @@ void image_capture_task(void *arg)
     uint32_t pixfmt = 0;
 
     uint32_t t_cmd = static_cast<uint32_t>(esp_log_timestamp());
-    ESP_LOGI(TAG, "[TIMING] cmd received t=0ms");
+    // Per-frame capture step timings are DEBUG (they fire mid-capture, on the hot
+    // path); only the post-send "[TIMING] total" summary stays at INFO.
+    ESP_LOGD(TAG, "[TIMING] cmd received t=0ms");
 
     bsp_lcd_set_camera_status("Remote capture...");
 
@@ -624,17 +626,17 @@ void image_capture_task(void *arg)
     jpeg = prefetch_take(&jpeg_len);
     if (jpeg) {
         t_jpeg_done = static_cast<uint32_t>(esp_log_timestamp());
-        ESP_LOGI(TAG, "[TIMING] prefetch hit +%lums (jpeg=%u bytes)",
+        ESP_LOGD(TAG, "[TIMING] prefetch hit +%lums (jpeg=%u bytes)",
                  static_cast<unsigned long>(t_jpeg_done - t_cmd),
                  static_cast<unsigned>(jpeg_len));
     } else {
         uint32_t t_cam_start = static_cast<uint32_t>(esp_log_timestamp());
-        ESP_LOGI(TAG, "[TIMING] camera init start +%lums", static_cast<unsigned long>(t_cam_start - t_cmd));
+        ESP_LOGD(TAG, "[TIMING] camera init start +%lums", static_cast<unsigned long>(t_cam_start - t_cmd));
 
         esp_err_t capture_e = g_camera_uart.capture_frame(&frame, &len, &width, &height, &pixfmt);
 
         uint32_t t_cam_done = static_cast<uint32_t>(esp_log_timestamp());
-        ESP_LOGI(TAG, "[TIMING] capture done +%lums (camera=%lums) %lux%lu %u bytes",
+        ESP_LOGD(TAG, "[TIMING] capture done +%lums (camera=%lums) %lux%lu %u bytes",
                  static_cast<unsigned long>(t_cam_done - t_cmd),
                  static_cast<unsigned long>(t_cam_done - t_cam_start),
                  static_cast<unsigned long>(width),
@@ -662,7 +664,7 @@ void image_capture_task(void *arg)
         e = g_radio.image_xfer().encode_frame(frame, len, width, height, pixfmt, &jpeg, &jpeg_len);
         heap_caps_free(frame);
         t_jpeg_done = static_cast<uint32_t>(esp_log_timestamp());
-        ESP_LOGI(TAG, "[TIMING] JPEG done +%lums (jpeg=%lums) %u bytes",
+        ESP_LOGD(TAG, "[TIMING] JPEG done +%lums (jpeg=%lums) %u bytes",
                  static_cast<unsigned long>(t_jpeg_done - t_cmd),
                  static_cast<unsigned long>(t_jpeg_done - t_jpeg_start),
                  static_cast<unsigned>(jpeg_len));
@@ -740,7 +742,7 @@ void image_capture_task(void *arg)
     uint16_t total_frags = static_cast<uint16_t>(
         (blob_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) / APP_IMAGE_FRAGMENT_DATA_SIZE);
     uint16_t tx_session = has_opus ? (session_id | APP_AUDIO_SESSION_FLAG) : session_id;
-    ESP_LOGI(TAG, "sending blob: %u pkts, %u bytes (jpeg=%u opus=%u)",
+    ESP_LOGD(TAG, "sending blob: %u pkts, %u bytes (jpeg=%u opus=%u)",
              total_frags, static_cast<unsigned>(blob_len),
              static_cast<unsigned>(jpeg_len), static_cast<unsigned>(opus_len));
 
