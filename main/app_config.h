@@ -71,7 +71,7 @@
 #define APP_FLRC_BANDWIDTH_HZ           2666000UL
 
 /* TX power for bench tests. 22 dBm saturates nearby receivers; use 10 for close range. */
-#define APP_FLRC_TX_POWER_DBM           10
+#define APP_FLRC_TX_POWER_DBM           22
 
 /* Use FEC during early tests; switch to RAL_FLRC_CR_1_1 only after range tests. */
 #define APP_FLRC_CODING_RATE            RAL_FLRC_CR_3_4
