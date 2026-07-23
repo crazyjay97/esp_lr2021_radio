@@ -76,7 +76,11 @@ esp_timer_handle_t g_stream_next_timer = nullptr;
 // AVFrame struct by the rx-complete callback (non-blocking). gateway_audio_task
 // dequeues these pairs and displays the image immediately before playing its
 // corresponding audio segment, naturally syncing video to the I2S clock-driven
-// audio timeline. A small prebuffer absorbs the retransmit-induced jitter.
+// audio timeline. There is NO prebuffer: playback starts as soon as a frame is
+// available (lowest latency). To stop latency from accumulating when frames
+// pile up faster than they drain, a frame that has waited longer than
+// APP_GW_AV_MAX_LATENCY_MS in the queue is dropped (image + audio together, so
+// sync is preserved) whenever a newer frame is already queued behind it.
 struct AVFrame {
     uint16_t *rgb565;       // decoded image in SPIRAM, null if no image
     uint32_t  width;
@@ -85,13 +89,13 @@ struct AVFrame {
     size_t    opus_len;
     uint32_t  jpeg_size;    // original compressed size, for diagnostics
     uint32_t  transfer_ms;  // RF transfer time, for diagnostics
+    uint32_t  enqueue_ms;   // time the frame was pushed, for the catch-up test
 };
 QueueHandle_t g_av_queue = nullptr;
 TaskHandle_t g_audio_task = nullptr;
 bool g_audio_playing_state = false;
 #define APP_GW_AV_QUEUE_SIZE        20      /* ~ a few seconds of AV pairs */
-#define APP_GW_AUDIO_PREBUFFER_MS   400U    /* jitter buffer depth before playback */
-#define APP_GW_AV_FRAME_EST_MS      220U    /* rough per-frame duration estimate */
+#define APP_GW_AV_MAX_LATENCY_MS    600U    /* drop-oldest catch-up threshold */
 
 const char *mode_name(AppMode mode)
 {
@@ -933,6 +937,8 @@ static void av_queue_push(AVFrame *frame)
 {
     if (!g_av_queue || !frame) { av_frame_free(frame); return; }
 
+    frame->enqueue_ms = static_cast<uint32_t>(esp_log_timestamp());
+
     if (xQueueSend(g_av_queue, frame, 0) != pdTRUE) {
         AVFrame old;
         if (xQueueReceive(g_av_queue, &old, 0) == pdTRUE) {
@@ -944,18 +950,12 @@ static void av_queue_push(AVFrame *frame)
     }
 }
 
-// Rough estimate of queued AV duration, used only to gate the prebuffer.
-static uint32_t av_queue_ms(void)
-{
-    if (!g_av_queue) return 0;
-    return uxQueueMessagesWaiting(g_av_queue) * APP_GW_AV_FRAME_EST_MS;
-}
-
-// Gateway continuous audio playback task. Dequeues opus segments, decodes each
-// frame, and writes to I2S back to back. PA stays on (gateway is mains-powered),
-// so there is no PA enable/disable bookkeeping. Jitter buffer: before starting
-// (or after an underrun) it waits until PREBUFFER_MS of audio is queued, then
-// drains continuously; if the queue empties it re-prebuffers -> brief silence.
+// Gateway AV playback task. Dequeues image+audio pairs, shows the image, then
+// decodes/writes the opus segment to I2S. No prebuffer: it plays as soon as a
+// frame exists (lowest latency). Catch-up: if the frame pulled off the queue
+// has already waited > APP_GW_AV_MAX_LATENCY_MS AND a newer frame is queued
+// behind it, the stale frame (image + audio together) is dropped so latency
+// cannot keep growing when frames arrive faster than they drain.
 void gateway_audio_task(void *arg)
 {
     (void)arg;
@@ -967,30 +967,40 @@ void gateway_audio_task(void *arg)
         return;
     }
     // PA is NOT left on continuously: a class-D amp switching next to the LR2021
-    // front-end raises the packet error rate. It is enabled only while actually
-    // draining audio (playing state) and disabled during prebuffer/underrun, so
-    // the radio sees a quiet front-end whenever no sound is being produced.
+    // front-end raises the packet error rate. It is enabled just before the
+    // first write and disabled when the queue runs dry, so the radio sees a
+    // quiet front-end whenever no sound is being produced.
     ESP_LOGI(TAG, "gateway audio task started (PA gated on playback)");
 
     int16_t pcm[APP_AUDIO_FRAME_SAMPLES];
     int16_t stereo[APP_AUDIO_FRAME_SAMPLES * 2];
 
     for (;;) {
-        if (!g_audio_playing_state) {
-            if (av_queue_ms() < APP_GW_AUDIO_PREBUFFER_MS) {
-                vTaskDelay(pdMS_TO_TICKS(50));
-                continue;
-            }
-            g_audio_playing_state = true;
-            bsp_audio_pa_enable(true);   // enable just before the first write
-            ESP_LOGI(TAG, "audio playback started (prebuffer reached), PA on");
-        }
-
+        // Block until a frame is available. No prebuffer -> play immediately.
         AVFrame frame;
         if (xQueueReceive(g_av_queue, &frame, pdMS_TO_TICKS(300)) != pdTRUE) {
-            g_audio_playing_state = false;   // underrun -> re-prebuffer
-            bsp_audio_pa_enable(false);      // silence the amp while we refill
+            if (g_audio_playing_state) {
+                g_audio_playing_state = false;   // queue dry -> silence the amp
+                bsp_audio_pa_enable(false);
+            }
             continue;
+        }
+
+        // Catch-up: drop this frame if it has been waiting too long AND a newer
+        // frame is already queued. Image + audio are dropped together so they
+        // stay in sync; we only ever advance to a frame that is fresh enough or
+        // is the last one in the queue (never leaving nothing to play).
+        while ((static_cast<uint32_t>(esp_log_timestamp()) - frame.enqueue_ms)
+                   > APP_GW_AV_MAX_LATENCY_MS
+               && uxQueueMessagesWaiting(g_av_queue) > 0) {
+            av_frame_free(&frame);
+            xQueueReceive(g_av_queue, &frame, 0);
+        }
+
+        if (!g_audio_playing_state) {
+            g_audio_playing_state = true;
+            bsp_audio_pa_enable(true);   // enable just before the first write
+            ESP_LOGI(TAG, "audio playback started, PA on");
         }
 
         // AV sync: display THIS frame's image right before playing its audio.
