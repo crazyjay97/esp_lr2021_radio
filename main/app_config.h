@@ -161,6 +161,16 @@
 /* Keep Opus encode away from the radio/control task on CPU0. */
 #define APP_VOICE_TX_TASK_CORE          1
 
+/* Gateway downlink-voice capture priority. The gateway runs mic capture (this
+ * task) AND AV-sync playback (gw_audio, prio 4) on core 1. Playback paces the
+ * pull-stream (next frame is requested only after the current one finishes
+ * playing), so it MUST win: keep capture BELOW gw_audio. Capture still runs
+ * continuously (writes the pre-encode ring, never dropping the user's speech),
+ * it just yields to playback and encodes in the gaps where playback blocks on
+ * the I2S DMA. Node capture keeps APP_VOICE_TX_TASK_PRIORITY (its core 1 does
+ * capture only, so no such contention). */
+#define APP_GW_VOICE_TX_TASK_PRIORITY   3
+
 /* ----- Audio DSP (noise suppression / voice enhancement) -------------------- */
 
 #define APP_AUDIO_DSP_ENABLE              1

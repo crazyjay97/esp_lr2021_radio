@@ -260,9 +260,13 @@ esp_err_t RadioPing::start_gateway()
     // for downlink voice (bidirectional intercom). Reuse tx_task: its gateway
     // path naturally skips PIR/low-power/sound-trigger branches (all inert when
     // is_gateway_==true and sound_trigger_level_==0), leaving a clean capture loop.
+    // Priority BELOW gw_audio (prio 4): playback paces the pull-stream and must
+    // win, or the received frame rate drops. Capture still runs continuously and
+    // never loses the user's speech; it just yields and encodes in playback's
+    // I2S-DMA gaps. See APP_GW_VOICE_TX_TASK_PRIORITY.
     ok = xTaskCreatePinnedToCore(tx_task_trampoline, "voice_tx",
                                  APP_VOICE_TX_TASK_STACK_BYTES, this,
-                                 APP_VOICE_TX_TASK_PRIORITY, nullptr,
+                                 APP_GW_VOICE_TX_TASK_PRIORITY, nullptr,
                                  APP_VOICE_TX_TASK_CORE);
     if (ok != pdPASS) {
         return ESP_ERR_NO_MEM;
