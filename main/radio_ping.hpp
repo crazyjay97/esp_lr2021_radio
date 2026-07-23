@@ -171,6 +171,11 @@ private:
     void handle_image_nack();
     void handle_image_done();
     void image_tx_task();
+    // Gateway downlink voice (bidirectional intercom): drain the pre-encode ring
+    // and hand the Opus blob to the image-TX send chain, tagged with
+    // APP_DOWNLINK_VOICE_SESSION_FLAG so the node treats it as voice, not an image.
+    // Called right after a node uplink image completes (the ping-pong turn point).
+    void send_downlink_voice();
     bool send_single_packet(const uint8_t *data, uint16_t len);
     bool wait_for_tx_done(uint32_t timeout_ms);
     void check_image_rx_timeout();
@@ -261,6 +266,9 @@ private:
     config_received_cb_t config_received_cb_ = nullptr;
     low_power_standby_cb_t low_power_standby_cb_ = nullptr;
     uint16_t image_session_id_ = 1;
+    // Rolling session id for gateway downlink voice blobs. Kept separate from the
+    // image session counter and always OR'd with APP_DOWNLINK_VOICE_SESSION_FLAG.
+    uint16_t downlink_voice_session_ = 1;
     volatile bool image_tx_active_ = false;
     bool opus_preenc_enabled_ = false;
     // Last cumulative opus-ring drop count seen by drain_opus(), so we only log

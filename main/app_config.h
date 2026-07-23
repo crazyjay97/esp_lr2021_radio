@@ -251,6 +251,15 @@
 #define APP_AUDIO_CLIP_MAX_OPUS_BYTES   20000U
 #define APP_AUDIO_SESSION_FLAG          0x8000U
 
+/* Bidirectional intercom downlink (gateway -> node) voice. The gateway reuses
+ * the image-transfer send chain (ImageStart/Data/EOT/Nack retransmit) to push a
+ * pure-Opus blob to the node. The node tells "this is downlink voice, not an
+ * image" from this bit set in the transfer's session_id. Distinct from
+ * APP_AUDIO_SESSION_FLAG (which marks a node uplink image blob that carries a
+ * parasitic audio tail). Max downlink blob size mirrors APP_STREAM_OPUS_MAX_BYTES. */
+#define APP_DOWNLINK_VOICE_SESSION_FLAG 0x4000U
+#define APP_DOWNLINK_OPUS_MAX_BYTES     3000U
+
 /* Continuous audio streaming alongside video. Max opus bytes packed into one
  * frame blob. Normal ~220ms/frame is ~22 opus frames ~550-650 bytes; cap at
  * ~1.5s so a slow retransmit round can't bloat the blob. */

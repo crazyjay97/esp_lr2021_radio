@@ -210,6 +210,15 @@ esp_err_t RadioPing::init_gateway()
         ESP_LOGW(TAG, "opus ring buffer alloc failed (PSRAM?)");
     }
 
+    // Downlink voice: the gateway now also drives the image-TX send chain to push
+    // an Opus blob to the node (bidirectional intercom), so it needs the same
+    // one-slot request queue the node uses for its image push.
+    image_tx_queue_ = xQueueCreate(1, sizeof(ImageTxRequest));
+    if (image_tx_queue_ == nullptr) {
+        ESP_LOGE(TAG, "image tx queue alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+
 #if !APP_RADIO_HW_INIT_ENABLE
     ESP_LOGW(TAG, "LR2021 hardware init disabled");
     return ESP_OK;
@@ -276,6 +285,17 @@ esp_err_t RadioPing::start_gateway()
                                  APP_VOICE_PLAY_TASK_STACK_BYTES, this,
                                  APP_VOICE_PLAY_TASK_PRIORITY, nullptr,
                                  APP_VOICE_PLAY_TASK_CORE);
+    if (ok != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Downlink voice sender: reuses the node's image-TX task/protocol verbatim to
+    // push an Opus blob to the node. Idle until send_downlink_voice() enqueues a
+    // request (after a node uplink image completes — the ping-pong turn point).
+    ok = xTaskCreatePinnedToCore(image_tx_task_trampoline, "img_tx",
+                                 APP_IMAGE_TASK_STACK_BYTES, this,
+                                 APP_IMAGE_TX_TASK_PRIORITY, nullptr,
+                                 APP_IMAGE_TX_TASK_CORE);
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
@@ -1339,6 +1359,44 @@ void RadioPing::stop_image_req_retry()
     image_req_active_ = false;
 }
 
+// Gateway downlink voice: drain whatever Opus frames the gateway's mic has
+// pre-encoded since the last downlink and push them to the node over the image
+// send chain. The blob is the raw [len][opus]... frame stream (same layout the
+// node's uplink audio tail uses), and the send chain treats it as opaque bytes,
+// so no protocol change is needed — only the session flag tells the node it is
+// voice. Runs in the radio task (called from handle_image_eot's completion), but
+// does no radio I/O itself: it just allocates the blob and enqueues it for the
+// img_tx task, exactly like the app layer does with send_image().
+void RadioPing::send_downlink_voice()
+{
+    if (!image_tx_queue_) {
+        return;
+    }
+    // Drain the pre-encode ring into a heap buffer the img_tx task will own+free.
+    uint8_t *blob = static_cast<uint8_t *>(
+        heap_caps_malloc(APP_DOWNLINK_OPUS_MAX_BYTES, MALLOC_CAP_SPIRAM));
+    if (blob == nullptr) {
+        blob = static_cast<uint8_t *>(heap_caps_malloc(APP_DOWNLINK_OPUS_MAX_BYTES, MALLOC_CAP_8BIT));
+    }
+    if (blob == nullptr) {
+        ESP_LOGW(TAG, "downlink voice: blob alloc failed");
+        return;
+    }
+
+    size_t len = drain_opus(blob, APP_DOWNLINK_OPUS_MAX_BYTES);
+    if (len == 0) {
+        // Nothing captured this round (mic silent / ring empty). Skip the turn;
+        // the node stays in RX and the next uplink round proceeds as before.
+        heap_caps_free(blob);
+        return;
+    }
+
+    uint16_t session = static_cast<uint16_t>(
+        (downlink_voice_session_++ & ~APP_DOWNLINK_VOICE_SESSION_FLAG) | APP_DOWNLINK_VOICE_SESSION_FLAG);
+    ESP_LOGI(TAG, "downlink voice TX: session=0x%04x %u bytes", session, static_cast<unsigned>(len));
+    send_image(blob, len, session);   // takes ownership of blob
+}
+
 // Takes ownership of `jpeg`: image_tx_task frees it (heap_caps_free) once the
 // transfer finishes or aborts. The caller must NOT free it — the previous
 // scheme (caller frees after a fixed 30s wait) raced the tx task's own 30s
@@ -2040,6 +2098,30 @@ void RadioPing::handle_image_eot()
     if (missing_count == 0) {
         image_rx_pending_ = false;
         image_rx_done_session_ = session_id;
+
+        // Downlink voice blob (node side): the gateway pushed an Opus stream, not
+        // an image. Step A only proves the RF path — reassemble, count the frames,
+        // print, and drop it. Decode+playback comes in step B.
+        if (session_id & APP_DOWNLINK_VOICE_SESSION_FLAG) {
+            uint8_t *buf = nullptr;
+            size_t blob_len = 0;
+            uint32_t frames = 0;
+            if (image_xfer_.rx_reassemble(&buf, &blob_len) == ESP_OK && buf) {
+                for (size_t p = 0; p < blob_len; ) {
+                    uint8_t flen = buf[p];
+                    if (flen == 0 || p + 1 + flen > blob_len) break;
+                    frames++;
+                    p += 1 + flen;
+                }
+                heap_caps_free(buf);
+            }
+            ESP_LOGI(TAG, "downlink voice RX: session=0x%04x frags=%u bytes=%u opus_frames=%lu",
+                     session_id, image_xfer_.rx_total_count(),
+                     static_cast<unsigned>(blob_len), static_cast<unsigned long>(frames));
+            image_xfer_.rx_reset();
+            return;
+        }
+
         uint32_t now_ms = smtc_modem_hal_get_time_in_ms();
         uint32_t transfer_ms = now_ms - image_rx_start_ms_;
         uint32_t prepare_ms = image_rx_start_ms_ - image_cmd_sent_ms_;
@@ -2052,6 +2134,12 @@ void RadioPing::handle_image_eot()
                  static_cast<unsigned long>(total_ms));
         if (image_rx_complete_cb_) {
             image_rx_complete_cb_(&image_xfer_);
+        }
+        // Gateway ping-pong turn point: the node's uplink image is complete, so it
+        // is now listening. Push our downlink voice blob before requesting the next
+        // frame. Gateway only (the node never sends downlink voice).
+        if (is_gateway_) {
+            send_downlink_voice();
         }
     } else {
         // On the RX/NACK hot path — this fires once per retransmit round mid
