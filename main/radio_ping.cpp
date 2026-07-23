@@ -433,6 +433,14 @@ void RadioPing::task()
 {
     while (true) {
         if (!suspended_) {
+            // Fire a capture trigger that was parked while a TX held the radio
+            // (e.g. a downlink voice blob). Runs in this task's context so it
+            // serializes cleanly with poll_once/schedule_rx — no cross-task race.
+            if (image_capture_pending_ && !image_tx_active_) {
+                image_capture_pending_ = false;
+                ESP_LOGI(TAG, "firing parked capture trigger");
+                trigger_image_capture();
+            }
             poll_once();
             update_playback_timeout();
             check_image_rx_timeout();
@@ -1222,7 +1230,12 @@ void RadioPing::image_tx_task_trampoline(void *arg)
 void RadioPing::trigger_image_capture()
 {
     if (image_tx_active_) {
-        ESP_LOGW(TAG, "image TX already active, ignoring trigger");
+        // A TX (e.g. a downlink voice blob) owns the radio right now. Park the
+        // request instead of dropping it — the radio task fires it as soon as the
+        // radio is free (see task loop). The node's pull model never drops a
+        // request either; this keeps the gateway's stream from stalling a frame.
+        image_capture_pending_ = true;
+        ESP_LOGI(TAG, "image TX active, parking capture trigger");
         return;
     }
 
@@ -1256,6 +1269,10 @@ void RadioPing::trigger_image_capture()
     image_rx_pending_ = true;
     image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
     schedule_rx();
+
+    // A request is now live — clear any stale parked flag so the radio task does
+    // not re-fire and drop this fresh RX.
+    image_capture_pending_ = false;
 }
 
 // Low power: begin a new request round. One LoRa wakeup preamble (~520ms) trips

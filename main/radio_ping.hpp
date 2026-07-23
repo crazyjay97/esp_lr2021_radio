@@ -270,6 +270,12 @@ private:
     // image session counter and always OR'd with APP_DOWNLINK_VOICE_SESSION_FLAG.
     uint16_t downlink_voice_session_ = 1;
     volatile bool image_tx_active_ = false;
+    // A stream next-frame trigger that arrived while a TX was in flight (e.g. a
+    // downlink voice blob) is parked here instead of being dropped, then fired by
+    // the radio task once the radio is free. Mirrors the node's pull model, which
+    // never drops a request — so the gateway's pull stream never stalls for a
+    // whole frame just because a downlink blob was mid-flight.
+    volatile bool image_capture_pending_ = false;
     bool opus_preenc_enabled_ = false;
     // Last cumulative opus-ring drop count seen by drain_opus(), so we only log
     // the per-drain delta instead of the running total on every frame.
