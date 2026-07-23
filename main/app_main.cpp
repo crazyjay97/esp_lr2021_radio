@@ -1000,6 +1000,13 @@ void cooldown_retry_cb(void *arg)
 
 bool on_gw_capture(void)
 {
+    // A transfer is already running — don't preempt it (that deadlocks the
+    // half-duplex radio) and don't abort the HTTP download. Ignore the request.
+    if (g_radio.image_busy()) {
+        ESP_LOGW(TAG, "UI capture: transfer in progress, ignoring");
+        return false;
+    }
+
     if (g_audio_clip_enabled) {
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
         if (s_last_gw_capture_ms != 0 &&
@@ -1039,6 +1046,13 @@ void on_gw_rx_abort(void)
     ESP_LOGI(TAG, "UI: left transfer page, aborting image RX");
     g_radio.abort_image_rx();
     image_store_abort_transfer();
+}
+
+// Gateway UI: true while an image request/RX is in progress. The UI uses this to
+// ignore the capture key mid-transfer (no new request is started).
+bool on_gw_query_busy(void)
+{
+    return g_radio.image_busy();
 }
 
 // Gateway UI interval change callback — sends config to camera node
@@ -1422,6 +1436,7 @@ extern "C" void app_main(void)
                 ui_gw_set_wifi_prov_cb(on_wifi_prov_request);
                 ui_gw_set_wifi_disconnect_cb(on_wifi_disconnect_request);
                 ui_gw_set_rx_abort_cb(on_gw_rx_abort);
+                ui_gw_set_busy_cb(on_gw_query_busy);
 
                 wifi_mgr_set_state_cb(on_wifi_state_change);
                 wifi_mgr_init();

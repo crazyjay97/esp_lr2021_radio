@@ -153,6 +153,7 @@ static bool s_low_power_on = false;
 static ui_gw_wifi_prov_cb_t s_wifi_prov_cb = NULL;
 static ui_gw_wifi_disconnect_cb_t s_wifi_disconnect_cb = NULL;
 static ui_gw_rx_abort_cb_t s_rx_abort_cb = NULL;
+static ui_gw_busy_cb_t s_busy_cb = NULL;
 
 /* PAGE_CONFIG WiFi status panel */
 static lv_obj_t *s_cfg_wifi_btn = NULL;
@@ -528,6 +529,13 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
 
     switch (idx) {
     case 0: /* Capture */
+        /* Ignore the key entirely while a transfer is already running: don't
+         * switch to the RX page and don't fire a new request. A second request
+         * mid-transfer deadlocks the half-duplex radio. */
+        if (s_busy_cb && s_busy_cb()) {
+            ESP_LOGW(TAG, "capture ignored: transfer in progress");
+            break;
+        }
         if (s_capture_cb) {
             show_page(UI_PAGE_RX);
             if (s_capture_cb()) {
@@ -1121,7 +1129,12 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
 
     if (key == BSP_BTN_VOL_DN) {
         /* K3 = Capture (works from any page) */
-        if (s_capture_cb) {
+        /* Ignore the key entirely while a transfer is already running: don't
+         * switch to the RX page and don't fire a new request. A second request
+         * mid-transfer deadlocks the half-duplex radio. */
+        if (s_busy_cb && s_busy_cb()) {
+            ESP_LOGW(TAG, "capture ignored: transfer in progress");
+        } else if (s_capture_cb) {
             if (s_page != UI_PAGE_RX) {
                 show_page(UI_PAGE_RX);
             }
@@ -1315,6 +1328,11 @@ void ui_gw_set_wifi_disconnect_cb(ui_gw_wifi_disconnect_cb_t cb)
 void ui_gw_set_rx_abort_cb(ui_gw_rx_abort_cb_t cb)
 {
     s_rx_abort_cb = cb;
+}
+
+void ui_gw_set_busy_cb(ui_gw_busy_cb_t cb)
+{
+    s_busy_cb = cb;
 }
 
 void ui_gw_wifi_update(const char *state_str, const char *ssid, int8_t rssi)

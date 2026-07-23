@@ -1151,24 +1151,19 @@ void RadioPing::image_tx_task_trampoline(void *arg)
     static_cast<RadioPing *>(arg)->image_tx_task();
 }
 
-void RadioPing::trigger_image_capture()
+bool RadioPing::trigger_image_capture()
 {
-    if (image_tx_active_) {
-        ESP_LOGW(TAG, "image TX already active, ignoring trigger");
-        return;
-    }
-
-    // Abandon any in-progress RX (and its pending ImageCmd retry) before starting
-    // a new request. Otherwise the old session's tail (a few missing frags still
-    // being NACKed) fights the new ImageCmd flood on the half-duplex radio and
-    // neither finishes — both sides deadlock. Starting fresh drops the stale one.
-    if (image_rx_pending_ || image_req_active_) {
-        ESP_LOGI(TAG, "trigger: dropping stale RX (session=%u) for new request",
-                 image_xfer_.rx_session_id());
-        image_req_active_ = false;
-        image_rx_pending_ = false;
-        image_xfer_.rx_reset();
-        image_rx_nack_sent_ = 0;
+    // Reject a new request while any transfer is already in progress. Preempting
+    // an active transfer used to drop the stale RX and restart, but on the
+    // half-duplex radio the old session's tail (missing frags still being NACKed)
+    // fights the new ImageCmd flood and neither finishes — both sides deadlock.
+    // The in-progress state always clears on RX-complete, the 10s RX timeout, or
+    // a user abort (left transfer page), so a rejected request is never permanent:
+    // once the current transfer ends, the next trigger goes through.
+    if (image_busy()) {
+        ESP_LOGW(TAG, "image transfer in progress (tx=%d rx=%d req=%d), ignoring new request",
+                 image_tx_active_, image_rx_pending_, image_req_active_);
+        return false;
     }
 
     // Pick the session ONCE for this whole request. Retries reuse it (they do
@@ -1188,6 +1183,7 @@ void RadioPing::trigger_image_capture()
     image_rx_pending_ = true;
     image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
     schedule_rx();
+    return true;
 }
 
 // Low power: begin a new request round. One LoRa wakeup preamble (~520ms) trips

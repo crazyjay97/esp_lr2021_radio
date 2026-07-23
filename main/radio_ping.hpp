@@ -38,8 +38,14 @@ public:
     void suspend();
     void resume();
 
-    // Image transfer: B triggers A to capture
-    void trigger_image_capture();
+    // Image transfer: B triggers A to capture. Returns false (and does nothing)
+    // if a request/RX is already in progress — a new request cannot preempt an
+    // active transfer (see the body for why restarting mid-transfer deadlocks).
+    bool trigger_image_capture();
+    // True while the gateway owns the radio for an image request or RX (or, on
+    // the node, while an image TX is running). Callers use this to avoid firing
+    // a second transfer request on top of an active one.
+    bool image_busy() const { return image_tx_active_ || image_rx_pending_ || image_req_active_; }
     // Gateway: abort the in-progress image RX (and any pending ImageCmd retry).
     // Called from the UI thread when the user leaves the transfer page; only
     // sets a request flag so the actual radio-state teardown happens in the
