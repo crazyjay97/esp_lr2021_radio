@@ -18,6 +18,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "driver/i2s_std.h"
@@ -249,6 +250,57 @@ static esp_err_t i2s_init(uint32_t sample_rate_hz)
     return ESP_OK;
 }
 
+/* The I2S DMA interrupt is allocated on whichever core calls i2s_channel_enable().
+ * The radio's GPIO IRQ lives on core 0, and during an image burst the RX DMA
+ * interrupt on core 0 competes with it, dropping received packets. Run the I2S
+ * init (and thus its DMA ISR registration) on core 1 so core 0 stays free for
+ * the radio. i2s_channel_read/write are just queue ops and don't care which core
+ * the ISR runs on, so callers on either core are unaffected.
+ *
+ * We use a short-lived worker task pinned to core 1 rather than esp_ipc_call: the
+ * IPC task's stack is tiny (~1 KB) and i2s_init puts two large config structs on
+ * the stack plus calls into the driver, which overflows it. A dedicated task lets
+ * us size the stack correctly. */
+typedef struct {
+    uint32_t          sample_rate_hz;
+    esp_err_t         result;
+    SemaphoreHandle_t done;
+} i2s_init_worker_ctx_t;
+
+static void i2s_init_core1_worker(void *arg)
+{
+    i2s_init_worker_ctx_t *ctx = (i2s_init_worker_ctx_t *)arg;
+    ctx->result = i2s_init(ctx->sample_rate_hz);
+    xSemaphoreGive(ctx->done);   /* ctx is not touched after this */
+    vTaskDelete(NULL);
+}
+
+static esp_err_t i2s_init_on_core1(uint32_t sample_rate_hz)
+{
+    i2s_init_worker_ctx_t ctx = {
+        .sample_rate_hz = sample_rate_hz,
+        .result         = ESP_FAIL,
+        .done           = xSemaphoreCreateBinary(),
+    };
+    if (ctx.done == NULL) {
+        ESP_LOGE(TAG, "sem alloc failed; init on caller core");
+        return i2s_init(sample_rate_hz);
+    }
+
+    BaseType_t ok = xTaskCreatePinnedToCore(i2s_init_core1_worker, "i2s_init",
+                                            4096, &ctx, tskIDLE_PRIORITY + 5,
+                                            NULL, 1);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "worker spawn failed; init on caller core");
+        vSemaphoreDelete(ctx.done);
+        return i2s_init(sample_rate_hz);
+    }
+
+    xSemaphoreTake(ctx.done, portMAX_DELAY);
+    vSemaphoreDelete(ctx.done);
+    return ctx.result;
+}
+
 static esp_err_t i2s_init_tx_only(uint32_t sample_rate_hz)
 {
     if (s_tx != NULL) {
@@ -353,8 +405,9 @@ esp_err_t bsp_audio_init(uint32_t sample_rate_hz)
     es_log_reg(ES8311_CHVER_REGFF, "CHIPFF");
 
     /* I2S must start clocking *before* the codec programming so the codec
-     * can sync its internal PLL / clock manager. */
-    ESP_RETURN_ON_ERROR(i2s_init(sample_rate_hz), TAG, "i2s");
+     * can sync its internal PLL / clock manager. Init on core 1 so the RX DMA
+     * interrupt lands there instead of contending with the radio IRQ on core 0. */
+    ESP_RETURN_ON_ERROR(i2s_init_on_core1(sample_rate_hz), TAG, "i2s");
     ESP_RETURN_ON_ERROR(es8311_program_regs(),    TAG, "es8311 regs");
     es_dump_key_regs("after codec init");
 
