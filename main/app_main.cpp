@@ -23,6 +23,7 @@
 
 #include <stdio.h>
 #include <new>
+#include <cmath>
 
 #include "app_config.h"
 #include "bsp.h"
@@ -950,6 +951,74 @@ static void av_queue_push(AVFrame *frame)
     }
 }
 
+// --- Howling (acoustic feedback) suppression --------------------------------
+// The gateway speaker sitting close to the node mic can form an acoustic
+// feedback loop (howling). Field data showed howling has two clean signatures
+// in the decoded playback PCM that normal audio never hits: heavy sample
+// saturation (clip%) and very high energy (rms). Autocorrelation / ZCR variance
+// were unreliable in practice, so detection uses only clip% + rms.
+//
+// State machine (per 10ms frame, 160 samples @ 16kHz):
+//   ACTIVE  -> a frame with clip >= ENTER_CLIP AND rms >= ENTER_RMS held for
+//              ENTER_FRAMES starts muting.
+//   MUTED   -> output is zeroed; when clip <= EXIT_CLIP AND rms <= EXIT_RMS for
+//              EXIT_FRAMES (one full echo round-trip) playback resumes.
+// Thresholds are intentionally loose: only unmistakable howling is muted, so
+// loud but legitimate audio is never cut. Muting the gateway speaker breaks the
+// loop, so the mic stops re-capturing the tone and levels fall back to normal.
+#define HOWL_CLIP_SAMPLE    29490   /* 0.9 * full scale: a "clipped" sample     */
+#define HOWL_ENTER_CLIP     5       /* % clipped samples to call it howling     */
+#define HOWL_ENTER_RMS      6000    /* energy floor to call it howling          */
+#define HOWL_ENTER_FRAMES   3       /* ~30ms sustained before muting            */
+#define HOWL_EXIT_CLIP      2       /* % clipped to consider the loop broken    */
+#define HOWL_EXIT_RMS       4500    /* energy ceiling to consider it gone       */
+#define HOWL_EXIT_FRAMES    50      /* ~500ms clear (> one echo round-trip)     */
+
+struct HowlSuppressor {
+    bool     muted;
+    uint16_t enter_run;   // consecutive frames meeting the enter condition
+    uint16_t exit_run;    // consecutive frames meeting the exit condition
+};
+
+// Analyze one decoded frame and update mute state. Returns true if this frame
+// should be silenced (zeroed) before playback.
+static bool howl_process(HowlSuppressor *h, const int16_t *pcm, int n)
+{
+    if (n <= 0) return h->muted;
+
+    int64_t sum_sq = 0;
+    int      clipped = 0;
+    for (int i = 0; i < n; i++) {
+        int32_t s = pcm[i];
+        sum_sq += (int64_t)s * s;
+        int32_t a = s < 0 ? -s : s;
+        if (a > HOWL_CLIP_SAMPLE) clipped++;
+    }
+    uint32_t rms = (uint32_t)sqrtf((float)(sum_sq / n));
+    uint32_t clip_pct = (uint32_t)(clipped * 100 / n);
+
+    if (!h->muted) {
+        bool howl = (clip_pct >= HOWL_ENTER_CLIP && rms >= HOWL_ENTER_RMS);
+        h->enter_run = howl ? (uint16_t)(h->enter_run + 1) : 0;
+        if (h->enter_run >= HOWL_ENTER_FRAMES) {
+            h->muted = true;
+            h->exit_run = 0;
+            ESP_LOGW(TAG, "howling detected (clip=%lu%% rms=%lu), muting",
+                     (unsigned long)clip_pct, (unsigned long)rms);
+        }
+    } else {
+        bool clear = (clip_pct <= HOWL_EXIT_CLIP && rms <= HOWL_EXIT_RMS);
+        h->exit_run = clear ? (uint16_t)(h->exit_run + 1) : 0;
+        if (h->exit_run >= HOWL_EXIT_FRAMES) {
+            h->muted = false;
+            h->enter_run = 0;
+            ESP_LOGI(TAG, "howling cleared, resuming playback");
+        }
+    }
+
+    return h->muted;
+}
+
 // Gateway AV playback task. Dequeues image+audio pairs, shows the image, then
 // decodes/writes the opus segment to I2S. No prebuffer: it plays as soon as a
 // frame exists (lowest latency). Catch-up: if the frame pulled off the queue
@@ -974,6 +1043,7 @@ void gateway_audio_task(void *arg)
 
     int16_t pcm[APP_AUDIO_FRAME_SAMPLES];
     int16_t stereo[APP_AUDIO_FRAME_SAMPLES * 2];
+    HowlSuppressor howl = {};   // acoustic-feedback (howling) mute state
 
     for (;;) {
         // Block until a frame is available. No prebuffer -> play immediately.
@@ -1022,9 +1092,12 @@ void gateway_audio_task(void *arg)
             int n = codec.decode(&frame.opus_packed[pos], flen, pcm, APP_AUDIO_FRAME_SAMPLES);
             pos += flen;
             if (n <= 0) continue;
+            // Break the acoustic feedback loop: zero this frame while howling.
+            bool mute = howl_process(&howl, pcm, n);
             for (int i = 0; i < n; i++) {
-                stereo[2 * i] = pcm[i];
-                stereo[2 * i + 1] = pcm[i];
+                int16_t s = mute ? 0 : pcm[i];
+                stereo[2 * i] = s;
+                stereo[2 * i + 1] = s;
             }
             size_t written = 0;
             bsp_audio_write(stereo, n * 2 * sizeof(int16_t), &written);
