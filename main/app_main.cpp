@@ -72,20 +72,26 @@ esp_timer_handle_t g_ptt_timer = nullptr;
 // (not re-entrant inside the rx-complete callback).
 esp_timer_handle_t g_stream_next_timer = nullptr;
 
-// Gateway continuous audio playback. Each received frame's opus segment is
-// copied into g_audio_queue by the rx-complete callback (non-blocking) and
-// drained by gateway_audio_task, which decodes + writes I2S continuously. A
-// small prebuffer absorbs the retransmit-induced jitter of the pull stream.
-struct AudioSegment {
-    uint8_t *opus_packed;   // heap_caps blob, player task frees it
-    size_t   len;
+// Gateway AV sync queue. Each received frame (image + audio) is paired into an
+// AVFrame struct by the rx-complete callback (non-blocking). gateway_audio_task
+// dequeues these pairs and displays the image immediately before playing its
+// corresponding audio segment, naturally syncing video to the I2S clock-driven
+// audio timeline. A small prebuffer absorbs the retransmit-induced jitter.
+struct AVFrame {
+    uint16_t *rgb565;       // decoded image in SPIRAM, null if no image
+    uint32_t  width;
+    uint32_t  height;
+    uint8_t  *opus_packed;  // opus blob in SPIRAM, null if no audio
+    size_t    opus_len;
+    uint32_t  jpeg_size;    // original compressed size, for diagnostics
+    uint32_t  transfer_ms;  // RF transfer time, for diagnostics
 };
-QueueHandle_t g_audio_queue = nullptr;
+QueueHandle_t g_av_queue = nullptr;
 TaskHandle_t g_audio_task = nullptr;
 bool g_audio_playing_state = false;
-#define APP_GW_AUDIO_QUEUE_SIZE     20      /* ~ a few seconds of frame segments */
+#define APP_GW_AV_QUEUE_SIZE        20      /* ~ a few seconds of AV pairs */
 #define APP_GW_AUDIO_PREBUFFER_MS   400U    /* jitter buffer depth before playback */
-#define APP_GW_AUDIO_SEG_EST_MS     220U    /* rough per-segment duration estimate */
+#define APP_GW_AV_FRAME_EST_MS      220U    /* rough per-frame duration estimate */
 
 const char *mode_name(AppMode mode)
 {
@@ -909,40 +915,40 @@ bool on_image_capture_request(uint16_t session_id)
     return true;
 }
 
-// Push one opus segment (copied) into the gateway playback queue. Non-blocking:
-// returns immediately so the rx-complete path / pull loop is never stalled by
-// audio. On a full queue the OLDEST segment is dropped to make room, keeping
-// playback close to real time rather than backing up unbounded latency.
-static void audio_queue_push(const uint8_t *opus_data, size_t opus_len)
+// Free both buffers an AVFrame owns. Safe on null fields.
+static void av_frame_free(AVFrame *f)
 {
-    if (!g_audio_queue || !opus_data || opus_len == 0) return;
+    if (!f) return;
+    if (f->rgb565)      heap_caps_free(f->rgb565);
+    if (f->opus_packed) heap_caps_free(f->opus_packed);
+    f->rgb565 = nullptr;
+    f->opus_packed = nullptr;
+}
 
-    AudioSegment seg;
-    seg.opus_packed = static_cast<uint8_t *>(heap_caps_malloc(opus_len, MALLOC_CAP_SPIRAM));
-    if (!seg.opus_packed) {
-        ESP_LOGW(TAG, "audio queue push: alloc failed %u bytes",
-                 static_cast<unsigned>(opus_len));
-        return;
-    }
-    memcpy(seg.opus_packed, opus_data, opus_len);
-    seg.len = opus_len;
+// Push one paired image+audio frame into the AV sync queue. Non-blocking so the
+// rx-complete path / pull loop is never stalled. On a full queue the OLDEST
+// pair is dropped (and freed) to make room, keeping playback close to real time
+// rather than backing up unbounded latency. Takes ownership of both buffers.
+static void av_queue_push(AVFrame *frame)
+{
+    if (!g_av_queue || !frame) { av_frame_free(frame); return; }
 
-    if (xQueueSend(g_audio_queue, &seg, 0) != pdTRUE) {
-        AudioSegment old;
-        if (xQueueReceive(g_audio_queue, &old, 0) == pdTRUE) {
-            heap_caps_free(old.opus_packed);
+    if (xQueueSend(g_av_queue, frame, 0) != pdTRUE) {
+        AVFrame old;
+        if (xQueueReceive(g_av_queue, &old, 0) == pdTRUE) {
+            av_frame_free(&old);
         }
-        if (xQueueSend(g_audio_queue, &seg, 0) != pdTRUE) {
-            heap_caps_free(seg.opus_packed);   // still no room; drop ours
+        if (xQueueSend(g_av_queue, frame, 0) != pdTRUE) {
+            av_frame_free(frame);   // still no room; drop ours
         }
     }
 }
 
-// Rough estimate of queued audio duration, used only to gate the prebuffer.
-static uint32_t audio_queue_ms(void)
+// Rough estimate of queued AV duration, used only to gate the prebuffer.
+static uint32_t av_queue_ms(void)
 {
-    if (!g_audio_queue) return 0;
-    return uxQueueMessagesWaiting(g_audio_queue) * APP_GW_AUDIO_SEG_EST_MS;
+    if (!g_av_queue) return 0;
+    return uxQueueMessagesWaiting(g_av_queue) * APP_GW_AV_FRAME_EST_MS;
 }
 
 // Gateway continuous audio playback task. Dequeues opus segments, decodes each
@@ -971,7 +977,7 @@ void gateway_audio_task(void *arg)
 
     for (;;) {
         if (!g_audio_playing_state) {
-            if (audio_queue_ms() < APP_GW_AUDIO_PREBUFFER_MS) {
+            if (av_queue_ms() < APP_GW_AUDIO_PREBUFFER_MS) {
                 vTaskDelay(pdMS_TO_TICKS(50));
                 continue;
             }
@@ -980,18 +986,30 @@ void gateway_audio_task(void *arg)
             ESP_LOGI(TAG, "audio playback started (prebuffer reached), PA on");
         }
 
-        AudioSegment seg;
-        if (xQueueReceive(g_audio_queue, &seg, pdMS_TO_TICKS(300)) != pdTRUE) {
+        AVFrame frame;
+        if (xQueueReceive(g_av_queue, &frame, pdMS_TO_TICKS(300)) != pdTRUE) {
             g_audio_playing_state = false;   // underrun -> re-prebuffer
             bsp_audio_pa_enable(false);      // silence the amp while we refill
             continue;
         }
 
+        // AV sync: display THIS frame's image right before playing its audio.
+        // Because we only reach here at the audio drain rate (I2S clock paced),
+        // the image cadence tracks the audio timeline instead of racing ahead
+        // at RF-arrival speed. The rotate+invalidate is a few ms; the LVGL flush
+        // then overlaps the ~220ms audio playback below on the LVGL task.
+        if (frame.rgb565) {
+            ui_gw_rx_complete(frame.rgb565, frame.width, frame.height,
+                              frame.jpeg_size, frame.transfer_ms);
+            heap_caps_free(frame.rgb565);
+            frame.rgb565 = nullptr;
+        }
+
         size_t pos = 0;
-        while (pos < seg.len) {
-            uint8_t flen = seg.opus_packed[pos++];
-            if (flen == 0 || pos + flen > seg.len) break;
-            int n = codec.decode(&seg.opus_packed[pos], flen, pcm, APP_AUDIO_FRAME_SAMPLES);
+        while (frame.opus_packed && pos < frame.opus_len) {
+            uint8_t flen = frame.opus_packed[pos++];
+            if (flen == 0 || pos + flen > frame.opus_len) break;
+            int n = codec.decode(&frame.opus_packed[pos], flen, pcm, APP_AUDIO_FRAME_SAMPLES);
             pos += flen;
             if (n <= 0) continue;
             for (int i = 0; i < n; i++) {
@@ -1001,7 +1019,7 @@ void gateway_audio_task(void *arg)
             size_t written = 0;
             bsp_audio_write(stereo, n * 2 * sizeof(int16_t), &written);
         }
-        heap_caps_free(seg.opus_packed);
+        av_frame_free(&frame);
     }
 }
 
@@ -1050,6 +1068,13 @@ void on_image_rx_complete(ImageTransfer *xfer)
     uint32_t t_rx = static_cast<uint32_t>(esp_log_timestamp());
     uint32_t t_decode_ms = 0, t_display_ms = 0, t_save_ms = 0;
     static uint32_t s_last_frame_ms = 0;
+
+    // AV sync staging: when a frame carries audio, the decoded image is copied
+    // here (SPIRAM) and later paired with its opus segment into g_av_queue so
+    // gateway_audio_task displays it in lockstep with playback. Null when the
+    // image was already shown inline (no audio, or SPIRAM copy failed).
+    uint16_t *av_pending_rgb565 = nullptr;
+    uint32_t  av_pending_w = 0, av_pending_h = 0;
 
     if (g_audio_clip_enabled) {
         s_last_gw_capture_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -1110,12 +1135,31 @@ void on_image_rx_complete(ImageTransfer *xfer)
                     uint32_t h = header.height;
                     uint32_t t_disp0 = static_cast<uint32_t>(esp_log_timestamp());
                     if (g_app_mode == AppMode::radio) {
-                        // Synchronous cost only: rotate into the canvas + mark
-                        // dirty. The actual LCD flush happens asynchronously on
-                        // the LVGL task (core 1), overlapping the next frame's
-                        // transfer, so it is NOT included in t_display_ms.
-                        ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565), w, h,
-                                          static_cast<uint32_t>(raw_len), g_radio.last_transfer_ms());
+                        if (has_audio && opus_len > 0) {
+                            // AV sync path: hand the image to gateway_audio_task
+                            // paired with its audio, so display is paced by the
+                            // I2S clock instead of racing ahead at RF speed. Copy
+                            // rgb565 into SPIRAM (decode buffer is freed here).
+                            av_pending_rgb565 = static_cast<uint16_t *>(
+                                heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM));
+                            if (av_pending_rgb565) {
+                                memcpy(av_pending_rgb565, rgb565, (size_t)w * h * 2);
+                                av_pending_w = w;
+                                av_pending_h = h;
+                            } else {
+                                // SPIRAM full: fall back to immediate display so
+                                // the frame is not lost (audio will be ahead).
+                                ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565),
+                                                  w, h, static_cast<uint32_t>(raw_len),
+                                                  g_radio.last_transfer_ms());
+                            }
+                        } else {
+                            // No audio: display immediately for lowest latency.
+                            // Synchronous cost only (rotate + mark dirty); the LCD
+                            // flush happens async on the LVGL task (core 1).
+                            ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565), w, h,
+                                              static_cast<uint32_t>(raw_len), g_radio.last_transfer_ms());
+                        }
                     } else {
                         bsp_lcd_show_rgb565_photo(reinterpret_cast<const uint16_t *>(rgb565), w, h);
                         bsp_lcd_set_camera_status("Photo received");
@@ -1133,12 +1177,28 @@ void on_image_rx_complete(ImageTransfer *xfer)
     image_store_save(jpeg_data, jpeg_len, opus_data, opus_len, sid);
     t_save_ms = static_cast<uint32_t>(esp_log_timestamp()) - t_save0;
 
-    // Enqueue audio for continuous playback. Non-blocking: the old blocking
+    // Enqueue the AV pair for synced playback. Non-blocking: the old blocking
     // play_audio_clip() ran the whole segment inline on the rx path and stalled
-    // the pull loop (rx done -> 10ms -> request next frame), which capped the
-    // frame rate. gateway_audio_task now decodes/plays off this thread.
-    if (opus_data && opus_len > 0) {
-        audio_queue_push(opus_data, opus_len);
+    // the pull loop, capping frame rate. gateway_audio_task now displays the
+    // image + decodes/plays audio off this thread, paced by the I2S clock so
+    // video stays in sync with audio. If the image was already shown inline
+    // (SPIRAM copy failed) av_pending_rgb565 is null and only audio is queued.
+    if (av_pending_rgb565 || (opus_data && opus_len > 0)) {
+        AVFrame frame = {};
+        frame.rgb565      = av_pending_rgb565;
+        frame.width       = av_pending_w;
+        frame.height      = av_pending_h;
+        frame.jpeg_size   = static_cast<uint32_t>(raw_len);
+        frame.transfer_ms = g_radio.last_transfer_ms();
+        if (opus_data && opus_len > 0) {
+            frame.opus_packed = static_cast<uint8_t *>(
+                heap_caps_malloc(opus_len, MALLOC_CAP_SPIRAM));
+            if (frame.opus_packed) {
+                memcpy(frame.opus_packed, opus_data, opus_len);
+                frame.opus_len = opus_len;
+            }
+        }
+        av_queue_push(&frame);   // takes ownership of both buffers
     }
 
     heap_caps_free(raw);
@@ -1658,12 +1718,12 @@ extern "C" void app_main(void)
                     nvs_close(gw_nvs);
                 }
 
-                // Continuous audio playback (gateway only): create the segment
+                // AV sync playback (gateway only): create the paired image+audio
                 // queue and start the player task. Pinned to core 1 (with LVGL)
                 // at a priority below the UI so display refresh stays smooth.
-                g_audio_queue = xQueueCreate(APP_GW_AUDIO_QUEUE_SIZE, sizeof(AudioSegment));
-                if (!g_audio_queue) {
-                    ESP_LOGE(TAG, "gateway audio queue create failed");
+                g_av_queue = xQueueCreate(APP_GW_AV_QUEUE_SIZE, sizeof(AVFrame));
+                if (!g_av_queue) {
+                    ESP_LOGE(TAG, "gateway AV queue create failed");
                 } else {
                     // 8KB stack: the Opus decoder uses several KB internally,
                     // plus the pcm/stereo frame buffers are on-stack locals.
