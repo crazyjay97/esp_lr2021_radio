@@ -1753,8 +1753,10 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "led init: %s", esp_err_to_name(e));
     }
     if (g_app_mode == AppMode::radio) {
-        if ((e = bsp_audio_init_playback_only(APP_AUDIO_SAMPLE_RATE_HZ)) != ESP_OK) {
-            ESP_LOGE(TAG, "audio init (playback): %s", esp_err_to_name(e));
+        // Gateway now needs mic capture too (downlink voice), so init full duplex
+        // instead of playback-only.
+        if ((e = bsp_audio_init(APP_AUDIO_SAMPLE_RATE_HZ)) != ESP_OK) {
+            ESP_LOGE(TAG, "audio init (gateway full duplex): %s", esp_err_to_name(e));
         }
     } else {
         if ((e = bsp_audio_init(APP_AUDIO_SAMPLE_RATE_HZ)) != ESP_OK) {
@@ -1793,6 +1795,8 @@ extern "C" void app_main(void)
                 ESP_LOGE(TAG, "radio task start (gateway): %s", esp_err_to_name(e));
             } else {
                 g_radio_active = true;
+                // Enable Opus pre-encoding of gateway mic input (downlink voice).
+                g_radio.enable_opus_preenc(true);
                 nvs_handle_t gw_nvs;
                 if (nvs_open("ui_gw", NVS_READONLY, &gw_nvs) == ESP_OK) {
                     uint8_t lp = 0;

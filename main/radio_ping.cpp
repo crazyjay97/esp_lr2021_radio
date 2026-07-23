@@ -191,7 +191,9 @@ esp_err_t RadioPing::init_gateway()
     instance_ = this;
     is_gateway_ = true;
 
-    esp_err_t err = codec_.init_decoder_only();
+    // Gateway now needs BOTH: decoder for the node's uplink voice/image-blob
+    // audio, and encoder for its own downlink voice (bidirectional intercom).
+    esp_err_t err = codec_.init();
     if (err != ESP_OK) {
         return err;
     }
@@ -200,6 +202,12 @@ esp_err_t RadioPing::init_gateway()
     if (voice_queue_ == nullptr) {
         ESP_LOGE(TAG, "voice queue alloc failed");
         return ESP_ERR_NO_MEM;
+    }
+
+    // Pre-encode ring for the gateway's downlink voice (same sizing as node).
+    size_t opus_ring_frames = APP_OPUS_RING_SECONDS * 1000 / APP_AUDIO_FRAME_MS;
+    if (!opus_ringbuf_.init(opus_ring_frames)) {
+        ESP_LOGW(TAG, "opus ring buffer alloc failed (PSRAM?)");
     }
 
 #if !APP_RADIO_HW_INIT_ENABLE
@@ -244,6 +252,18 @@ esp_err_t RadioPing::start_gateway()
                                             APP_RADIO_TASK_STACK_BYTES, this,
                                             APP_RADIO_TASK_PRIORITY, &task_handle_,
                                             APP_RADIO_TASK_CORE);
+    if (ok != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Gateway now captures mic input, encodes, and writes to the pre-encode ring
+    // for downlink voice (bidirectional intercom). Reuse tx_task: its gateway
+    // path naturally skips PIR/low-power/sound-trigger branches (all inert when
+    // is_gateway_==true and sound_trigger_level_==0), leaving a clean capture loop.
+    ok = xTaskCreatePinnedToCore(tx_task_trampoline, "voice_tx",
+                                 APP_VOICE_TX_TASK_STACK_BYTES, this,
+                                 APP_VOICE_TX_TASK_PRIORITY, nullptr,
+                                 APP_VOICE_TX_TASK_CORE);
     if (ok != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
