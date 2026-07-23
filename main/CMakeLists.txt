@@ -27,6 +27,7 @@ idf_component_register(SRCS
                            esp_driver_spi
                            esp_driver_uart
                            esp_lcd
+                           console
                            esp_timer
                            esp_adc
                            nvs_flash

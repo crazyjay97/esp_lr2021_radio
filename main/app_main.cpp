@@ -13,6 +13,7 @@
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_console.h"
 #include "driver/gpio.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -1184,6 +1185,51 @@ void on_button(bsp_btn_id_t id, bool pressed, void *user)
         return;
     }
 }
+
+// Console command: "version" -> print firmware version and FLRC TX power.
+int cmd_version(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    ESP_LOGI(TAG, "firmware version: V1.01");
+    ESP_LOGI(TAG, "FLRC TX power: %d dBm", APP_FLRC_TX_POWER_DBM);
+    return 0;
+}
+
+// Start a REPL on the console (USB-Serial-JTAG) so the user can type commands
+// like "version" over the same serial port the logs come out of.
+void start_console()
+{
+    esp_console_repl_t *repl = nullptr;
+    esp_console_repl_config_t repl_cfg = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    repl_cfg.prompt = "lr2021>";
+
+    const esp_console_cmd_t version_cmd = {
+        .command = "version",
+        .help = "Print firmware version and FLRC TX power",
+        .hint = nullptr,
+        .func = &cmd_version,
+        .argtable = nullptr,
+        .func_w_context = nullptr,
+        .context = nullptr,
+    };
+
+    esp_err_t e = esp_console_cmd_register(&version_cmd);
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "register version cmd: %s", esp_err_to_name(e));
+        return;
+    }
+
+    esp_console_dev_usb_serial_jtag_config_t dev_cfg =
+        ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
+    if ((e = esp_console_new_repl_usb_serial_jtag(&dev_cfg, &repl_cfg, &repl)) != ESP_OK) {
+        ESP_LOGE(TAG, "console repl init: %s", esp_err_to_name(e));
+        return;
+    }
+    if ((e = esp_console_start_repl(repl)) != ESP_OK) {
+        ESP_LOGE(TAG, "console repl start: %s", esp_err_to_name(e));
+    }
+}
 } // namespace
 
 extern "C" void app_main(void)
@@ -1442,4 +1488,10 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "display: ST7789T3 %ux%u camera capture UI",
              APP_LCD_H_RES, APP_LCD_V_RES);
     ESP_LOGI(TAG, "K5: switch camera/radio mode. K6/PTT: FLRC voice in radio mode. K4=vol+, K3=vol-");
+
+    ESP_LOGI(TAG, "firmware version: V1.01");
+    ESP_LOGI(TAG, "FLRC TX power: %d dBm", APP_FLRC_TX_POWER_DBM);
+
+    // Console: type "version" to reprint version + TX power at any time.
+    start_console();
 }
