@@ -1206,7 +1206,7 @@ int cmd_version(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-    ESP_LOGI(TAG, "firmware version: V1.01");
+    ESP_LOGI(TAG, "firmware version: V1.02");
     ESP_LOGI(TAG, "FLRC TX power: %d dBm", APP_FLRC_TX_POWER_DBM);
     return 0;
 }
@@ -1511,7 +1511,7 @@ extern "C" void app_main(void)
              APP_LCD_H_RES, APP_LCD_V_RES);
     ESP_LOGI(TAG, "K5: switch camera/radio mode. K6/PTT: FLRC voice in radio mode. K4=vol+, K3=vol-");
 
-    ESP_LOGI(TAG, "firmware version: V1.01");
+    ESP_LOGI(TAG, "firmware version: V1.02");
     ESP_LOGI(TAG, "FLRC TX power: %d dBm", APP_FLRC_TX_POWER_DBM);
 
     // Console: type "version" to reprint version + TX power at any time.
