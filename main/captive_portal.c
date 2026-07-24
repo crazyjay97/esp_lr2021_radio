@@ -152,9 +152,37 @@ static esp_err_t http_redirect_404(httpd_req_t *req, httpd_err_code_t err)
     return ESP_OK;
 }
 
+/*
+ * Explicit connectivity-probe responder. Windows in particular only treats the
+ * network as a captive portal (and stops its tight probe/disconnect loop) when
+ * it gets a clear answer on its exact probe URLs; a generic 404 handler is not
+ * reliable there. We answer every known probe URL with a 302 to the gallery so
+ * the OS pops the sign-in page and stops hammering the AP with new sockets.
+ */
+static esp_err_t probe_redirect_handler(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/gallery");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+/* Connectivity-check URLs used by common client operating systems. */
+static const char *const s_probe_urls[] = {
+    "/connecttest.txt",             /* Windows 10/11 NCSI */
+    "/redirect",                    /* Windows sign-in redirect */
+    "/ncsi.txt",                    /* Windows NCSI (legacy) */
+    "/generate_204",                /* Android */
+    "/gen_204",                     /* Android (older) */
+    "/hotspot-detect.html",         /* iOS / macOS */
+    "/library/test/success.html",   /* iOS / macOS (captive agent) */
+    "/success.txt",                 /* Firefox / NetworkManager */
+};
+
 esp_err_t captive_portal_start(httpd_handle_t httpd)
 {
-    /* Hook the HTTP 404 -> gallery redirect (idempotent). */
+    /* Hook the HTTP 404 -> gallery redirect and the explicit probe URLs. */
     if (httpd && !s_http_hooked) {
         esp_err_t e = httpd_register_err_handler(httpd, HTTPD_404_NOT_FOUND,
                                                  http_redirect_404);
@@ -162,6 +190,21 @@ esp_err_t captive_portal_start(httpd_handle_t httpd)
             s_http_hooked = true;
         } else {
             ESP_LOGW(TAG, "register 404 handler failed: %s", esp_err_to_name(e));
+        }
+
+        /* Explicit handlers for OS connectivity probes so Windows reliably
+         * detects the captive portal instead of looping on "no internet". */
+        for (size_t i = 0; i < sizeof(s_probe_urls) / sizeof(s_probe_urls[0]); i++) {
+            httpd_uri_t probe = {
+                .uri     = s_probe_urls[i],
+                .method  = HTTP_GET,
+                .handler = probe_redirect_handler,
+            };
+            esp_err_t pe = httpd_register_uri_handler(httpd, &probe);
+            if (pe != ESP_OK) {
+                ESP_LOGW(TAG, "register probe %s failed: %s",
+                         s_probe_urls[i], esp_err_to_name(pe));
+            }
         }
     }
 
