@@ -1,5 +1,6 @@
 build/
-sdkconfig
+# sdkconfig is tracked on purpose: it is the single source of truth for the
+# build configuration, so a clone reproduces the exact same firmware config.
 sdkconfig.old
 managed_components/
 dependencies.lock
