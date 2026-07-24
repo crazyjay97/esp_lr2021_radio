@@ -762,18 +762,26 @@ bool RadioPing::configure_flrc()
     ralf_params_flrc_t params = {};
     params.rf_freq_in_hz = APP_FLRC_FREQUENCY_HZ;
     params.output_pwr_in_dbm = APP_FLRC_TX_POWER_DBM;
-    params.mod_params.br_in_bps = APP_FLRC_BITRATE_BPS;
-    params.mod_params.bw_dsb_in_hz = APP_FLRC_BANDWIDTH_HZ;
+    params.mod_params.raw_bit_rate = APP_FLRC_RAW_BIT_RATE;
     params.mod_params.cr = APP_FLRC_CODING_RATE;
     params.mod_params.pulse_shape = APP_FLRC_PULSE_SHAPE;
-    params.pkt_params.preamble_len_in_bits = 32;
+    params.pkt_params.preamble_len = APP_FLRC_PREAMBLE_LEN;
     params.pkt_params.sync_word_len = RAL_FLRC_SYNCWORD_LENGTH_4_BYTES;
     params.pkt_params.tx_syncword = RAL_FLRC_TX_SYNCWORD_1;
     params.pkt_params.match_sync_word = RAL_FLRC_RX_MATCH_SYNCWORD_1;
     params.pkt_params.pld_is_fix = false;
     params.pkt_params.pld_len_in_bytes = APP_FLRC_MAX_PAYLOAD_BYTES;
     params.pkt_params.crc_type = RAL_FLRC_CRC_2_BYTES;
-    params.sync_word = kSyncWord;
+    // Upgraded driver takes three RX-match sync-word pointers; we only use
+    // syncword slot 1 (tx_syncword/match_sync_word above), so point [0] at our
+    // sync word and leave the unused slots null.
+    params.sync_word[0] = kSyncWord;
+    params.sync_word[1] = nullptr;
+    params.sync_word[2] = nullptr;
+    // is_tx=true makes ralf_setup_flrc set TX power/freq AND program sync-word
+    // slot 1 (via tx_syncword). RX matching uses RAL_FLRC_RX_MATCH_SYNCWORD_1,
+    // which checks that same slot 1, so both TX and RX work from this one setup.
+    params.is_tx = true;
     params.crc_seed = 0xFFFFFFFFUL;
     params.crc_polynomial = 0x04C11DB7UL;
     return ralf_setup_flrc(&radio_, &params) == RAL_STATUS_OK;

@@ -64,11 +64,21 @@
 /* Center frequency. Confirm the exact channel is legal for the deployment area. */
 #define APP_FLRC_FREQUENCY_HZ           915120000UL
 
-/* LR2021 FLRC high-rate mode requested for this project. */
+/* LR2021 FLRC high-rate mode requested for this project.
+ * Informational only (used in logs): the upgraded driver selects the rate via
+ * the raw_bit_rate enum below, which already implies the paired bandwidth. */
 #define APP_FLRC_BITRATE_BPS            2600000UL
 
-/* Double-sided FLRC bandwidth paired with 2.6 Mbps in the LR2021 driver. */
+/* Double-sided FLRC bandwidth paired with 2.6 Mbps. Informational only now;
+ * bandwidth is bundled into APP_FLRC_RAW_BIT_RATE in the upgraded driver. */
 #define APP_FLRC_BANDWIDTH_HZ           2666000UL
+
+/* Raw bit-rate enum for the upgraded LR2021 driver. This replaces the old
+ * br_in_bps/bw_dsb_in_hz numeric fields; 2.6 Mbps maps to the value below. */
+#define APP_FLRC_RAW_BIT_RATE           RAL_FLRC_RAW_BIT_RATE_2_600_MBPS
+
+/* Preamble length enum for the upgraded driver (was preamble_len_in_bits=32). */
+#define APP_FLRC_PREAMBLE_LEN           RAL_FLRC_PREAMBLE_LENGTH_32_BITS
 
 /* TX power for bench tests. 22 dBm saturates nearby receivers; use 10 for close range. */
 #define APP_FLRC_TX_POWER_DBM           22
