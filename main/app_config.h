@@ -104,7 +104,7 @@
 
 /* Stack for RAC callbacks plus Opus encode/decode. Opus needs much more than
  * the old ping-only path, so keep this conservative during bring-up. */
-#define APP_RADIO_TASK_STACK_BYTES      32768U
+#define APP_RADIO_TASK_STACK_BYTES      16384U
 
 /* Keep direct RAL radio control on CPU0. */
 #define APP_RADIO_TASK_CORE             0
@@ -143,14 +143,14 @@
 
 /* Opus decode plus I2S write run here so radio RX can re-arm quickly. */
 #define APP_VOICE_PLAY_TASK_PRIORITY    5
-#define APP_VOICE_PLAY_TASK_STACK_BYTES 32768U
+#define APP_VOICE_PLAY_TASK_STACK_BYTES 16384U
 
 /* Run Opus decode/playback away from direct radio control. */
 #define APP_VOICE_PLAY_TASK_CORE        1
 
 /* Opus encode plus I2S read run here so RAC polling is not blocked by audio. */
 #define APP_VOICE_TX_TASK_PRIORITY      5
-#define APP_VOICE_TX_TASK_STACK_BYTES   32768U
+#define APP_VOICE_TX_TASK_STACK_BYTES   16384U
 
 /* Keep Opus encode away from the radio/control task on CPU0. */
 #define APP_VOICE_TX_TASK_CORE          1
