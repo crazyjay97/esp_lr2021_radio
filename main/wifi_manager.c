@@ -319,8 +319,11 @@ static esp_err_t wifi_hw_start(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     cfg.nvs_enable = 0;
-    cfg.static_rx_buf_num = 6;
-    cfg.dynamic_rx_buf_num = 12;
+    /* SoftAP needs enough RX headroom during the association handshake, or a
+     * client repeatedly fails auth/assoc and its slot lingers until timeout.
+     * Bumped from 6/12 to 10/16 to fix clients that cannot associate. */
+    cfg.static_rx_buf_num = 10;
+    cfg.dynamic_rx_buf_num = 16;
     cfg.static_tx_buf_num = 0;
     cfg.dynamic_tx_buf_num = 12;
     cfg.tx_buf_type = 1;

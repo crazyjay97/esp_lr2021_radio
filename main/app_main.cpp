@@ -6,6 +6,7 @@
 #include "ui_gateway.h"
 #include "wifi_manager.h"
 #include "image_store.h"
+#include "captive_portal.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -1444,7 +1445,13 @@ extern "C" void app_main(void)
                 image_store_restore_time();
                 {
                     httpd_handle_t h = wifi_mgr_get_httpd();
-                    if (h) image_store_register_httpd(h);
+                    if (h) {
+                        image_store_register_httpd(h);
+                        // Captive portal: DNS hijack + 404->gallery redirect so
+                        // clients on the open AP stay connected and auto-open
+                        // the gallery instead of disconnecting for "no internet".
+                        captive_portal_start(h);
+                    }
                 }
 
                 // Sync audio clip state from gateway UI NVS
