@@ -784,7 +784,27 @@ bool RadioPing::configure_flrc()
     params.is_tx = true;
     params.crc_seed = 0xFFFFFFFFUL;
     params.crc_polynomial = 0x04C11DB7UL;
-    return ralf_setup_flrc(&radio_, &params) == RAL_STATUS_OK;
+    if (ralf_setup_flrc(&radio_, &params) != RAL_STATUS_OK) {
+        return false;
+    }
+
+    // FLRC BURST needs the 1024-byte FIFO: a single 511-byte fragment already
+    // overflows the default 256-byte FIFO, and the burst path prefills 2x511 =
+    // 1022 bytes. The TX FIFO (0x804000) and RX FIFO (0x804400) live in
+    // non-overlapping RAM, so configuring both is safe on both the node (sends
+    // fragments) and the gateway (receives them) — the direction each side does
+    // not use simply stays idle. Do this on every configure_flrc() so the
+    // per-transfer reconfigure keeps the large FIFO in place.
+    const void *ctx = radio_.ral.context;
+    if (lr20xx_radio_fifo_configure_1024_byte_tx_fifo(ctx) != LR20XX_STATUS_OK) {
+        ESP_LOGE(TAG, "configure_flrc: 1024 TX FIFO failed");
+        return false;
+    }
+    if (lr20xx_radio_fifo_configure_1024_byte_rx_fifo(ctx) != LR20XX_STATUS_OK) {
+        ESP_LOGE(TAG, "configure_flrc: 1024 RX FIFO failed");
+        return false;
+    }
+    return true;
 }
 
 bool RadioPing::build_voice_packet(uint16_t *tx_size)
@@ -1448,33 +1468,9 @@ void RadioPing::image_tx_task()
             continue;
         }
 
-        // Step 1: Blast all fragments
-        for (uint16_t i = 0; i < total_fragments; i++) {
-            size_t offset = static_cast<size_t>(i) * APP_IMAGE_FRAGMENT_DATA_SIZE;
-            uint16_t frag_len = static_cast<uint16_t>(
-                ((offset + APP_IMAGE_FRAGMENT_DATA_SIZE) <= req.jpeg_len)
-                    ? APP_IMAGE_FRAGMENT_DATA_SIZE
-                    : (req.jpeg_len - offset));
-
-            uint8_t pkt[APP_FLRC_MAX_PAYLOAD_BYTES];
-            std::memcpy(pkt, kMagic, sizeof(kMagic));
-            pkt[4] = kPacketTypeImageData;
-            pkt[5] = 1;
-            put_u16_le(&pkt[6], req.session_id);
-            put_u16_le(&pkt[8], i);
-            put_u16_le(&pkt[10], total_fragments);
-            put_u16_le(&pkt[12], frag_len);
-            std::memcpy(&pkt[kHeaderSize], req.jpeg + offset, frag_len);
-            uint16_t crc = crc16_ccitt(&pkt[4], kHeaderSize - 4 + frag_len);
-            put_u16_le(&pkt[kHeaderSize + frag_len], crc);
-
-            if (!send_single_packet(pkt, static_cast<uint16_t>(kHeaderSize + frag_len + 2))) {
-            // ESP_LOGW(TAG, "image TX frag %u/%u failed", i, total_fragments);
-            }
-            if (image_tx_inter_packet_us_ > 0) {
-                esp_rom_delay_us(image_tx_inter_packet_us_);
-            }
-        }
+        // Step 1: FLRC BURST — stream every fragment back-to-back (sequential
+        // 0..total_fragments-1). indices=nullptr selects the sequential path.
+        burst_send_fragments(req, total_fragments, nullptr, total_fragments);
 
         // ESP_LOGI(TAG, "image TX: initial burst done (%u frags)", total_fragments);
 
@@ -1560,35 +1556,9 @@ void RadioPing::image_tx_task()
             // Retransmit missing fragments
             // ESP_LOGI(TAG, "image TX round %u: resending %u missing frags",
             //          round + 1, nack_count_);
-            for (uint16_t n = 0; n < nack_count_; n++) {
-                uint16_t i = nack_indices_[n];
-                if (i >= total_fragments) continue;
-
-                size_t offset = static_cast<size_t>(i) * APP_IMAGE_FRAGMENT_DATA_SIZE;
-                uint16_t frag_len = static_cast<uint16_t>(
-                    ((offset + APP_IMAGE_FRAGMENT_DATA_SIZE) <= req.jpeg_len)
-                        ? APP_IMAGE_FRAGMENT_DATA_SIZE
-                        : (req.jpeg_len - offset));
-
-                uint8_t pkt[APP_FLRC_MAX_PAYLOAD_BYTES];
-                std::memcpy(pkt, kMagic, sizeof(kMagic));
-                pkt[4] = kPacketTypeImageData;
-                pkt[5] = 1;
-                put_u16_le(&pkt[6], req.session_id);
-                put_u16_le(&pkt[8], i);
-                put_u16_le(&pkt[10], total_fragments);
-                put_u16_le(&pkt[12], frag_len);
-                std::memcpy(&pkt[kHeaderSize], req.jpeg + offset, frag_len);
-                uint16_t crc = crc16_ccitt(&pkt[4], kHeaderSize - 4 + frag_len);
-                put_u16_le(&pkt[kHeaderSize + frag_len], crc);
-
-                if (!send_single_packet(pkt, static_cast<uint16_t>(kHeaderSize + frag_len + 2))) {
-            // ESP_LOGW(TAG, "image TX retransmit frag %u failed", i);
-                }
-                if (image_tx_inter_packet_us_ > 0) {
-                    esp_rom_delay_us(image_tx_inter_packet_us_);
-                }
-            }
+            // FLRC BURST retransmit: stream only the NACK'd fragment indices
+            // back-to-back through the same burst driver.
+            burst_send_fragments(req, total_fragments, nack_indices_, nack_count_);
         }
 
         image_tx_active_ = false;
@@ -1618,6 +1588,106 @@ void RadioPing::image_tx_task()
         heap_caps_free(const_cast<uint8_t *>(req.jpeg));
         req.jpeg = nullptr;
     }
+}
+
+uint16_t RadioPing::build_image_fragment(uint8_t *pkt, const ImageTxRequest &req,
+                                         uint16_t frag_index, uint16_t total_fragments)
+{
+    size_t offset = static_cast<size_t>(frag_index) * APP_IMAGE_FRAGMENT_DATA_SIZE;
+    uint16_t frag_len = static_cast<uint16_t>(
+        ((offset + APP_IMAGE_FRAGMENT_DATA_SIZE) <= req.jpeg_len)
+            ? APP_IMAGE_FRAGMENT_DATA_SIZE
+            : (req.jpeg_len - offset));
+
+    std::memcpy(pkt, kMagic, sizeof(kMagic));
+    pkt[4] = kPacketTypeImageData;
+    pkt[5] = 1;
+    put_u16_le(&pkt[6], req.session_id);
+    put_u16_le(&pkt[8], frag_index);
+    put_u16_le(&pkt[10], total_fragments);
+    put_u16_le(&pkt[12], frag_len);
+    std::memcpy(&pkt[kHeaderSize], req.jpeg + offset, frag_len);
+    uint16_t crc = crc16_ccitt(&pkt[4], kHeaderSize - 4 + frag_len);
+    put_u16_le(&pkt[kHeaderSize + frag_len], crc);
+
+    return static_cast<uint16_t>(kHeaderSize + frag_len + 2);
+}
+
+void RadioPing::burst_send_fragments(const ImageTxRequest &req, uint16_t total_fragments,
+                                     const uint16_t *indices, uint16_t count)
+{
+    if (count == 0) {
+        return;
+    }
+
+    const void *ctx = radio_.ral.context;
+
+    // Map the streaming position to a fragment index: sequential 0..count-1 when
+    // no explicit index list is given, otherwise the caller's NACK index list.
+    auto frag_at = [&](uint16_t pos) -> uint16_t {
+        return indices ? indices[pos] : pos;
+    };
+
+    // Enter the burst: keep the antenna/TCXO on for the whole stream and route
+    // TX_DONE to our polled IRQ path. FALLBACK_FS keeps the PLL locked between
+    // packets so each set_tx fires the next FIFO packet immediately (no per-packet
+    // STDBY->FS relock), which is what makes the back-to-back stream fast.
+    smtc_modem_hal_protect_api_call();
+    smtc_modem_hal_start_radio_tcxo();
+    smtc_modem_hal_set_ant_switch(true);
+    (void)ral_set_dio_irq_params(&radio_.ral, RAL_IRQ_TX_DONE);
+    (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+    (void)lr20xx_radio_common_set_rx_tx_fallback_mode(ctx, LR20XX_RADIO_FALLBACK_FS);
+    (void)lr20xx_radio_fifo_clear_tx(ctx);
+    smtc_modem_hal_unprotect_api_call();
+
+    uint8_t pkt[APP_FLRC_MAX_PAYLOAD_BYTES];
+    uint16_t next_write = 0;  // next streaming position to write into the FIFO
+
+    // Prefill up to 2 packets so the FIFO holds one in-flight + one queued. Each
+    // fragment is a single fifo_write_tx; with pld_is_fix=false the radio sends
+    // min(fifo_level, 511) per set_tx, so full 495B fragments go as 511B packets
+    // and the (short) last fragment goes at its real length — no zero padding.
+    for (int prefill = 0; prefill < 2 && next_write < count; prefill++) {
+        uint16_t len = build_image_fragment(pkt, req, frag_at(next_write), total_fragments);
+        smtc_modem_hal_protect_api_call();
+        (void)lr20xx_radio_fifo_write_tx(ctx, pkt, len);
+        smtc_modem_hal_unprotect_api_call();
+        next_write++;
+    }
+
+    // Launch: sends FIFO packet #0; any prefilled #1 waits in the FIFO.
+    mode_ = Mode::tx_pending;
+    smtc_modem_hal_protect_api_call();
+    (void)ral_set_tx(&radio_.ral);
+    smtc_modem_hal_unprotect_api_call();
+
+    // For each remaining position: wait for the current packet's TX_DONE, fire
+    // set_tx to launch the already-buffered next packet, then refill one more.
+    for (uint16_t pos = 1; pos < count; pos++) {
+        (void)wait_for_tx_done(50);
+
+        mode_ = Mode::tx_pending;
+        smtc_modem_hal_protect_api_call();
+        (void)ral_set_tx(&radio_.ral);
+        if (next_write < count) {
+            uint16_t len = build_image_fragment(pkt, req, frag_at(next_write), total_fragments);
+            (void)lr20xx_radio_fifo_write_tx(ctx, pkt, len);
+        }
+        smtc_modem_hal_unprotect_api_call();
+        if (next_write < count) {
+            next_write++;
+        }
+    }
+
+    // Wait for the final packet to drain, then restore the normal STDBY_XOSC
+    // fallback so the handshake path (EOT/ACK/NACK) turns to RX as before.
+    (void)wait_for_tx_done(50);
+
+    smtc_modem_hal_protect_api_call();
+    (void)lr20xx_radio_common_set_rx_tx_fallback_mode(ctx, LR20XX_RADIO_FALLBACK_STDBY_XOSC);
+    smtc_modem_hal_unprotect_api_call();
+    mode_ = Mode::idle;
 }
 
 bool RadioPing::send_single_packet(const uint8_t *data, uint16_t len)

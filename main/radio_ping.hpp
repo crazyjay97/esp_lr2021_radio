@@ -170,6 +170,21 @@ private:
     void handle_image_done();
     void image_tx_task();
     bool send_single_packet(const uint8_t *data, uint16_t len);
+    // Forward declaration: ImageTxRequest is defined further down (line ~215),
+    // but the burst helpers below take it by const-ref so an incomplete type is
+    // enough here.
+    struct ImageTxRequest;
+    // Build one ImageData fragment packet into `pkt` (14B header + frag + CRC16)
+    // and return the total on-air length. `pkt` must hold APP_FLRC_MAX_PAYLOAD_BYTES.
+    uint16_t build_image_fragment(uint8_t *pkt, const ImageTxRequest &req,
+                                  uint16_t frag_index, uint16_t total_fragments);
+    // FLRC BURST driver for the image bulk path: streams `count` fragments
+    // back-to-back through the 1024-byte TX FIFO (prefill 2, refill 1 on each
+    // TX_DONE). `indices==nullptr` streams sequential fragments 0..count-1;
+    // otherwise streams the `count` fragment indices listed in `indices`
+    // (used by the NACK retransmit round). Restores STDBY fallback on exit.
+    void burst_send_fragments(const ImageTxRequest &req, uint16_t total_fragments,
+                              const uint16_t *indices, uint16_t count);
     bool wait_for_tx_done(uint32_t timeout_ms);
     void check_image_rx_timeout();
     void check_image_rx_abort();

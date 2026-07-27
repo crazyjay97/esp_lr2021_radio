@@ -89,8 +89,16 @@
 /* BT=0.5 keeps spectrum cleaner than no shaping at high FLRC data rates. */
 #define APP_FLRC_PULSE_SHAPE            RAL_FLRC_PULSE_SHAPE_BT_05
 
-/* Keep payloads small so each packet carries one low-latency voice frame. */
-#define APP_FLRC_MAX_PAYLOAD_BYTES      255U
+/* Max FLRC on-air payload. Raised to 511 so image fragments can run one large
+ * 511-byte packet each (FLRC BURST). Voice packets stay small in practice: they
+ * are capped at APP_FLRC_OPUS_FRAMES_PER_PACKET frames, so the higher ceiling
+ * does not change voice behavior. rx_buf_ is sized from this, so RX must use the
+ * full 511 to avoid truncating burst fragments. */
+#define APP_FLRC_MAX_PAYLOAD_BYTES      511U
+
+/* FLRC BURST per-packet on-air payload for image bulk transfer. 2x511 = 1022B
+ * fits the 1024-byte FIFO, letting us prefill 2 packets before the first TX. */
+#define APP_FLRC_BURST_PAYLOAD_LEN      511U
 
 /* Pack several 10 ms Opus frames per FLRC packet to reduce TX overhead while
  * keeping each radio packet to about 50 ms of audio. */
