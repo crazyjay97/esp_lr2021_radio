@@ -1325,6 +1325,27 @@ extern "C" void app_main(void)
     }
 #if APP_RADIO_FEATURES_ENABLE
     {
+        // Pre-configure the LR2021 NRST pin (CONFIG_LR2021_NRST_GPIO) as a
+        // driven-high output BEFORE any radio init. The driver's ral_reset()
+        // runs before ral_init() (which is where the HAL configures its GPIOs),
+        // so without this the very first reset pulse toggles an unconfigured
+        // pin and never reaches the chip. Driver 0.0.7 loads PRAM during
+        // ral_init() and needs the chip to be cleanly reset first; skipping the
+        // real reset leaves BUSY stuck HIGH and hangs init. Setting NRST high
+        // here (idempotent with radio_gpio_init) guarantees the reset pulse
+        // lands. The reference project achieves the same by configuring GPIO38
+        // as an output at startup.
+        {
+            gpio_config_t nrst_conf = {};
+            nrst_conf.pin_bit_mask = 1ULL << CONFIG_LR2021_NRST_GPIO;
+            nrst_conf.mode         = GPIO_MODE_OUTPUT;
+            nrst_conf.pull_up_en   = GPIO_PULLUP_DISABLE;
+            nrst_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+            nrst_conf.intr_type    = GPIO_INTR_DISABLE;
+            gpio_config(&nrst_conf);
+            gpio_set_level((gpio_num_t)CONFIG_LR2021_NRST_GPIO, 1);
+        }
+
         bool radio_ok = true;
         if (g_app_mode == AppMode::radio) {
             if ((e = g_radio.init_gateway()) != ESP_OK) {

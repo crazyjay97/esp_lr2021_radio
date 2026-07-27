@@ -136,6 +136,7 @@ private:
     bool build_voice_packet(uint16_t *tx_size);
     void capture_voice_packet();
     void handle_rx_packet();
+    void dispatch_rx_packet(uint16_t len, int16_t rssi);
     void queue_voice_packet(uint16_t len, int16_t rssi);
     void log_rx(uint16_t seq, uint16_t len, int16_t rssi);
     void wait_for_jitter_buffer();
@@ -164,7 +165,7 @@ private:
     void check_image_req_retry();
     void stop_image_req_retry();
     void handle_image_start(uint16_t len);
-    void handle_image_data();
+    void handle_image_data(uint16_t len);
     void handle_image_eot();
     void handle_image_nack();
     void handle_image_done();

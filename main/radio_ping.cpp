@@ -645,9 +645,28 @@ void RadioPing::handle_irq(ral_irq_t irq)
 
     if (completed_mode == Mode::rx_pending) {
         if ((irq & RAL_IRQ_RX_DONE) != 0) {
+            // Snapshot BEFORE draining: are we mid image-data burst? The gateway
+            // receives the burst in continuous RX, where the radio auto-returns
+            // to RX after every packet. Re-arming here would call ral_set_rx ->
+            // lr20xx_radio_fifo_clear_rx and wipe the bytes of the NEXT fragment
+            // already streaming into the 1024B FIFO — that clear is the root
+            // cause of burst desync (fragment 0 ok, fragment 1 loses its head,
+            // read pointer straddles packets forever -> "RX unknown"). So during
+            // an active image stream we do NOT re-arm; we just keep mode_ in
+            // rx_pending so poll_once's idle branch does not re-arm either, and
+            // let the hardware stay in continuous RX. The FIFO is aligned exactly
+            // once, by the ready-ACK's schedule_rx in handle_image_start.
+            bool image_stream = image_rx_pending_;
             mode_ = Mode::idle;
             handle_rx_packet();
-            if (mode_ == Mode::idle && !ptt_active_ && !tx_burst_active_) {
+            if (image_stream) {
+                // Control packets in the stream (EOT/NACK/Start) run their own
+                // schedule_rx and leave mode_ = rx_pending; only a pure data
+                // fragment leaves it idle. Either way, stay in continuous RX.
+                if (mode_ == Mode::idle) {
+                    mode_ = Mode::rx_pending;
+                }
+            } else if (mode_ == Mode::idle && !ptt_active_ && !tx_burst_active_) {
                 schedule_rx();
             }
         } else if ((irq & RAL_IRQ_RX_CRC_ERROR) != 0) {
@@ -656,6 +675,13 @@ void RadioPing::handle_irq(ral_irq_t irq)
             if ((rx_crc_errors_ % 10) == 1) {
                 ESP_LOGW(TAG, "RX CRC errors=%lu", static_cast<unsigned long>(rx_crc_errors_));
             }
+            // A CRC-failed FLRC packet leaves untrusted bytes of UNKNOWN length
+            // in the RX FIFO. We cannot know how many to drop to stay aligned, so
+            // dispatching them to the decoder (old behavior) only feeds garbage
+            // in and desyncs the read pointer. Instead re-arm RX: ral_set_rx
+            // clears the whole FIFO and resets the read pointer to a clean packet
+            // boundary. The discarded fragments are recovered by the EOT/NACK
+            // retransmit loop. Matches the driver's own burst reference.
             schedule_rx();
         } else if ((irq & RAL_IRQ_RX_HDR_ERROR) != 0) {
             mode_ = Mode::idle;
@@ -898,23 +924,61 @@ void RadioPing::capture_voice_packet()
 
 void RadioPing::handle_rx_packet()
 {
-    uint16_t len = 0;
-    ral_flrc_rx_pkt_status_t pkt_status = {};
+    // Drain the RX FIFO fully on each RX_DONE. This is essential for the FLRC
+    // burst image stream: at 2.6 Mbps a 511B fragment lands every ~2ms, faster
+    // than the poll loop can service one interrupt, so multiple fragments pile
+    // up in the 1024B RX FIFO before we get here. irq_pending_ is a bool, so N
+    // back-to-back RX_DONEs collapse into a single poll_once pass — if we read
+    // only one packet per pass, the FIFO backlog grows every round until it
+    // overflows and the read pointer desyncs (every later read straddles a
+    // packet boundary -> garbage header -> "RX unknown"). Reading by FIFO level
+    // until it drains empties the whole backlog in one pass and keeps the read
+    // pointer aligned on packet boundaries.
+    //
+    // The FIFO is a raw byte stream with no per-packet delimiters, so alignment
+    // relies on burst fragments being a CONSTANT 511B on air (see
+    // burst_send_fragments). On the first read we take min(level, 511); on later
+    // reads a level < 511 means only a partial (still-arriving) fragment is
+    // present, so we stop and let the next RX_DONE finish it.
+    for (int drained = 0; ; drained++) {
+        uint16_t level = 0;
+        smtc_modem_hal_protect_api_call();
+        ral_status_t lvl_status =
+            (ral_status_t) lr20xx_radio_fifo_get_rx_level(radio_.ral.context, &level);
+        smtc_modem_hal_unprotect_api_call();
 
-    smtc_modem_hal_protect_api_call();
-    ral_status_t status = ral_get_pkt_payload(&radio_.ral, sizeof(rx_buf_), rx_buf_, &len);
-    if (status == RAL_STATUS_OK) {
-        status = ral_get_flrc_rx_pkt_status(&radio_.ral, &pkt_status);
+        if (lvl_status != RAL_STATUS_OK || level == 0) {
+            break;
+        }
+        // Later iterations with a sub-fragment level: fragment still in flight.
+        if (drained > 0 && level < APP_FLRC_MAX_PAYLOAD_BYTES) {
+            break;
+        }
+
+        uint16_t take = (level >= APP_FLRC_MAX_PAYLOAD_BYTES) ? APP_FLRC_MAX_PAYLOAD_BYTES : level;
+
+        uint16_t len = 0;
+        ral_flrc_rx_pkt_status_t pkt_status = {};
+        smtc_modem_hal_protect_api_call();
+        ral_status_t status =
+            (ral_status_t) lr20xx_radio_fifo_read_rx(radio_.ral.context, rx_buf_, take);
+        if (status == RAL_STATUS_OK) {
+            len = take;
+            status = ral_get_flrc_rx_pkt_status(&radio_.ral, &pkt_status);
+        }
+        smtc_modem_hal_unprotect_api_call();
+
+        if (status != RAL_STATUS_OK) {
+            ESP_LOGW(TAG, "RX read failed: %d", status);
+            break;
+        }
+
+        dispatch_rx_packet(len, pkt_status.rssi_sync_in_dbm);
     }
-    smtc_modem_hal_unprotect_api_call();
+}
 
-    if (status != RAL_STATUS_OK) {
-        ESP_LOGW(TAG, "RX read failed: %d", status);
-        return;
-    }
-
-    int16_t rssi = pkt_status.rssi_sync_in_dbm;
-
+void RadioPing::dispatch_rx_packet(uint16_t len, int16_t rssi)
+{
     if (len < kHeaderSize || std::memcmp(rx_buf_, kMagic, sizeof(kMagic)) != 0) {
         rx_unknown_packets_++;
         if ((rx_unknown_packets_ % 50U) == 1U) {
@@ -943,8 +1007,12 @@ void RadioPing::handle_rx_packet()
         handle_image_cmd();
     } else if (rx_buf_[4] == kPacketTypeImageData) {
         image_rx_last_rssi_ = rssi;
-        schedule_rx();
-        handle_image_data();
+        // No schedule_rx() anywhere on the data-fragment path: the gateway is in
+        // continuous RX (auto-returns to RX after each packet), so any set_rx
+        // here would clear_rx the next fragment mid-stream. handle_irq keeps
+        // mode_ = rx_pending after this returns so nothing re-arms until the
+        // burst ends with an EOT/NACK control packet. See handle_irq RX_DONE.
+        handle_image_data(len);
     } else if (rx_buf_[4] == kPacketTypeImageNack) {
         handle_image_nack();
     } else if (rx_buf_[4] == kPacketTypeImageDone) {
@@ -1644,14 +1712,29 @@ void RadioPing::burst_send_fragments(const ImageTxRequest &req, uint16_t total_f
     uint8_t pkt[APP_FLRC_MAX_PAYLOAD_BYTES];
     uint16_t next_write = 0;  // next streaming position to write into the FIFO
 
-    // Prefill up to 2 packets so the FIFO holds one in-flight + one queued. Each
-    // fragment is a single fifo_write_tx; with pld_is_fix=false the radio sends
-    // min(fifo_level, 511) per set_tx, so full 495B fragments go as 511B packets
-    // and the (short) last fragment goes at its real length — no zero padding.
+    // Build one fragment and zero-pad it to a CONSTANT 511 bytes on air. This is
+    // the crux of reliable burst RX: with variable-length packets the receiver's
+    // ral_get_pkt_payload() reads the "last-completed-packet" length register,
+    // which does NOT track the FIFO head. Under 2.6 Mbps continuous RX the gateway
+    // can't drain fast enough, packets pile up in the 1024B RX FIFO, and a single
+    // short (last) fragment desyncs the read pointer for good — every later packet
+    // then reads at the wrong offset and fails the magic check ("RX unknown").
+    // Fixing every packet at 511 keeps the length register == the head packet, so
+    // fifo reads always land on a packet boundary and the stream self-aligns.
+    // The trailing zero pad is harmless: the RX decoder locates the CRC/data via
+    // the header's frag_len field, not the on-air length.
+    auto build_padded = [&](uint16_t pos) {
+        uint16_t len = build_image_fragment(pkt, req, frag_at(pos), total_fragments);
+        if (len < APP_FLRC_MAX_PAYLOAD_BYTES) {
+            std::memset(pkt + len, 0, APP_FLRC_MAX_PAYLOAD_BYTES - len);
+        }
+    };
+
+    // Prefill up to 2 packets so the FIFO holds one in-flight + one queued.
     for (int prefill = 0; prefill < 2 && next_write < count; prefill++) {
-        uint16_t len = build_image_fragment(pkt, req, frag_at(next_write), total_fragments);
+        build_padded(next_write);
         smtc_modem_hal_protect_api_call();
-        (void)lr20xx_radio_fifo_write_tx(ctx, pkt, len);
+        (void)lr20xx_radio_fifo_write_tx(ctx, pkt, APP_FLRC_MAX_PAYLOAD_BYTES);
         smtc_modem_hal_unprotect_api_call();
         next_write++;
     }
@@ -1671,8 +1754,8 @@ void RadioPing::burst_send_fragments(const ImageTxRequest &req, uint16_t total_f
         smtc_modem_hal_protect_api_call();
         (void)ral_set_tx(&radio_.ral);
         if (next_write < count) {
-            uint16_t len = build_image_fragment(pkt, req, frag_at(next_write), total_fragments);
-            (void)lr20xx_radio_fifo_write_tx(ctx, pkt, len);
+            build_padded(next_write);
+            (void)lr20xx_radio_fifo_write_tx(ctx, pkt, APP_FLRC_MAX_PAYLOAD_BYTES);
         }
         smtc_modem_hal_unprotect_api_call();
         if (next_write < count) {
@@ -1868,7 +1951,7 @@ void RadioPing::handle_image_start(uint16_t len)
     schedule_rx();
 }
 
-void RadioPing::handle_image_data()
+void RadioPing::handle_image_data(uint16_t len)
 {
     uint16_t session_id = get_u16_le(&rx_buf_[6]);
     uint16_t frag_index = get_u16_le(&rx_buf_[8]);
@@ -1882,6 +1965,17 @@ void RadioPing::handle_image_data()
 
     if (frag_len > APP_IMAGE_FRAGMENT_DATA_SIZE) {
         ESP_LOGW(TAG, "RX ImageData: bad frag_len=%u", frag_len);
+        return;
+    }
+
+    // Guard against a short/misaligned read: the header claims frag_len bytes of
+    // data plus a 2-byte CRC after the header, so we must actually have read at
+    // least kHeaderSize + frag_len + 2 bytes. Without this, a partial fragment
+    // (fewer bytes in rx_buf_ than the header advertises) would read its CRC —
+    // and possibly the payload — from stale bytes left over from the previous
+    // packet, occasionally passing CRC16 on garbage. Drop it and let the NACK
+    // loop re-request the fragment.
+    if (len < static_cast<uint16_t>(kHeaderSize + frag_len + 2)) {
         return;
     }
 
