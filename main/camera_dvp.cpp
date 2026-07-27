@@ -30,6 +30,7 @@ constexpr uint32_t kFourccYuyv = 0x56595559; // 'YUYV'
 constexpr uint32_t kFourccVyuy = 0x59555956; // 'VYUY'
 constexpr uint32_t kFrameBytes = APP_CAMERA_FRAME_BYTES;
 constexpr size_t kCaptureDmaBufferCount = 4;
+constexpr int kCaptureFrameNumber = 2;
 
 #if APP_CAMERA_COLOR_ENABLE
 constexpr uint32_t kDvpCaptureWidth = APP_CAMERA_SENSOR_WIDTH;
@@ -495,17 +496,18 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Arm capture: skip a few frames for stable AE/AWB
+    // Capture the second incoming frame, skipping the first for AE/AWB settling.
     s_dvp_ctx.received = 0;
     s_dvp_ctx.captured_buffer = nullptr;
     xQueueReset(capture_sem_);
-    s_dvp_ctx.capture_target = s_dvp_ctx.frame_count + 3;
+    s_dvp_ctx.capture_target = s_dvp_ctx.frame_count + kCaptureFrameNumber;
 
     bool got_frame = xSemaphoreTake(capture_sem_, pdMS_TO_TICKS(5000)) == pdTRUE;
 
     if (got_frame && s_dvp_ctx.received >= kFrameBytes && s_dvp_ctx.captured_buffer) {
-        ESP_LOGI(TAG, "captured frame: %u bytes (skipped %d)",
-                 (unsigned)s_dvp_ctx.received, s_dvp_ctx.frame_count - 1);
+        ESP_LOGI(TAG, "captured frame: %u bytes (capture frame=%d, skipped=%d)",
+                 (unsigned)s_dvp_ctx.received, kCaptureFrameNumber,
+                 kCaptureFrameNumber - 1);
 
         uint8_t *copy = static_cast<uint8_t *>(
             heap_caps_malloc(kFrameBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
