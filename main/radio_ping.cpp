@@ -1829,19 +1829,22 @@ bool RadioPing::wait_for_tx_done(uint32_t timeout_ms)
 void RadioPing::handle_image_cmd()
 {
     uint16_t session_id = get_u16_le(&rx_buf_[6]);
-    // ESP_LOGI(TAG, "RX ImageCmd: session=%u", session_id);
 
-    // Ack immediately (before the slow JPEG capture) so the gateway stops
-    // resending ImageCmd. This is sent on EVERY ImageCmd — including gateway
-    // retransmits of the same session (their ack was lost) — so a lost ack
-    // self-heals. The capture-side dedup (image_capture_cb_) drops the duplicate
-    // dispatch, so re-acking never triggers a second capture.
+    // Decide whether the capture was actually dispatched before acknowledging.
+    // This prevents the gateway from waiting for an image that a busy node
+    // intentionally did not start.
+    ImageCmdAckStatus status = ImageCmdAckStatus::rejected;
+    if (image_capture_cb_) {
+        status = image_capture_cb_(session_id);
+    }
+
     uint8_t ack[kHeaderSize];
     std::memcpy(ack, kMagic, sizeof(kMagic));
     ack[4] = kPacketTypeImageCmdAck;
     ack[5] = 1;
     put_u16_le(&ack[6], session_id);
-    ack[8] = 0; ack[9] = 0; ack[10] = 0; ack[11] = 0; ack[12] = 0; ack[13] = 0;
+    ack[8] = static_cast<uint8_t>(status);
+    ack[9] = 0; ack[10] = 0; ack[11] = 0; ack[12] = 0; ack[13] = 0;
 
     if (mode_ == Mode::rx_pending) {
         smtc_modem_hal_protect_api_call();
@@ -1853,8 +1856,9 @@ void RadioPing::handle_image_cmd()
     send_single_packet(ack, kHeaderSize);
     schedule_rx();
 
-    if (image_capture_cb_) {
-        image_capture_cb_(session_id);
+    if (status != ImageCmdAckStatus::accepted) {
+        ESP_LOGW(TAG, "TX ImageCmdAck: session=%u status=%u",
+                 session_id, static_cast<unsigned>(status));
     }
 }
 
@@ -1865,8 +1869,34 @@ void RadioPing::handle_image_cmd_ack()
     if (session_id != image_req_session_) {
         return;
     }
-    // ESP_LOGI(TAG, "RX ImageCmdAck: session=%u", session_id);
+
+    uint8_t raw_status = rx_buf_[8];
+    ImageCmdAckStatus status = raw_status <= static_cast<uint8_t>(ImageCmdAckStatus::rejected)
+                                   ? static_cast<ImageCmdAckStatus>(raw_status)
+                                   : ImageCmdAckStatus::rejected;
+
     stop_image_req_retry();
+
+    if (status == ImageCmdAckStatus::accepted ||
+        status == ImageCmdAckStatus::duplicate) {
+        ESP_LOGI(TAG, "RX ImageCmdAck: session=%u status=%u",
+                 session_id, static_cast<unsigned>(status));
+        schedule_rx();
+        return;
+    }
+
+    // BUSY/COOLDOWN/REJECTED means no image will follow. Clear the gateway
+    // request state immediately instead of holding the UI in image_busy() until
+    // the 10-second no-data timeout expires.
+    ESP_LOGW(TAG, "RX ImageCmdAck rejected: session=%u status=%u",
+             session_id, static_cast<unsigned>(status));
+    image_rx_pending_ = false;
+    image_xfer_.rx_reset();
+    image_rx_nack_sent_ = 0;
+    image_rx_eot_count_ = 0;
+    if (image_request_rejected_cb_) {
+        image_request_rejected_cb_(status);
+    }
     schedule_rx();
 }
 

@@ -166,7 +166,7 @@ uint8_t load_config_u8(const char *key, uint8_t def)
     return val;
 }
 
-void on_image_capture_request(uint16_t session_id);
+ImageCmdAckStatus on_image_capture_request(uint16_t session_id);
 
 void auto_capture_timer_cb(void *arg)
 {
@@ -651,54 +651,54 @@ void image_capture_task(void *arg)
 }
 
 // Callback: device A receives ImageCmd from B
-void on_image_capture_request(uint16_t session_id)
+ImageCmdAckStatus on_image_capture_request(uint16_t session_id)
 {
     if (g_app_mode != AppMode::camera) {
-        ESP_LOGW(TAG, "ImageCmd received but not in camera mode");
+        ESP_LOGW(TAG, "ImageCmd rejected: not in camera mode (session=%u)", session_id);
         g_radio.notify_capture_dropped();
-        return;
+        return ImageCmdAckStatus::rejected;
     }
-    if (g_capture_busy) {
-        ESP_LOGW(TAG, "ImageCmd ignored: capture already busy");
-        g_radio.notify_capture_dropped();
-        return;
-    }
-    // Dedup gateway ImageCmd retransmits of the same session. The gateway resends
-    // ImageCmd until it gets an ack; if an ack is lost for the whole capture, a
-    // late retransmit can arrive after g_capture_busy cleared. handle_image_cmd
-    // still re-acks it (good), but we must not launch a second capture for a
-    // session we already handled. New requests always carry a new session_id.
+
+    // A retransmit of the already dispatched session is not a new request.
+    // Report DUPLICATE so the gateway keeps waiting for the existing image.
     static uint16_t s_last_dispatched_session = 0;
     static bool s_have_dispatched = false;
     if (s_have_dispatched && session_id == s_last_dispatched_session) {
-        ESP_LOGW(TAG, "ImageCmd ignored: session %u already dispatched", session_id);
-        return;
+        ESP_LOGW(TAG, "ImageCmd duplicate: session=%u", session_id);
+        return ImageCmdAckStatus::duplicate;
     }
-    if (g_audio_clip_enabled) {
-        static uint32_t s_last_node_capture_ms = 0;
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-        if (s_last_node_capture_ms != 0 &&
-            (now - s_last_node_capture_ms) < APP_AUDIO_CAPTURE_COOLDOWN_MS) {
-            ESP_LOGW(TAG, "ImageCmd ignored: audio cooldown");
-            g_radio.notify_capture_dropped();
-            return;
-        }
-        s_last_node_capture_ms = now;
-    }
-    g_capture_busy = true;
-    s_last_dispatched_session = session_id;
-    s_have_dispatched = true;
 
-    // Low power: hold the node awake through the capture + push. Without this,
-    // poll_once re-enters CAD light sleep (500ms halt) immediately after the
-    // timer fires, starving the camera/JPEG task so capture never finishes. The
-    // keep-awake guard is cleared on TX completion or 8s timeout, whichever first.
+    if (g_capture_busy) {
+        ESP_LOGW(TAG, "ImageCmd busy: session=%u active_session=%u",
+                 session_id, s_have_dispatched ? s_last_dispatched_session : 0);
+        // The keep-awake guard belongs to the active capture; do not clear it
+        // merely because a second request arrived while that capture is busy.
+        return ImageCmdAckStatus::busy;
+    }
+
+    static uint32_t s_last_node_capture_ms = 0;
+    uint32_t capture_start_ms = 0;
+    if (g_audio_clip_enabled) {
+        capture_start_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+        if (s_last_node_capture_ms != 0 &&
+            (capture_start_ms - s_last_node_capture_ms) < APP_AUDIO_CAPTURE_COOLDOWN_MS) {
+            ESP_LOGW(TAG, "ImageCmd cooldown: session=%u", session_id);
+            g_radio.notify_capture_dropped();
+            return ImageCmdAckStatus::cooldown;
+        }
+    }
+
+    g_capture_busy = true;
+
+    // Low power: hold the node awake through the capture + push.
     g_radio.notify_capture_starting();
 
     auto *ctx = new (std::nothrow) ImageCaptureCtx{ session_id };
     if (!ctx) {
         g_capture_busy = false;
-        return;
+        g_radio.notify_capture_dropped();
+        ESP_LOGE(TAG, "image capture context alloc failed");
+        return ImageCmdAckStatus::rejected;
     }
 
     BaseType_t ok = xTaskCreatePinnedToCore(image_capture_task, "img_cap",
@@ -708,8 +708,17 @@ void on_image_capture_request(uint16_t session_id)
     if (ok != pdPASS) {
         delete ctx;
         g_capture_busy = false;
+        g_radio.notify_capture_dropped();
         ESP_LOGE(TAG, "image capture task create failed");
+        return ImageCmdAckStatus::rejected;
     }
+
+    s_last_dispatched_session = session_id;
+    s_have_dispatched = true;
+    if (g_audio_clip_enabled) {
+        s_last_node_capture_ms = capture_start_ms;
+    }
+    return ImageCmdAckStatus::accepted;
 }
 
 // Callback: device B receives complete image
@@ -1013,6 +1022,22 @@ void on_image_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
             return;
         }
         ui_gw_rx_progress(received, total, rssi);
+    }
+}
+
+void on_image_request_rejected(ImageCmdAckStatus status)
+{
+    const char *reason = "Camera rejected";
+    if (status == ImageCmdAckStatus::busy) {
+        reason = "Camera busy, retry";
+    } else if (status == ImageCmdAckStatus::cooldown) {
+        reason = "Camera cooling down";
+    }
+
+    ESP_LOGW(TAG, "image request rejected by node: status=%u",
+             static_cast<unsigned>(status));
+    if (g_app_mode == AppMode::radio) {
+        ui_gw_rx_failed(reason);
     }
 }
 
@@ -1413,6 +1438,7 @@ extern "C" void app_main(void)
         }
         if (radio_ok) {
             g_radio.set_image_capture_cb(on_image_capture_request);
+            g_radio.set_image_request_rejected_cb(on_image_request_rejected);
             g_radio.set_image_rx_complete_cb(on_image_rx_complete);
             g_radio.set_image_rx_progress_cb(on_image_rx_progress);
             g_radio.set_vbat_received_cb(on_vbat_received);

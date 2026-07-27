@@ -16,7 +16,16 @@
 #include "audio_ringbuf.hpp"
 #include "opus_ringbuf.hpp"
 
-typedef void (*image_capture_cb_t)(uint16_t session_id);
+enum class ImageCmdAckStatus : uint8_t {
+    accepted = 0,
+    busy = 1,
+    cooldown = 2,
+    duplicate = 3,
+    rejected = 4,
+};
+
+typedef ImageCmdAckStatus (*image_capture_cb_t)(uint16_t session_id);
+typedef void (*image_request_rejected_cb_t)(ImageCmdAckStatus status);
 typedef void (*image_rx_complete_cb_t)(ImageTransfer *xfer);
 typedef void (*image_rx_progress_cb_t)(uint16_t received, uint16_t total, int16_t rssi);
 typedef void (*image_rx_eot_cb_t)(uint16_t missing_count, bool is_first_eot);
@@ -57,6 +66,7 @@ public:
     void send_image(const uint8_t *jpeg, size_t jpeg_len, uint16_t session_id);
     // Register callbacks
     void set_image_capture_cb(image_capture_cb_t cb) { image_capture_cb_ = cb; }
+    void set_image_request_rejected_cb(image_request_rejected_cb_t cb) { image_request_rejected_cb_ = cb; }
     void set_image_rx_complete_cb(image_rx_complete_cb_t cb) { image_rx_complete_cb_ = cb; }
     void set_image_rx_progress_cb(image_rx_progress_cb_t cb) { image_rx_progress_cb_ = cb; }
     void set_vbat_received_cb(vbat_received_cb_t cb) { vbat_received_cb_ = cb; }
@@ -264,6 +274,7 @@ private:
 
     // Image transfer state
     image_capture_cb_t image_capture_cb_ = nullptr;
+    image_request_rejected_cb_t image_request_rejected_cb_ = nullptr;
     image_rx_complete_cb_t image_rx_complete_cb_ = nullptr;
     image_rx_progress_cb_t image_rx_progress_cb_ = nullptr;
     vbat_received_cb_t vbat_received_cb_ = nullptr;
