@@ -255,6 +255,10 @@
 /* ----- Image transfer over FLRC ------------------------------------------ */
 
 #define APP_IMAGE_JPEG_QUALITY          90
+#define APP_IMAGE_TX_WIDTH              240U
+#define APP_IMAGE_TX_HEIGHT             320U
+#define APP_IMAGE_PRE_ROTATE_WIDTH      320U
+#define APP_IMAGE_PRE_ROTATE_HEIGHT     240U
 #define APP_IMAGE_FRAGMENT_DATA_SIZE    (APP_FLRC_MAX_PAYLOAD_BYTES - 16U)
 #define APP_IMAGE_TX_INTER_PACKET_US    0U
 #define APP_IMAGE_RX_TIMEOUT_MS         3000U

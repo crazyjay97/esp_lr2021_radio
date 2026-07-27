@@ -600,7 +600,7 @@ static const char GALLERY_HTML[] =
     ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px;max-width:1100px;margin:0 auto}"
     ".card{background:#fff;border-radius:12px;overflow:hidden;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.08);transition:transform .15s,box-shadow .15s}"
     ".card:hover{transform:translateY(-2px);box-shadow:0 4px 16px rgba(0,0,0,.12)}"
-    ".card img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;pointer-events:none}"
+    ".card img{width:100%;aspect-ratio:3/4;object-fit:contain;display:block;pointer-events:none}"
     ".card .info{padding:10px 12px;font-size:.8em;color:#555;display:flex;justify-content:space-between;align-items:center}"
     ".card .badge{background:#1a73e8;color:#fff;padding:2px 7px;border-radius:10px;font-size:.7em;font-weight:600}"
     ".ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:100;align-items:center;justify-content:center;flex-direction:column}"

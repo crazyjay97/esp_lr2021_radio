@@ -3,7 +3,9 @@
 #include <cstring>
 
 #include "esp_heap_caps.h"
+#include "esp_imgfx_scale.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_jpeg_enc.h"
 #include "esp_jpeg_dec.h"
 #include "esp_jpeg_common.h"
@@ -34,60 +36,112 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
     *out_jpeg = nullptr;
     *out_jpeg_len = 0;
 
-    const size_t expected_len = width * height * 2;
-    if (yuv_len < expected_len) {
+    const size_t source_len = width * height * 2U;
+    if (yuv_len < source_len) {
         ESP_LOGE(TAG, "YUV buffer too small: %u < %u",
-                 static_cast<unsigned>(yuv_len), static_cast<unsigned>(expected_len));
+                 static_cast<unsigned>(yuv_len), static_cast<unsigned>(source_len));
         return ESP_ERR_INVALID_SIZE;
     }
+    if (width != APP_CAMERA_SENSOR_WIDTH || height != APP_CAMERA_SENSOR_HEIGHT) {
+        ESP_LOGE(TAG, "unsupported source resolution: %lux%lu",
+                 static_cast<unsigned long>(width), static_cast<unsigned long>(height));
+        return ESP_ERR_NOT_SUPPORTED;
+    }
 
-    // Swizzle YUV422 to encoder's YCbYCr based on actual pixel format
     static constexpr uint32_t FOURCC_UYVY = 0x59565955;
     static constexpr uint32_t FOURCC_YUYV = 0x56595559;
-    static constexpr uint32_t FOURCC_VYUY = 0x59555956;
+    esp_imgfx_pixel_fmt_t scale_pixfmt;
+    if (pixfmt == FOURCC_UYVY) {
+        scale_pixfmt = ESP_IMGFX_PIXEL_FMT_UYVY;
+    } else if (pixfmt == FOURCC_YUYV) {
+        scale_pixfmt = ESP_IMGFX_PIXEL_FMT_YUYV;
+    } else {
+        ESP_LOGE(TAG, "unsupported YUV422 format: 0x%08lx",
+                 static_cast<unsigned long>(pixfmt));
+        return ESP_ERR_NOT_SUPPORTED;
+    }
 
+    const size_t enc_input_len =
+        APP_IMAGE_PRE_ROTATE_WIDTH * APP_IMAGE_PRE_ROTATE_HEIGHT * 2U;
+    const int64_t scale_start_us = esp_timer_get_time();
     uint8_t *enc_input = static_cast<uint8_t *>(
-        jpeg_calloc_align(expected_len, 16));
+        heap_caps_aligned_alloc(64, enc_input_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!enc_input) {
         ESP_LOGE(TAG, "enc input alloc failed: %u bytes",
-                 static_cast<unsigned>(expected_len));
+                 static_cast<unsigned>(enc_input_len));
         return ESP_ERR_NO_MEM;
     }
 
-    if (pixfmt == FOURCC_YUYV) {
-        // YUYV [Y0, Cb, Y1, Cr] → YCbYCr — already correct order
-        memcpy(enc_input, yuv422, expected_len);
-    } else if (pixfmt == FOURCC_VYUY) {
-        // VYUY [Cr, Y0, Cb, Y1] → [Y0, Cb, Y1, Cr]
-        for (size_t i = 0; i + 3 < expected_len; i += 4) {
-            enc_input[i + 0] = yuv422[i + 1]; // Y0
-            enc_input[i + 1] = yuv422[i + 2]; // Cb
-            enc_input[i + 2] = yuv422[i + 3]; // Y1
-            enc_input[i + 3] = yuv422[i + 0]; // Cr
+    esp_imgfx_scale_cfg_t scale_cfg = {};
+    scale_cfg.in_res.width = static_cast<int16_t>(width);
+    scale_cfg.in_res.height = static_cast<int16_t>(height);
+    scale_cfg.in_pixel_fmt = scale_pixfmt;
+    scale_cfg.scale_res.width = static_cast<int16_t>(APP_IMAGE_PRE_ROTATE_WIDTH);
+    scale_cfg.scale_res.height = static_cast<int16_t>(APP_IMAGE_PRE_ROTATE_HEIGHT);
+    scale_cfg.filter_type = ESP_IMGFX_SCALE_FILTER_TYPE_BILINEAR;
+
+    esp_imgfx_scale_handle_t scaler = nullptr;
+    esp_imgfx_err_t scale_err = esp_imgfx_scale_open(&scale_cfg, &scaler);
+    if (scale_err != ESP_IMGFX_ERR_OK || !scaler) {
+        ESP_LOGE(TAG, "image scaler open failed: %d", scale_err);
+        if (scaler) {
+            esp_imgfx_scale_close(scaler);
         }
-    } else {
-        // UYVY [Cb, Y0, Cr, Y1] → [Y0, Cb, Y1, Cr]
-        for (size_t i = 0; i + 3 < expected_len; i += 4) {
-            enc_input[i + 0] = yuv422[i + 1]; // Y0
-            enc_input[i + 1] = yuv422[i + 0]; // Cb
-            enc_input[i + 2] = yuv422[i + 3]; // Y1
-            enc_input[i + 3] = yuv422[i + 2]; // Cr
+        heap_caps_free(enc_input);
+        return ESP_FAIL;
+    }
+
+    esp_imgfx_data_t source_image = {};
+    source_image.data = const_cast<uint8_t *>(yuv422);
+    source_image.data_len = static_cast<uint32_t>(source_len);
+    esp_imgfx_data_t scaled_image = {};
+    scaled_image.data = enc_input;
+    scaled_image.data_len = static_cast<uint32_t>(enc_input_len);
+
+    scale_err = esp_imgfx_scale_process(scaler, &source_image, &scaled_image);
+    esp_imgfx_scale_close(scaler);
+    if (scale_err != ESP_IMGFX_ERR_OK) {
+        ESP_LOGE(TAG, "image scale failed: %d", scale_err);
+        heap_caps_free(enc_input);
+        return ESP_FAIL;
+    }
+
+    // The scaler preserves packed YUV422. Convert UYVY to the JPEG encoder's
+    // YCbYCr layout in place; YUYV already has the required byte order.
+    if (pixfmt == FOURCC_UYVY) {
+        for (size_t i = 0; i + 3 < enc_input_len; i += 4) {
+            const uint8_t cb = enc_input[i + 0];
+            const uint8_t y0 = enc_input[i + 1];
+            const uint8_t cr = enc_input[i + 2];
+            const uint8_t y1 = enc_input[i + 3];
+            enc_input[i + 0] = y0;
+            enc_input[i + 1] = cb;
+            enc_input[i + 2] = y1;
+            enc_input[i + 3] = cr;
         }
     }
 
+    const int64_t scale_done_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "[TIMING] image scale %lux%lu -> %ux%u: %lld ms",
+             static_cast<unsigned long>(width), static_cast<unsigned long>(height),
+             APP_IMAGE_PRE_ROTATE_WIDTH, APP_IMAGE_PRE_ROTATE_HEIGHT,
+             static_cast<long long>((scale_done_us - scale_start_us + 500) / 1000));
+
     jpeg_enc_config_t enc_cfg = DEFAULT_JPEG_ENC_CONFIG();
-    enc_cfg.width = static_cast<int>(width);
-    enc_cfg.height = static_cast<int>(height);
+    enc_cfg.width = APP_IMAGE_PRE_ROTATE_WIDTH;
+    enc_cfg.height = APP_IMAGE_PRE_ROTATE_HEIGHT;
     enc_cfg.src_type = JPEG_PIXEL_FORMAT_YCbYCr;
     enc_cfg.subsampling = JPEG_SUBSAMPLE_420;
     enc_cfg.quality = APP_IMAGE_JPEG_QUALITY;
+    enc_cfg.rotate = JPEG_ROTATE_90D;
     enc_cfg.task_enable = false;
 
+    const int64_t encode_start_us = esp_timer_get_time();
     jpeg_enc_handle_t encoder = nullptr;
     jpeg_error_t jerr = jpeg_enc_open(&enc_cfg, &encoder);
     if (jerr != JPEG_ERR_OK || !encoder) {
         ESP_LOGE(TAG, "jpeg_enc_open failed: %d", jerr);
-        jpeg_free_align(enc_input);
+        heap_caps_free(enc_input);
         return ESP_FAIL;
     }
 
@@ -96,16 +150,17 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
     if (!jpeg_buf) {
         ESP_LOGE(TAG, "jpeg output buffer alloc failed");
         jpeg_enc_close(encoder);
-        jpeg_free_align(enc_input);
+        heap_caps_free(enc_input);
         return ESP_ERR_NO_MEM;
     }
 
     int out_size = 0;
-    jerr = jpeg_enc_process(encoder, enc_input, static_cast<int>(expected_len),
+    jerr = jpeg_enc_process(encoder, enc_input, static_cast<int>(enc_input_len),
                             jpeg_buf, static_cast<int>(APP_IMAGE_MAX_JPEG_SIZE),
                             &out_size);
     jpeg_enc_close(encoder);
-    jpeg_free_align(enc_input);
+    heap_caps_free(enc_input);
+    const int64_t encode_done_us = esp_timer_get_time();
 
     if (jerr != JPEG_ERR_OK || out_size <= 0) {
         ESP_LOGE(TAG, "jpeg_enc_process failed: %d out_size=%d", jerr, out_size);
@@ -113,8 +168,11 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "JPEG encoded: %lux%lu → %d bytes (Q=%d)",
-             static_cast<unsigned long>(width), static_cast<unsigned long>(height),
+    ESP_LOGI(TAG, "[TIMING] JPEG encode %ux%u Q%d: %lld ms",
+             APP_IMAGE_TX_WIDTH, APP_IMAGE_TX_HEIGHT, APP_IMAGE_JPEG_QUALITY,
+             static_cast<long long>((encode_done_us - encode_start_us + 500) / 1000));
+    ESP_LOGI(TAG, "JPEG encoded: %ux%u -> %d bytes (Q=%d)",
+             APP_IMAGE_TX_WIDTH, APP_IMAGE_TX_HEIGHT,
              out_size, APP_IMAGE_JPEG_QUALITY);
 
     *out_jpeg = jpeg_buf;

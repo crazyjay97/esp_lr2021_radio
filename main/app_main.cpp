@@ -790,40 +790,82 @@ void on_image_rx_complete(ImageTransfer *xfer)
              static_cast<unsigned>(jpeg_len),
              static_cast<unsigned>(opus_len));
 
-    // Decode and display JPEG
+    // Decode only the sender-preprocessed 240x320 JPEG. Legacy 640x480 images
+    // are intentionally rejected so the LCD and web gallery share one format.
+    bool image_ready = false;
+    const char *image_failure = "JPEG decode failed";
     jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
     dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
 
     jpeg_dec_handle_t decoder = nullptr;
     jpeg_error_t jerr = jpeg_dec_open(&dec_cfg, &decoder);
-    if (jerr == JPEG_ERR_OK && decoder) {
+    if (jerr != JPEG_ERR_OK || !decoder) {
+        ESP_LOGE(TAG, "jpeg_dec_open failed: %d", jerr);
+    } else {
         jpeg_dec_io_t io = {};
         io.inbuf = const_cast<unsigned char *>(jpeg_data);
         io.inbuf_len = static_cast<int>(jpeg_len);
 
         jpeg_dec_header_info_t header = {};
         jerr = jpeg_dec_parse_header(decoder, &io, &header);
-        if (jerr == JPEG_ERR_OK) {
-            int outbuf_len = header.width * header.height * 2;
-            uint8_t *rgb565 = static_cast<uint8_t *>(jpeg_calloc_align(outbuf_len, 16));
-            if (rgb565) {
-                io.outbuf = rgb565;
-                jerr = jpeg_dec_process(decoder, &io);
-                if (jerr == JPEG_ERR_OK) {
-                    uint32_t w = header.width;
-                    uint32_t h = header.height;
-                    if (g_app_mode == AppMode::radio) {
-                        ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565), w, h,
-                                          static_cast<uint32_t>(raw_len), g_radio.last_transfer_ms());
+        if (jerr != JPEG_ERR_OK) {
+            ESP_LOGE(TAG, "jpeg_dec_parse_header failed: %d", jerr);
+        } else if (header.width != APP_IMAGE_TX_WIDTH ||
+                   header.height != APP_IMAGE_TX_HEIGHT) {
+            ESP_LOGE(TAG, "reject JPEG size %ux%u, expected %ux%u",
+                     header.width, header.height,
+                     APP_IMAGE_TX_WIDTH, APP_IMAGE_TX_HEIGHT);
+            image_failure = "Bad image size";
+        } else {
+            ESP_LOGI(TAG, "JPEG header accepted: %ux%u, %u bytes",
+                     header.width, header.height, static_cast<unsigned>(jpeg_len));
+            int outbuf_len = 0;
+            jerr = jpeg_dec_get_outbuf_len(decoder, &outbuf_len);
+            if (jerr != JPEG_ERR_OK || outbuf_len <= 0) {
+                ESP_LOGE(TAG, "jpeg_dec_get_outbuf_len failed: %d len=%d",
+                         jerr, outbuf_len);
+            } else {
+                uint8_t *rgb565 = static_cast<uint8_t *>(
+                    jpeg_calloc_align(static_cast<size_t>(outbuf_len), 16));
+                if (!rgb565) {
+                    ESP_LOGE(TAG, "RGB565 alloc failed: %d bytes", outbuf_len);
+                    image_failure = "Display memory low";
+                } else {
+                    io.outbuf = rgb565;
+                    jerr = jpeg_dec_process(decoder, &io);
+                    if (jerr == JPEG_ERR_OK) {
+                        if (g_app_mode == AppMode::radio) {
+                            ui_gw_rx_complete(
+                                reinterpret_cast<const uint16_t *>(rgb565),
+                                header.width, header.height,
+                                static_cast<uint32_t>(raw_len),
+                                g_radio.last_transfer_ms());
+                        } else {
+                            bsp_lcd_show_rgb565_photo(
+                                reinterpret_cast<const uint16_t *>(rgb565),
+                                header.width, header.height);
+                            bsp_lcd_set_camera_status("Photo received");
+                        }
+                        image_ready = true;
                     } else {
-                        bsp_lcd_show_rgb565_photo(reinterpret_cast<const uint16_t *>(rgb565), w, h);
-                        bsp_lcd_set_camera_status("Photo received");
+                        ESP_LOGE(TAG, "jpeg_dec_process failed: %d", jerr);
                     }
+                    jpeg_free_align(rgb565);
                 }
-                jpeg_free_align(rgb565);
             }
         }
         jpeg_dec_close(decoder);
+    }
+
+    if (!image_ready) {
+        if (g_app_mode == AppMode::radio) {
+            ui_gw_rx_failed(image_failure);
+        } else {
+            bsp_lcd_set_camera_status(image_failure);
+        }
+        heap_caps_free(raw);
+        xfer->rx_reset();
+        return;
     }
 
     // Save to image store for HTTP gallery
