@@ -1102,6 +1102,17 @@ bool on_gw_low_power_change(uint32_t enable)
     bool ok = g_radio.send_config(APP_CFG_KEY_LOW_POWER, enable);
     if (ok) {
         g_low_power_enabled = (enable != 0);
+        if (enable) {
+            // Low power sleeps the CPU during CAD standby, so the gateway's audio
+            // clip capture path can't run. Clear our OWN copy too: the UI layer
+            // (cfg_apply_low_power_lock) greys the switch and zeroes ui_gw NVS,
+            // and the node zeroes its copy on the config packet — but this
+            // gateway-side g_audio_clip_enabled was never touched, so on_gw_capture
+            // kept running the audio-cooldown path under low power. Mirror the
+            // node's APP_CFG_KEY_LOW_POWER handler here to keep the three copies
+            // in sync within the session (NVS persistence is done UI-side).
+            g_audio_clip_enabled = false;
+        }
     }
     return ok;
 }

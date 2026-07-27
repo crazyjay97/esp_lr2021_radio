@@ -1274,7 +1274,18 @@ bool RadioPing::trigger_image_capture()
     // (no wakeup) and floods continuously. check_image_req_retry (radio task
     // loop) drives the flood and starts fresh rounds until the node replies.
     image_req_active_ = true;
+    // This runs on the UI/timer task, NOT the radio task. The first round's LoRa
+    // wakeup calls wait_for_tx_done(), which busy-polls irq_pending_ for TX_DONE.
+    // If the radio task's poll_once() runs concurrently it consumes that same IRQ
+    // (ral_get_and_clear_irq_status clears all bits), so wait_for_tx_done never
+    // sees TX_DONE and spins to its timeout — the wakeup then "fails" even though
+    // the preamble went out fine. Suspend the radio poll loop for the duration of
+    // this first round (same guard send_config uses) so the wakeup is the sole IRQ
+    // consumer, then release it so check_image_req_retry (radio task) can flood.
+    bool was_suspended = suspended_;
+    suspended_ = true;
     start_image_req_round();
+    suspended_ = was_suspended;
 
     image_rx_pending_ = true;
     image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
