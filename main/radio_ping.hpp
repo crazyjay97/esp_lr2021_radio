@@ -138,6 +138,7 @@ private:
     bool build_voice_packet(uint16_t *tx_size);
     void capture_voice_packet();
     void handle_rx_packet();
+    void dispatch_rx_packet(uint16_t len, int16_t rssi);
     void queue_voice_packet(uint16_t len, int16_t rssi);
     void log_rx(uint16_t seq, uint16_t len, int16_t rssi);
     void wait_for_jitter_buffer();
@@ -166,12 +167,17 @@ private:
     void check_image_req_retry();
     void stop_image_req_retry();
     void handle_image_start(uint16_t len);
-    void handle_image_data();
+    void handle_image_data(uint16_t len);
     void handle_image_eot();
     void handle_image_nack();
     void handle_image_done();
     void image_tx_task();
     bool send_single_packet(const uint8_t *data, uint16_t len);
+    struct ImageTxRequest;
+    uint16_t build_image_fragment(uint8_t *pkt, const ImageTxRequest &req,
+                                  uint16_t frag_index, uint16_t total_fragments);
+    void burst_send_fragments(const ImageTxRequest &req, uint16_t total_fragments,
+                              const uint16_t *indices, uint16_t count);
     bool wait_for_tx_done(uint32_t timeout_ms);
     void check_image_rx_timeout();
     void check_image_rx_abort();

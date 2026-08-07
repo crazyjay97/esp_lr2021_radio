@@ -64,11 +64,17 @@
 /* Center frequency. Confirm the exact channel is legal for the deployment area. */
 #define APP_FLRC_FREQUENCY_HZ           915120000UL
 
-/* LR2021 FLRC high-rate mode requested for this project. */
+/* LR2021 FLRC high-rate mode requested for this project.
+ * Informational only: the upgraded driver selects rate and bandwidth together
+ * through APP_FLRC_RAW_BIT_RATE. */
 #define APP_FLRC_BITRATE_BPS            2600000UL
 
-/* Double-sided FLRC bandwidth paired with 2.6 Mbps in the LR2021 driver. */
+/* Double-sided bandwidth paired with 2.6 Mbps; retained for diagnostics. */
 #define APP_FLRC_BANDWIDTH_HZ           2666000UL
+
+/* Upgraded LR2021 driver replaces numeric bitrate/bandwidth fields with enums. */
+#define APP_FLRC_RAW_BIT_RATE           RAL_FLRC_RAW_BIT_RATE_2_600_MBPS
+#define APP_FLRC_PREAMBLE_LEN           RAL_FLRC_PREAMBLE_LENGTH_32_BITS
 
 /* TX power for bench tests. 22 dBm saturates nearby receivers; use 10 for close range. */
 #define APP_FLRC_TX_POWER_DBM           22
@@ -79,8 +85,12 @@
 /* BT=0.5 keeps spectrum cleaner than no shaping at high FLRC data rates. */
 #define APP_FLRC_PULSE_SHAPE            RAL_FLRC_PULSE_SHAPE_BT_05
 
-/* Keep payloads small so each packet carries one low-latency voice frame. */
-#define APP_FLRC_MAX_PAYLOAD_BYTES      255U
+/* Keep the existing voice packet aggregation boundary unchanged. */
+#define APP_FLRC_VOICE_MAX_PAYLOAD_BYTES 255U
+
+/* Image bulk transfer uses one fixed 511-byte packet per fragment. */
+#define APP_FLRC_MAX_PAYLOAD_BYTES      511U
+#define APP_FLRC_BURST_PAYLOAD_LEN      511U
 
 /* Pack several 10 ms Opus frames per FLRC packet to reduce TX overhead while
  * keeping each radio packet to about 50 ms of audio. */

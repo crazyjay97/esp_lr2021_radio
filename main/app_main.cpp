@@ -1766,6 +1766,18 @@ extern "C" void app_main(void)
     }
 #if APP_RADIO_FEATURES_ENABLE
     {
+        // Driver 0.0.7 loads LR2021 PRAM during ral_init(). Configure NRST as a
+        // driven-high output before the first ral_reset(), otherwise the initial
+        // reset pulse can be lost and leave BUSY stuck high on a cold start.
+        gpio_config_t nrst_conf = {};
+        nrst_conf.pin_bit_mask = 1ULL << CONFIG_LR2021_NRST_GPIO;
+        nrst_conf.mode         = GPIO_MODE_OUTPUT;
+        nrst_conf.pull_up_en   = GPIO_PULLUP_DISABLE;
+        nrst_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        nrst_conf.intr_type    = GPIO_INTR_DISABLE;
+        gpio_config(&nrst_conf);
+        gpio_set_level((gpio_num_t)CONFIG_LR2021_NRST_GPIO, 1);
+
         bool radio_ok = true;
         if (g_app_mode == AppMode::radio) {
             if ((e = g_radio.init_gateway()) != ESP_OK) {

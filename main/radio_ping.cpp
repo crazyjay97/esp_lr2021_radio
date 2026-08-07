@@ -157,11 +157,7 @@ esp_err_t RadioPing::init()
     ral_status_t status = ral_reset(&radio_.ral);
     if (status == RAL_STATUS_OK) status = ral_init(&radio_.ral);
     if (status == RAL_STATUS_OK) {
-        // Land in FS (frequency synthesis) after every TX/RX instead of dropping
-        // to standby. The image push sends dozens of packets back-to-back; from
-        // FS the next set_tx skips the PLL re-lock/ramp that a standby fallback
-        // would repeat per packet, cutting per-packet turnaround in the burst.
-        status = ral_set_rx_tx_fallback_mode(&radio_.ral, RAL_FALLBACK_FS);
+        status = ral_set_rx_tx_fallback_mode(&radio_.ral, RAL_FALLBACK_STDBY_XOSC);
     }
     if (status == RAL_STATUS_OK) status = ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
     if (status == RAL_STATUS_OK && !configure_flrc()) status = RAL_STATUS_ERROR;
@@ -211,11 +207,7 @@ esp_err_t RadioPing::init_gateway()
     ral_status_t status = ral_reset(&radio_.ral);
     if (status == RAL_STATUS_OK) status = ral_init(&radio_.ral);
     if (status == RAL_STATUS_OK) {
-        // Land in FS (frequency synthesis) after every TX/RX instead of dropping
-        // to standby. The image push sends dozens of packets back-to-back; from
-        // FS the next set_tx skips the PLL re-lock/ramp that a standby fallback
-        // would repeat per packet, cutting per-packet turnaround in the burst.
-        status = ral_set_rx_tx_fallback_mode(&radio_.ral, RAL_FALLBACK_FS);
+        status = ral_set_rx_tx_fallback_mode(&radio_.ral, RAL_FALLBACK_STDBY_XOSC);
     }
     if (status == RAL_STATUS_OK) status = ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
     if (status == RAL_STATUS_OK && !configure_flrc()) status = RAL_STATUS_ERROR;
@@ -667,9 +659,17 @@ void RadioPing::handle_irq(ral_irq_t irq)
 
     if (completed_mode == Mode::rx_pending) {
         if ((irq & RAL_IRQ_RX_DONE) != 0) {
+            // During an image burst the radio stays in continuous RX. Re-arming
+            // after each fragment would clear bytes of the next fragment that
+            // are already entering the 1024-byte FIFO.
+            bool image_stream = image_rx_pending_;
             mode_ = Mode::idle;
             handle_rx_packet();
-            if (mode_ == Mode::idle && !ptt_active_ && !tx_burst_active_) {
+            if (image_stream) {
+                if (mode_ == Mode::idle) {
+                    mode_ = Mode::rx_pending;
+                }
+            } else if (mode_ == Mode::idle && !ptt_active_ && !tx_burst_active_) {
                 schedule_rx();
             }
         } else if ((irq & RAL_IRQ_RX_CRC_ERROR) != 0) {
@@ -678,6 +678,8 @@ void RadioPing::handle_irq(ral_irq_t irq)
             if ((rx_crc_errors_ % 10) == 1) {
                 ESP_LOGW(TAG, "RX CRC errors=%lu", static_cast<unsigned long>(rx_crc_errors_));
             }
+            // A bad packet has unknown usable length. Re-arm once to clear and
+            // realign the FIFO; the existing EOT/NACK loop requests it again.
             schedule_rx();
         } else if ((irq & RAL_IRQ_RX_HDR_ERROR) != 0) {
             mode_ = Mode::idle;
@@ -784,21 +786,36 @@ bool RadioPing::configure_flrc()
     ralf_params_flrc_t params = {};
     params.rf_freq_in_hz = APP_FLRC_FREQUENCY_HZ;
     params.output_pwr_in_dbm = APP_FLRC_TX_POWER_DBM;
-    params.mod_params.br_in_bps = APP_FLRC_BITRATE_BPS;
-    params.mod_params.bw_dsb_in_hz = APP_FLRC_BANDWIDTH_HZ;
+    params.mod_params.raw_bit_rate = APP_FLRC_RAW_BIT_RATE;
     params.mod_params.cr = APP_FLRC_CODING_RATE;
     params.mod_params.pulse_shape = APP_FLRC_PULSE_SHAPE;
-    params.pkt_params.preamble_len_in_bits = 32;
+    params.pkt_params.preamble_len = APP_FLRC_PREAMBLE_LEN;
     params.pkt_params.sync_word_len = RAL_FLRC_SYNCWORD_LENGTH_4_BYTES;
     params.pkt_params.tx_syncword = RAL_FLRC_TX_SYNCWORD_1;
     params.pkt_params.match_sync_word = RAL_FLRC_RX_MATCH_SYNCWORD_1;
     params.pkt_params.pld_is_fix = false;
     params.pkt_params.pld_len_in_bytes = APP_FLRC_MAX_PAYLOAD_BYTES;
     params.pkt_params.crc_type = RAL_FLRC_CRC_2_BYTES;
-    params.sync_word = kSyncWord;
+    params.sync_word[0] = kSyncWord;
+    params.sync_word[1] = nullptr;
+    params.sync_word[2] = nullptr;
+    params.is_tx = true;
     params.crc_seed = 0xFFFFFFFFUL;
     params.crc_polynomial = 0x04C11DB7UL;
-    return ralf_setup_flrc(&radio_, &params) == RAL_STATUS_OK;
+    if (ralf_setup_flrc(&radio_, &params) != RAL_STATUS_OK) {
+        return false;
+    }
+
+    const void *ctx = radio_.ral.context;
+    if (lr20xx_radio_fifo_configure_1024_byte_tx_fifo(ctx) != LR20XX_STATUS_OK) {
+        ESP_LOGE(TAG, "configure_flrc: 1024 TX FIFO failed");
+        return false;
+    }
+    if (lr20xx_radio_fifo_configure_1024_byte_rx_fifo(ctx) != LR20XX_STATUS_OK) {
+        ESP_LOGE(TAG, "configure_flrc: 1024 RX FIFO failed");
+        return false;
+    }
+    return true;
 }
 
 bool RadioPing::build_voice_packet(uint16_t *tx_size)
@@ -820,7 +837,7 @@ bool RadioPing::build_voice_packet(uint16_t *tx_size)
     uint8_t frame_count = 0;
     while (frame_count < APP_FLRC_OPUS_FRAMES_PER_PACKET) {
         if (frame.len == 0 || frame.len > APP_OPUS_MAX_PACKET_BYTES ||
-            offset + 1U + frame.len > APP_FLRC_MAX_PAYLOAD_BYTES) {
+            offset + 1U + frame.len > APP_FLRC_VOICE_MAX_PAYLOAD_BYTES) {
             break;
         }
 
@@ -892,23 +909,47 @@ void RadioPing::capture_voice_packet()
 
 void RadioPing::handle_rx_packet()
 {
-    uint16_t len = 0;
-    ral_flrc_rx_pkt_status_t pkt_status = {};
+    // RX_DONE notifications can collapse while multiple 511-byte image packets
+    // accumulate in the 1024-byte FIFO. Drain every complete packet now; after
+    // the first read, a sub-511 level belongs to a packet still arriving.
+    for (int drained = 0; ; drained++) {
+        uint16_t level = 0;
+        smtc_modem_hal_protect_api_call();
+        ral_status_t level_status = static_cast<ral_status_t>(
+            lr20xx_radio_fifo_get_rx_level(radio_.ral.context, &level));
+        smtc_modem_hal_unprotect_api_call();
 
-    smtc_modem_hal_protect_api_call();
-    ral_status_t status = ral_get_pkt_payload(&radio_.ral, sizeof(rx_buf_), rx_buf_, &len);
-    if (status == RAL_STATUS_OK) {
-        status = ral_get_flrc_rx_pkt_status(&radio_.ral, &pkt_status);
+        if (level_status != RAL_STATUS_OK || level == 0) {
+            break;
+        }
+        if (drained > 0 && level < APP_FLRC_BURST_PAYLOAD_LEN) {
+            break;
+        }
+
+        uint16_t take = (level >= APP_FLRC_BURST_PAYLOAD_LEN)
+                            ? APP_FLRC_BURST_PAYLOAD_LEN
+                            : level;
+        ral_flrc_rx_pkt_status_t pkt_status = {};
+
+        smtc_modem_hal_protect_api_call();
+        ral_status_t status = static_cast<ral_status_t>(
+            lr20xx_radio_fifo_read_rx(radio_.ral.context, rx_buf_, take));
+        if (status == RAL_STATUS_OK) {
+            status = ral_get_flrc_rx_pkt_status(&radio_.ral, &pkt_status);
+        }
+        smtc_modem_hal_unprotect_api_call();
+
+        if (status != RAL_STATUS_OK) {
+            ESP_LOGW(TAG, "RX read failed: %d", status);
+            break;
+        }
+
+        dispatch_rx_packet(take, pkt_status.rssi_sync_in_dbm);
     }
-    smtc_modem_hal_unprotect_api_call();
+}
 
-    if (status != RAL_STATUS_OK) {
-        ESP_LOGW(TAG, "RX read failed: %d", status);
-        return;
-    }
-
-    int16_t rssi = pkt_status.rssi_sync_in_dbm;
-
+void RadioPing::dispatch_rx_packet(uint16_t len, int16_t rssi)
+{
     if (len < kHeaderSize || std::memcmp(rx_buf_, kMagic, sizeof(kMagic)) != 0) {
         rx_unknown_packets_++;
         if ((rx_unknown_packets_ % 50U) == 1U) {
@@ -939,8 +980,7 @@ void RadioPing::handle_rx_packet()
         handle_image_cmd();
     } else if (rx_buf_[4] == kPacketTypeImageData) {
         image_rx_last_rssi_ = rssi;
-        schedule_rx();
-        handle_image_data();
+        handle_image_data(len);
     } else if (rx_buf_[4] == kPacketTypeImageNack) {
         handle_image_nack();
     } else if (rx_buf_[4] == kPacketTypeImageDone) {
@@ -1469,32 +1509,7 @@ void RadioPing::image_tx_task()
         }
 
         // Step 1: Blast all fragments
-        for (uint16_t i = 0; i < total_fragments; i++) {
-            size_t offset = static_cast<size_t>(i) * APP_IMAGE_FRAGMENT_DATA_SIZE;
-            uint16_t frag_len = static_cast<uint16_t>(
-                ((offset + APP_IMAGE_FRAGMENT_DATA_SIZE) <= req.jpeg_len)
-                    ? APP_IMAGE_FRAGMENT_DATA_SIZE
-                    : (req.jpeg_len - offset));
-
-            uint8_t pkt[APP_FLRC_MAX_PAYLOAD_BYTES];
-            std::memcpy(pkt, kMagic, sizeof(kMagic));
-            pkt[4] = kPacketTypeImageData;
-            pkt[5] = 1;
-            put_u16_le(&pkt[6], req.session_id);
-            put_u16_le(&pkt[8], i);
-            put_u16_le(&pkt[10], total_fragments);
-            put_u16_le(&pkt[12], frag_len);
-            std::memcpy(&pkt[kHeaderSize], req.jpeg + offset, frag_len);
-            uint16_t crc = crc16_ccitt(&pkt[4], kHeaderSize - 4 + frag_len);
-            put_u16_le(&pkt[kHeaderSize + frag_len], crc);
-
-            if (!send_single_packet(pkt, static_cast<uint16_t>(kHeaderSize + frag_len + 2))) {
-            // ESP_LOGW(TAG, "image TX frag %u/%u failed", i, total_fragments);
-            }
-            if (image_tx_inter_packet_us_ > 0) {
-                esp_rom_delay_us(image_tx_inter_packet_us_);
-            }
-        }
+        burst_send_fragments(req, total_fragments, nullptr, total_fragments);
 
         // ESP_LOGI(TAG, "image TX: initial burst done (%u frags)", total_fragments);
 
@@ -1578,37 +1593,7 @@ void RadioPing::image_tx_task()
             }
 
             // Retransmit missing fragments
-            // ESP_LOGI(TAG, "image TX round %u: resending %u missing frags",
-            //          round + 1, nack_count_);
-            for (uint16_t n = 0; n < nack_count_; n++) {
-                uint16_t i = nack_indices_[n];
-                if (i >= total_fragments) continue;
-
-                size_t offset = static_cast<size_t>(i) * APP_IMAGE_FRAGMENT_DATA_SIZE;
-                uint16_t frag_len = static_cast<uint16_t>(
-                    ((offset + APP_IMAGE_FRAGMENT_DATA_SIZE) <= req.jpeg_len)
-                        ? APP_IMAGE_FRAGMENT_DATA_SIZE
-                        : (req.jpeg_len - offset));
-
-                uint8_t pkt[APP_FLRC_MAX_PAYLOAD_BYTES];
-                std::memcpy(pkt, kMagic, sizeof(kMagic));
-                pkt[4] = kPacketTypeImageData;
-                pkt[5] = 1;
-                put_u16_le(&pkt[6], req.session_id);
-                put_u16_le(&pkt[8], i);
-                put_u16_le(&pkt[10], total_fragments);
-                put_u16_le(&pkt[12], frag_len);
-                std::memcpy(&pkt[kHeaderSize], req.jpeg + offset, frag_len);
-                uint16_t crc = crc16_ccitt(&pkt[4], kHeaderSize - 4 + frag_len);
-                put_u16_le(&pkt[kHeaderSize + frag_len], crc);
-
-                if (!send_single_packet(pkt, static_cast<uint16_t>(kHeaderSize + frag_len + 2))) {
-            // ESP_LOGW(TAG, "image TX retransmit frag %u failed", i);
-                }
-                if (image_tx_inter_packet_us_ > 0) {
-                    esp_rom_delay_us(image_tx_inter_packet_us_);
-                }
-            }
+            burst_send_fragments(req, total_fragments, nack_indices_, nack_count_);
         }
 
         image_tx_active_ = false;
@@ -1638,6 +1623,120 @@ void RadioPing::image_tx_task()
         heap_caps_free(const_cast<uint8_t *>(req.jpeg));
         req.jpeg = nullptr;
     }
+}
+
+uint16_t RadioPing::build_image_fragment(uint8_t *pkt, const ImageTxRequest &req,
+                                         uint16_t frag_index, uint16_t total_fragments)
+{
+    size_t offset = static_cast<size_t>(frag_index) * APP_IMAGE_FRAGMENT_DATA_SIZE;
+    uint16_t frag_len = static_cast<uint16_t>(
+        ((offset + APP_IMAGE_FRAGMENT_DATA_SIZE) <= req.jpeg_len)
+            ? APP_IMAGE_FRAGMENT_DATA_SIZE
+            : (req.jpeg_len - offset));
+
+    std::memcpy(pkt, kMagic, sizeof(kMagic));
+    pkt[4] = kPacketTypeImageData;
+    pkt[5] = 1;
+    put_u16_le(&pkt[6], req.session_id);
+    put_u16_le(&pkt[8], frag_index);
+    put_u16_le(&pkt[10], total_fragments);
+    put_u16_le(&pkt[12], frag_len);
+    std::memcpy(&pkt[kHeaderSize], req.jpeg + offset, frag_len);
+    uint16_t crc = crc16_ccitt(&pkt[4], kHeaderSize - 4 + frag_len);
+    put_u16_le(&pkt[kHeaderSize + frag_len], crc);
+
+    return static_cast<uint16_t>(kHeaderSize + frag_len + 2);
+}
+
+void RadioPing::burst_send_fragments(const ImageTxRequest &req, uint16_t total_fragments,
+                                     const uint16_t *indices, uint16_t count)
+{
+    if (count == 0) {
+        return;
+    }
+
+    // Preserve the existing retransmit guard: malformed NACK indices must not
+    // address beyond the current JPEG buffer. Compact valid indices locally so
+    // the FIFO prefill/refill loop still sees a dense sequence.
+    uint16_t valid_indices[APP_IMAGE_NACK_MAX_INDICES];
+    if (indices != nullptr) {
+        uint16_t valid_count = 0;
+        for (uint16_t i = 0; i < count; i++) {
+            if (indices[i] < total_fragments) {
+                valid_indices[valid_count++] = indices[i];
+            }
+        }
+        if (valid_count == 0) {
+            return;
+        }
+        indices = valid_indices;
+        count = valid_count;
+    }
+
+    const void *ctx = radio_.ral.context;
+    auto frag_at = [&](uint16_t pos) -> uint16_t {
+        return indices ? indices[pos] : pos;
+    };
+
+    // Keep the target project's task-notification TX_DONE path: the image task
+    // owns every IRQ for the complete burst while the main radio task is paused.
+    tx_done_waiter_ = xTaskGetCurrentTaskHandle();
+    xTaskNotifyStateClear(nullptr);
+
+    smtc_modem_hal_protect_api_call();
+    smtc_modem_hal_start_radio_tcxo();
+    smtc_modem_hal_set_ant_switch(true);
+    (void)ral_set_dio_irq_params(&radio_.ral, RAL_IRQ_TX_DONE);
+    (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+    (void)lr20xx_radio_common_set_rx_tx_fallback_mode(ctx, LR20XX_RADIO_FALLBACK_FS);
+    (void)lr20xx_radio_fifo_clear_tx(ctx);
+    smtc_modem_hal_unprotect_api_call();
+
+    uint8_t pkt[APP_FLRC_MAX_PAYLOAD_BYTES];
+    uint16_t next_write = 0;
+    auto build_padded = [&](uint16_t pos) {
+        uint16_t len = build_image_fragment(pkt, req, frag_at(pos), total_fragments);
+        if (len < APP_FLRC_BURST_PAYLOAD_LEN) {
+            std::memset(pkt + len, 0, APP_FLRC_BURST_PAYLOAD_LEN - len);
+        }
+    };
+
+    // A 1024-byte FIFO holds one packet in flight and one queued packet.
+    for (int prefill = 0; prefill < 2 && next_write < count; prefill++) {
+        build_padded(next_write);
+        smtc_modem_hal_protect_api_call();
+        (void)lr20xx_radio_fifo_write_tx(ctx, pkt, APP_FLRC_BURST_PAYLOAD_LEN);
+        smtc_modem_hal_unprotect_api_call();
+        next_write++;
+    }
+
+    mode_ = Mode::tx_pending;
+    smtc_modem_hal_protect_api_call();
+    (void)ral_set_tx(&radio_.ral);
+    smtc_modem_hal_unprotect_api_call();
+
+    for (uint16_t pos = 1; pos < count; pos++) {
+        (void)wait_for_tx_done(50);
+
+        mode_ = Mode::tx_pending;
+        smtc_modem_hal_protect_api_call();
+        (void)ral_set_tx(&radio_.ral);
+        if (next_write < count) {
+            build_padded(next_write);
+            (void)lr20xx_radio_fifo_write_tx(ctx, pkt, APP_FLRC_BURST_PAYLOAD_LEN);
+            next_write++;
+        }
+        smtc_modem_hal_unprotect_api_call();
+    }
+
+    (void)wait_for_tx_done(50);
+
+    smtc_modem_hal_protect_api_call();
+    (void)lr20xx_radio_common_set_rx_tx_fallback_mode(
+        ctx, LR20XX_RADIO_FALLBACK_STDBY_XOSC);
+    smtc_modem_hal_unprotect_api_call();
+    mode_ = Mode::idle;
+    tx_done_waiter_ = nullptr;
 }
 
 bool RadioPing::send_single_packet(const uint8_t *data, uint16_t len)
@@ -1865,7 +1964,7 @@ void RadioPing::handle_image_start(uint16_t len)
     }
 }
 
-void RadioPing::handle_image_data()
+void RadioPing::handle_image_data(uint16_t len)
 {
     uint16_t session_id = get_u16_le(&rx_buf_[6]);
     uint16_t frag_index = get_u16_le(&rx_buf_[8]);
@@ -1879,6 +1978,10 @@ void RadioPing::handle_image_data()
 
     if (frag_len > APP_IMAGE_FRAGMENT_DATA_SIZE) {
         ESP_LOGW(TAG, "RX ImageData: bad frag_len=%u", frag_len);
+        return;
+    }
+
+    if (len < static_cast<uint16_t>(kHeaderSize + frag_len + 2)) {
         return;
     }
 
