@@ -8,6 +8,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -62,9 +63,27 @@ bool g_ptt_held_long = false;
 esp_timer_handle_t g_ptt_timer = nullptr;
 
 // Continuous video stream: one-shot timer that fires the next capture request a
-// short delay after a frame finishes, so the re-trigger runs off the radio task
-// (not re-entrant inside the rx-complete callback).
+// short delay after a received JPEG leaves ImageTransfer ownership.
 esp_timer_handle_t g_stream_next_timer = nullptr;
+
+constexpr UBaseType_t kGatewayImageQueueLength = 2;
+constexpr uint32_t kGatewayImageTaskStackBytes = 16384U;
+constexpr UBaseType_t kGatewayImageTaskPriority = 3;
+constexpr BaseType_t kGatewayImageTaskCore = 1;
+constexpr uint32_t kStreamNextFrameDelayMs = 1U;
+
+struct GatewayImageFrame {
+    uint8_t *jpeg = nullptr;
+    size_t jpeg_len = 0;
+    uint32_t transfer_ms = 0;
+    uint32_t reassemble_ms = 0;
+    uint32_t queued_ms = 0;
+    uint16_t session_id = 0;
+    uint16_t fragments = 0;
+};
+
+QueueHandle_t g_gateway_image_queue = nullptr;
+TaskHandle_t g_gateway_image_task_handle = nullptr;
 
 const char *mode_name(AppMode mode)
 {
@@ -167,6 +186,7 @@ uint8_t load_config_u8(const char *key, uint8_t def)
 
 bool on_image_capture_request(uint16_t session_id);
 void stream_next_frame_cb(void *arg);
+esp_err_t gateway_image_pipeline_init();
 
 void auto_capture_timer_cb(void *arg)
 {
@@ -788,94 +808,215 @@ void play_audio_clip(const uint8_t *opus_packed, size_t total_len)
     bsp_audio_pa_enable(false);
 }
 
+void schedule_stream_next_frame()
+{
+    if (g_app_mode != AppMode::radio || !ui_gw_stream_active()) return;
+
+    if (!g_stream_next_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = stream_next_frame_cb,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "stream_next",
+            .skip_unhandled_events = true,
+        };
+        esp_err_t e = esp_timer_create(&args, &g_stream_next_timer);
+        if (e != ESP_OK) {
+            ESP_LOGE(TAG, "stream timer create failed: %s", esp_err_to_name(e));
+            return;
+        }
+    }
+
+    (void)esp_timer_stop(g_stream_next_timer);
+    esp_err_t e = esp_timer_start_once(
+        g_stream_next_timer, static_cast<uint64_t>(kStreamNextFrameDelayMs) * 1000U);
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "stream timer start failed: %s", esp_err_to_name(e));
+    }
+}
+
+void gateway_image_frame_free(GatewayImageFrame *frame)
+{
+    if (!frame || !frame->jpeg) return;
+    heap_caps_free(frame->jpeg);
+    frame->jpeg = nullptr;
+}
+
+bool gateway_image_queue_push(const GatewayImageFrame &frame)
+{
+    if (!g_gateway_image_queue) return false;
+    if (xQueueSend(g_gateway_image_queue, &frame, 0) == pdTRUE) return true;
+
+    GatewayImageFrame stale = {};
+    if (xQueueReceive(g_gateway_image_queue, &stale, 0) == pdTRUE) {
+        ESP_LOGW(TAG, "image queue full: drop stale session=%u", stale.session_id);
+        gateway_image_frame_free(&stale);
+    }
+    return xQueueSend(g_gateway_image_queue, &frame, 0) == pdTRUE;
+}
+
+void gateway_image_queue_discard_pending()
+{
+    if (!g_gateway_image_queue) return;
+    GatewayImageFrame frame = {};
+    while (xQueueReceive(g_gateway_image_queue, &frame, 0) == pdTRUE) {
+        gateway_image_frame_free(&frame);
+    }
+}
+
+void gateway_image_task(void *arg)
+{
+    (void)arg;
+    uint8_t *rgb565 = nullptr;
+    int rgb565_capacity = 0;
+    uint32_t last_frame_ms = 0;
+
+    while (true) {
+        GatewayImageFrame frame = {};
+        if (xQueueReceive(g_gateway_image_queue, &frame, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        if (g_app_mode != AppMode::radio || !ui_gw_stream_active()) {
+            gateway_image_frame_free(&frame);
+            continue;
+        }
+
+        const uint32_t task_start_ms = static_cast<uint32_t>(esp_log_timestamp());
+        const uint32_t queue_wait_ms = task_start_ms - frame.queued_ms;
+        uint32_t decode_ms = 0;
+        uint32_t display_ms = 0;
+        bool displayed = false;
+
+        jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
+        dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
+
+        jpeg_dec_handle_t decoder = nullptr;
+        jpeg_error_t jerr = jpeg_dec_open(&dec_cfg, &decoder);
+        if (jerr == JPEG_ERR_OK && decoder) {
+            jpeg_dec_io_t io = {};
+            io.inbuf = frame.jpeg;
+            io.inbuf_len = static_cast<int>(frame.jpeg_len);
+
+            jpeg_dec_header_info_t header = {};
+            jerr = jpeg_dec_parse_header(decoder, &io, &header);
+            int outbuf_len = 0;
+            if (jerr == JPEG_ERR_OK) {
+                jerr = jpeg_dec_get_outbuf_len(decoder, &outbuf_len);
+            }
+            if (jerr == JPEG_ERR_OK && outbuf_len > 0) {
+                if (outbuf_len > rgb565_capacity) {
+                    if (rgb565) jpeg_free_align(rgb565);
+                    rgb565 = static_cast<uint8_t *>(jpeg_calloc_align(outbuf_len, 16));
+                    rgb565_capacity = rgb565 ? outbuf_len : 0;
+                }
+                if (rgb565) {
+                    io.outbuf = rgb565;
+                    jerr = jpeg_dec_process(decoder, &io);
+                    decode_ms = static_cast<uint32_t>(esp_log_timestamp()) - task_start_ms;
+                    if (jerr == JPEG_ERR_OK && ui_gw_stream_active()) {
+                        const uint32_t display_start_ms =
+                            static_cast<uint32_t>(esp_log_timestamp());
+                        ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565),
+                                          header.width, header.height,
+                                          static_cast<uint32_t>(frame.jpeg_len),
+                                          frame.transfer_ms);
+                        display_ms = static_cast<uint32_t>(esp_log_timestamp()) -
+                                     display_start_ms;
+                        displayed = true;
+                    }
+                } else {
+                    ESP_LOGE(TAG, "gateway RGB565 alloc failed: %d bytes", outbuf_len);
+                }
+            }
+            jpeg_dec_close(decoder);
+        }
+
+        if (jerr != JPEG_ERR_OK) {
+            ESP_LOGE(TAG, "gateway JPEG decode failed: %d session=%u", jerr,
+                     frame.session_id);
+        }
+        gateway_image_frame_free(&frame);
+
+        if (displayed) {
+            const uint32_t now_ms = static_cast<uint32_t>(esp_log_timestamp());
+            const uint32_t period_ms = last_frame_ms ? now_ms - last_frame_ms : 0;
+            last_frame_ms = now_ms;
+            const uint32_t consume_ms = frame.reassemble_ms + decode_ms + display_ms;
+            if (period_ms > 0) {
+                ESP_LOGI(TAG,
+                         "[FRAME] period=%lums (%lu.%lu fps) | transfer=%lums "
+                         "consume=%lums (queue=%lu reassemble=%lu decode=%lu display=%lu) "
+                         "jpeg=%u frags=%u",
+                         (unsigned long)period_ms,
+                         (unsigned long)(1000U / period_ms),
+                         (unsigned long)((10000U / period_ms) % 10U),
+                         (unsigned long)frame.transfer_ms,
+                         (unsigned long)consume_ms,
+                         (unsigned long)queue_wait_ms,
+                         (unsigned long)frame.reassemble_ms,
+                         (unsigned long)decode_ms,
+                         (unsigned long)display_ms,
+                         static_cast<unsigned>(frame.jpeg_len), frame.fragments);
+            }
+        }
+    }
+}
+
+esp_err_t gateway_image_pipeline_init()
+{
+    if (g_gateway_image_queue && g_gateway_image_task_handle) return ESP_OK;
+
+    g_gateway_image_queue = xQueueCreate(kGatewayImageQueueLength,
+                                         sizeof(GatewayImageFrame));
+    if (!g_gateway_image_queue) return ESP_ERR_NO_MEM;
+
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        gateway_image_task, "gw_image", kGatewayImageTaskStackBytes, nullptr,
+        kGatewayImageTaskPriority, &g_gateway_image_task_handle,
+        kGatewayImageTaskCore);
+    if (ok != pdPASS) {
+        vQueueDelete(g_gateway_image_queue);
+        g_gateway_image_queue = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "gateway image pipeline: queue=%u core=%d priority=%u next=%lums",
+             static_cast<unsigned>(kGatewayImageQueueLength),
+             static_cast<int>(kGatewayImageTaskCore),
+             static_cast<unsigned>(kGatewayImageTaskPriority),
+             static_cast<unsigned long>(kStreamNextFrameDelayMs));
+    return ESP_OK;
+}
+
 void on_image_rx_complete(ImageTransfer *xfer)
 {
     if (!xfer || !xfer->rx_complete()) return;
 
-    uint32_t t_rx = static_cast<uint32_t>(esp_log_timestamp());
-    uint32_t t_decode_ms = 0;
-    uint32_t t_display_ms = 0;
-    static uint32_t s_last_frame_ms = 0;
+    const uint32_t reassemble_start_ms = static_cast<uint32_t>(esp_log_timestamp());
+    GatewayImageFrame frame = {};
+    frame.transfer_ms = g_radio.last_transfer_ms();
+    frame.session_id = xfer->rx_session_id();
+    frame.fragments = xfer->rx_total_count();
 
-    uint8_t *jpeg = nullptr;
-    size_t jpeg_len = 0;
-    esp_err_t e = xfer->rx_reassemble(&jpeg, &jpeg_len);
-    if (e != ESP_OK || !jpeg) {
+    esp_err_t e = xfer->rx_reassemble(&frame.jpeg, &frame.jpeg_len);
+    if (e != ESP_OK || !frame.jpeg) {
         ESP_LOGE(TAG, "rx_reassemble failed: %d", e);
         xfer->rx_reset();
+        schedule_stream_next_frame();
         return;
     }
 
-    jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
-    dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
-
-    jpeg_dec_handle_t decoder = nullptr;
-    jpeg_error_t jerr = jpeg_dec_open(&dec_cfg, &decoder);
-    if (jerr == JPEG_ERR_OK && decoder) {
-        jpeg_dec_io_t io = {};
-        io.inbuf = jpeg;
-        io.inbuf_len = static_cast<int>(jpeg_len);
-
-        jpeg_dec_header_info_t header = {};
-        jerr = jpeg_dec_parse_header(decoder, &io, &header);
-        if (jerr == JPEG_ERR_OK) {
-            int outbuf_len = header.width * header.height * 2;
-            uint8_t *rgb565 = static_cast<uint8_t *>(jpeg_calloc_align(outbuf_len, 16));
-            if (rgb565) {
-                io.outbuf = rgb565;
-                jerr = jpeg_dec_process(decoder, &io);
-                t_decode_ms = static_cast<uint32_t>(esp_log_timestamp()) - t_rx;
-                if (jerr == JPEG_ERR_OK) {
-                    uint32_t t_disp0 = static_cast<uint32_t>(esp_log_timestamp());
-                    if (g_app_mode == AppMode::radio) {
-                        ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565),
-                                          header.width, header.height,
-                                          static_cast<uint32_t>(jpeg_len),
-                                          g_radio.last_transfer_ms());
-                    } else {
-                        bsp_lcd_show_rgb565_photo(reinterpret_cast<const uint16_t *>(rgb565),
-                                                  header.width, header.height);
-                        bsp_lcd_set_camera_status("Photo received");
-                    }
-                    t_display_ms = static_cast<uint32_t>(esp_log_timestamp()) - t_disp0;
-                }
-                jpeg_free_align(rgb565);
-            }
-        }
-        jpeg_dec_close(decoder);
-    }
-
-    heap_caps_free(jpeg);
     xfer->rx_reset();
+    frame.reassemble_ms = static_cast<uint32_t>(esp_log_timestamp()) -
+                          reassemble_start_ms;
+    frame.queued_ms = static_cast<uint32_t>(esp_log_timestamp());
 
-    uint32_t transfer_ms = g_radio.last_transfer_ms();
-    uint32_t now_ms = static_cast<uint32_t>(esp_log_timestamp());
-    uint32_t period_ms = (s_last_frame_ms != 0) ? (now_ms - s_last_frame_ms) : 0;
-    s_last_frame_ms = now_ms;
-    uint32_t consume_ms = t_decode_ms + t_display_ms;
-    if (period_ms > 0) {
-        ESP_LOGI(TAG, "[FRAME] period=%lums (%lu.%lu fps) | transfer=%lums consume=%lums "
-                      "(decode=%lu display=%lu)",
-                 (unsigned long)period_ms,
-                 (unsigned long)(1000 / period_ms), (unsigned long)((10000 / period_ms) % 10),
-                 (unsigned long)transfer_ms, (unsigned long)consume_ms,
-                 (unsigned long)t_decode_ms, (unsigned long)t_display_ms);
-    }
+    schedule_stream_next_frame();
 
-    if (g_app_mode == AppMode::radio && ui_gw_stream_active()) {
-        if (!g_stream_next_timer) {
-            const esp_timer_create_args_t args = {
-                .callback = stream_next_frame_cb,
-                .arg = nullptr,
-                .dispatch_method = ESP_TIMER_TASK,
-                .name = "stream_next",
-                .skip_unhandled_events = true,
-            };
-            esp_timer_create(&args, &g_stream_next_timer);
-        }
-        esp_timer_stop(g_stream_next_timer);
-        esp_timer_start_once(g_stream_next_timer,
-                             (uint64_t)APP_STREAM_NEXT_FRAME_DELAY_MS * 1000);
+    if (!gateway_image_queue_push(frame)) {
+        ESP_LOGE(TAG, "gateway image queue unavailable: drop session=%u",
+                 frame.session_id);
+        gateway_image_frame_free(&frame);
     }
 }
 
@@ -1057,6 +1198,7 @@ bool on_gw_capture(void)
 void on_gw_rx_abort(void)
 {
     ESP_LOGI(TAG, "UI: left transfer page, aborting image RX");
+    gateway_image_queue_discard_pending();
     g_radio.abort_image_rx();
 }
 
@@ -1377,7 +1519,12 @@ extern "C" void app_main(void)
             if ((e = bsp_lcd_start_gateway_ui()) != ESP_OK) {
                 ESP_LOGE(TAG, "gateway ui start: %s", esp_err_to_name(e));
             } else {
-                ui_gw_set_capture_cb(on_gw_capture);
+                e = gateway_image_pipeline_init();
+                if (e != ESP_OK) {
+                    ESP_LOGE(TAG, "gateway image pipeline init: %s", esp_err_to_name(e));
+                } else {
+                    ui_gw_set_capture_cb(on_gw_capture);
+                }
                 ui_gw_set_interval_cb(on_gw_interval_change);
                 ui_gw_set_sound_trigger_cb(on_gw_sound_trigger_change);
                 ui_gw_set_pir_trigger_cb(on_gw_pir_trigger_change);

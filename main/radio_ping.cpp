@@ -2111,7 +2111,8 @@ void RadioPing::handle_image_eot()
         // On the RX/NACK hot path — this fires once per retransmit round mid
         // transfer. Kept at DEBUG so it does not stall reception; the per-frame
         // outcome is still visible in the "RX done" line after completion.
-        ESP_LOGI(TAG, "image RX: sent ACK with %u missing, waiting for retransmit", missing_count);
+        ESP_LOGI(TAG, "image RX: sent ACK with %u missing (first=%u), waiting for retransmit",
+                 missing_count, missing_indices[0]);
         if (image_rx_eot_count_ == 1) {
             for (uint16_t i = 0; i < missing_count; i += 16) {
                 char line[128];
