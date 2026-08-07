@@ -215,46 +215,25 @@
 #define APP_AUTO_CAPTURE_MIN_SEC        10U    /* 10 seconds minimum */
 #define APP_CFG_KEY_INTERVAL            0x01
 #define APP_CFG_KEY_INTER_PACKET        0x02
-#define APP_CFG_KEY_AUDIO_CLIP          0x03
 #define APP_CFG_KEY_SOUND_TRIGGER       0x04
 #define APP_CFG_KEY_PIR_TRIGGER         0x05
 #define APP_CFG_KEY_VOICE_ALARM         0x06
 #define APP_CFG_KEY_LOW_POWER           0x07
-#define APP_AUDIO_CLIP_DEFAULT_ENABLE   0
-
-
 #define APP_TRIGGER_COOLDOWN_SEC        15U
-#define APP_AUDIO_CAPTURE_COOLDOWN_MS   6000U
 #define APP_PIR_GPIO                    GPIO_NUM_12
 #define APP_SOUND_TRIGGER_THRESH_LOW    1200
 #define APP_SOUND_TRIGGER_THRESH_MED    5000
 #define APP_SOUND_TRIGGER_THRESH_HIGH   12000
 
 /* Sound trigger fires the capture this many ms AFTER the threshold is crossed,
- * so the Opus pre-encode ring keeps filling and the snapshot captures the audio
- * at and just after the trigger moment (not only the pre-trigger tail).
- * 500ms = 50 frames at APP_AUDIO_FRAME_MS. PIR is a physical event with no such
- * "record the moment" need, so only the sound path uses this delay. */
+ * providing a short debounce window before dispatch. PIR is a physical event
+ * with no such need, so only the sound path uses this delay. */
 #define APP_SOUND_TRIGGER_DELAY_MS      500U
 
 /* ----- Voice alarm (speaker playback on trigger) ------------------------- */
 
 #define APP_VOICE_ALARM_ENABLE          1
 #define APP_VOICE_ALARM_VOLUME_PERCENT  80U   /* gateway level 8 → 80% → REG32=0xCC */
-
-/* ----- Opus pre-encode ring buffer --------------------------------------- */
-
-/* Depth of the Opus pre-encode ring in seconds. Sized to cover the worst-case
- * retransmit window between two consecutive frame sends so the drain() cursor
- * never runs dry mid-stream. */
-#define APP_OPUS_RING_SECONDS           5U
-#define APP_AUDIO_CLIP_MAX_OPUS_BYTES   20000U
-#define APP_AUDIO_SESSION_FLAG          0x8000U
-
-/* Continuous audio streaming alongside video. Max opus bytes packed into one
- * frame blob. Normal ~220ms/frame is ~22 opus frames ~550-650 bytes; cap at
- * ~1.5s so a slow retransmit round can't bloat the blob. */
-#define APP_STREAM_OPUS_MAX_BYTES       3000U
 
 /* ----- Image transfer over FLRC ------------------------------------------ */
 

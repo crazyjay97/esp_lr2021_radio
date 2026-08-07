@@ -5,12 +5,10 @@
 #include "opus_codec.hpp"
 #include "ui_gateway.h"
 #include "wifi_manager.h"
-#include "image_store.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
@@ -23,7 +21,6 @@
 
 #include <stdio.h>
 #include <new>
-#include <cmath>
 
 #include "app_config.h"
 #include "bsp.h"
@@ -38,8 +35,6 @@ namespace {
 constexpr const char *TAG = "app";
 constexpr const char *kNvsNs = "app";
 constexpr const char *kModeKey = "mode";
-
-uint32_t s_last_gw_capture_ms = 0;
 
 enum class AppMode : uint8_t {
     camera = 0,
@@ -57,7 +52,6 @@ bool g_radio_active = false;
 esp_timer_handle_t g_auto_capture_timer = nullptr;
 esp_timer_handle_t g_countdown_timer = nullptr;
 uint32_t g_capture_interval_sec = APP_AUTO_CAPTURE_DEFAULT_SEC;
-bool g_audio_clip_enabled = APP_AUDIO_CLIP_DEFAULT_ENABLE;
 volatile bool g_voice_alarm_enabled = false;
 uint16_t g_auto_session_id = 0x8000;
 int64_t g_last_capture_time_us = 0;
@@ -65,38 +59,12 @@ int64_t g_last_capture_time_us = 0;
 // K6 short/long press state
 int64_t g_ptt_press_time_us = 0;
 bool g_ptt_held_long = false;
-esp_timer_handle_t g_cooldown_retry_timer = nullptr;
 esp_timer_handle_t g_ptt_timer = nullptr;
 
 // Continuous video stream: one-shot timer that fires the next capture request a
 // short delay after a frame finishes, so the re-trigger runs off the radio task
 // (not re-entrant inside the rx-complete callback).
 esp_timer_handle_t g_stream_next_timer = nullptr;
-
-// Gateway AV sync queue. Each received frame (image + audio) is paired into an
-// AVFrame struct by the rx-complete callback (non-blocking). gateway_audio_task
-// dequeues these pairs and displays the image immediately before playing its
-// corresponding audio segment, naturally syncing video to the I2S clock-driven
-// audio timeline. There is NO prebuffer: playback starts as soon as a frame is
-// available (lowest latency). To stop latency from accumulating when frames
-// pile up faster than they drain, a frame that has waited longer than
-// APP_GW_AV_MAX_LATENCY_MS in the queue is dropped (image + audio together, so
-// sync is preserved) whenever a newer frame is already queued behind it.
-struct AVFrame {
-    uint16_t *rgb565;       // decoded image in SPIRAM, null if no image
-    uint32_t  width;
-    uint32_t  height;
-    uint8_t  *opus_packed;  // opus blob in SPIRAM, null if no audio
-    size_t    opus_len;
-    uint32_t  jpeg_size;    // original compressed size, for diagnostics
-    uint32_t  transfer_ms;  // RF transfer time, for diagnostics
-    uint32_t  enqueue_ms;   // time the frame was pushed, for the catch-up test
-};
-QueueHandle_t g_av_queue = nullptr;
-TaskHandle_t g_audio_task = nullptr;
-bool g_audio_playing_state = false;
-#define APP_GW_AV_QUEUE_SIZE        20      /* ~ a few seconds of AV pairs */
-#define APP_GW_AV_MAX_LATENCY_MS    600U    /* drop-oldest catch-up threshold */
 
 const char *mode_name(AppMode mode)
 {
@@ -267,9 +235,6 @@ void countdown_timer_cb(void *arg)
         snprintf(buf, sizeof(buf), "%lu%s | %lds", static_cast<unsigned long>(val), unit,
                  static_cast<long>(remaining));
     }
-    if (g_audio_clip_enabled) {
-        strncat(buf, " radio", sizeof(buf) - strlen(buf) - 1);
-    }
     bsp_lcd_set_camera_status(buf);
 }
 
@@ -375,11 +340,6 @@ void on_config_received(uint8_t key, uint32_t value)
         char buf[16];
         snprintf(buf, sizeof(buf), "%luus", static_cast<unsigned long>(value));
         bsp_lcd_set_camera_status(buf);
-    } else if (key == APP_CFG_KEY_AUDIO_CLIP) {
-        g_audio_clip_enabled = (value != 0);
-        save_config_u8("audio_clip", value ? 1 : 0);
-        update_camera_timer_status();
-        ESP_LOGI(TAG, "config: audio_clip=%s", g_audio_clip_enabled ? "on" : "off");
     } else if (key == APP_CFG_KEY_SOUND_TRIGGER) {
         g_radio.set_sound_trigger_level(value);
         save_config_u8("snd_trig", (uint8_t)value);
@@ -397,15 +357,12 @@ void on_config_received(uint8_t key, uint32_t value)
         save_config_u8("lowpwr", value ? 1 : 0);
         ESP_LOGI(TAG, "config: low_power=%s", value ? "on" : "off");
         if (value != 0) {
-            // Low power sleeps the CPU during CAD standby, so sound trigger and
-            // audio clip can't work. Zero them (and persist) so they stay off
-            // even after low power is turned off, matching the gateway UI.
-            g_audio_clip_enabled = false;
-            save_config_u8("audio_clip", 0);
+            // Low power sleeps the CPU during CAD standby, so sound trigger
+            // cannot work. Persist it off to match the gateway UI.
             g_radio.set_sound_trigger_level(0);
             save_config_u8("snd_trig", 0);
             update_camera_timer_status();
-            ESP_LOGI(TAG, "low power: sound trigger + audio clip disabled");
+            ESP_LOGI(TAG, "low power: sound trigger disabled");
         }
     }
 }
@@ -454,10 +411,8 @@ struct ImageCaptureCtx {
 // independent hardware (LCD_CAM/DMA vs the radio SPI) and, since the TX wait now
 // blocks (layer 2), the CPU is idle during most of the push. So while frame N is
 // being transmitted we pre-capture+encode frame N+1 into this cache. When the
-// next ImageCmd arrives we send the cached blob immediately, moving the ~100ms
-// prep off the per-frame critical path. Video-only: an opus clip must be
-// snapshotted at the capture instant, so prefetch is skipped when audio clips
-// are enabled (default off) and that path stays fully serial.
+// next ImageCmd arrives we send the cached JPEG immediately, moving the ~100ms
+// preparation off the per-frame critical path.
 static SemaphoreHandle_t g_prefetch_mutex = nullptr;
 static uint8_t *g_prefetch_jpeg = nullptr;   // heap_caps blob, owned by cache
 static size_t g_prefetch_jpeg_len = 0;
@@ -587,25 +542,6 @@ void image_capture_task(void *arg)
 
     bsp_lcd_set_camera_status("Remote capture...");
 
-#if APP_AUDIO_FEATURES_ENABLE
-    g_radio.pause_audio_capture();
-    vTaskDelay(pdMS_TO_TICKS(APP_AUDIO_FRAME_MS + 5));
-#endif
-
-    // Opus audio is drained fresh from the ring right before the blob is built
-    // (see below), NOT snapshotted here. The ring keeps filling during this whole
-    // capture+TX (tx_task no longer pauses on image_tx_active_), so draining at
-    // send time yields a continuous, gap-free stream across frames.
-    uint8_t *opus_buf = nullptr;
-    size_t opus_len = 0;
-
-#if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
-    esp_err_t audio_e = bsp_audio_suspend();
-    if (audio_e != ESP_OK) {
-        ESP_LOGW(TAG, "audio suspend for image capture: %s", esp_err_to_name(audio_e));
-    }
-#endif
-
     esp_err_t e = ESP_OK;
     (void)e;
 #if APP_CAMERA_NODE_LCD_ENABLE
@@ -614,23 +550,14 @@ void image_capture_task(void *arg)
         ESP_LOGE(TAG, "release lcd for image capture: %s", esp_err_to_name(e));
         bsp_lcd_reinit_after_camera();
         bsp_lcd_set_camera_status("LCD release failed");
-#if APP_AUDIO_FEATURES_ENABLE
-        bsp_audio_resume();
-        g_radio.resume_audio_capture();
-#endif
-        heap_caps_free(opus_buf);
         g_capture_busy = false;
         vTaskDelete(nullptr);
         return;
     }
 #endif
 
-    // JPEG blob for this frame. Fast path: a prefetched frame produced during
-    // the previous frame's TX is ready — use it and skip capture+encode entirely,
-    // moving that ~100ms off the per-frame critical path. Cold path (first frame
-    // or stale prefetch): capture + encode now. Prefetch is no longer gated on
-    // audio: opus is drained separately at send time, so JPEG being slightly old
-    // no longer breaks audio continuity.
+    // JPEG for this frame. Use a fresh prefetched frame when available;
+    // otherwise capture and encode on demand.
     uint8_t *jpeg = nullptr;
     size_t jpeg_len = 0;
     uint32_t t_jpeg_done;
@@ -654,17 +581,12 @@ void image_capture_task(void *arg)
                  static_cast<unsigned long>(height),
                  static_cast<unsigned>(len));
 
-        // LCD reinit and audio resume deferred until after transmission
+        // LCD reinit is deferred until after transmission.
         if (capture_e != ESP_OK || !frame) {
 #if APP_CAMERA_NODE_LCD_ENABLE
             bsp_lcd_reinit_after_camera();
 #endif
-#if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
-            bsp_audio_resume();
-#endif
             bsp_lcd_set_camera_status("Capture failed");
-            heap_caps_free(opus_buf);
-            g_radio.resume_audio_capture();
             g_capture_busy = false;
             vTaskDelete(nullptr);
             return;
@@ -684,94 +606,31 @@ void image_capture_task(void *arg)
 #if APP_CAMERA_NODE_LCD_ENABLE
             bsp_lcd_reinit_after_camera();
 #endif
-#if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
-            bsp_audio_resume();
-#endif
             bsp_lcd_set_camera_status("JPEG encode failed");
-            heap_caps_free(opus_buf);
-            g_radio.resume_audio_capture();
             g_capture_busy = false;
             vTaskDelete(nullptr);
             return;
         }
     }
-
-    // --- Drain fresh Opus audio accumulated since the previous send ---
-    // Done here (just before the blob is built) so the segment is as fresh as
-    // possible. drain_opus() advances the ring's read cursor, so successive
-    // frames carry a continuous, non-overlapping audio timeline. Capped at
-    // APP_STREAM_OPUS_MAX_BYTES so a slow retransmit round can't bloat the blob.
-    opus_buf = static_cast<uint8_t *>(
-        heap_caps_malloc(APP_STREAM_OPUS_MAX_BYTES, MALLOC_CAP_SPIRAM));
-    if (opus_buf) {
-        opus_len = g_radio.drain_opus(opus_buf, APP_STREAM_OPUS_MAX_BYTES);
-        if (opus_len == 0) {
-            heap_caps_free(opus_buf);
-            opus_buf = nullptr;
-        }
-    }
-
-    // --- Build blob: [4-byte jpeg_len][jpeg][opus] and send once ---
-    bool has_opus = (opus_buf && opus_len > 0);
-    uint8_t *blob;
-    size_t blob_len;
-
-    if (has_opus) {
-        blob_len = 4 + jpeg_len + opus_len;
-        blob = static_cast<uint8_t *>(
-            heap_caps_malloc(blob_len, MALLOC_CAP_SPIRAM));
-        if (!blob) {
-            ESP_LOGE(TAG, "blob alloc failed: %u bytes", static_cast<unsigned>(blob_len));
-            heap_caps_free(jpeg);
-            heap_caps_free(opus_buf);
-#if APP_CAMERA_NODE_LCD_ENABLE
-            bsp_lcd_reinit_after_camera();
-#endif
-#if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
-            bsp_audio_resume();
-#endif
-            bsp_lcd_set_camera_status("Alloc failed");
-            g_radio.resume_audio_capture();
-            g_capture_busy = false;
-            vTaskDelete(nullptr);
-            return;
-        }
-        blob[0] = static_cast<uint8_t>(jpeg_len);
-        blob[1] = static_cast<uint8_t>(jpeg_len >> 8);
-        blob[2] = static_cast<uint8_t>(jpeg_len >> 16);
-        blob[3] = static_cast<uint8_t>(jpeg_len >> 24);
-        memcpy(&blob[4], jpeg, jpeg_len);
-        memcpy(&blob[4 + jpeg_len], opus_buf, opus_len);
-    } else {
-        blob_len = jpeg_len;
-        blob = jpeg;
-        jpeg = nullptr;
-    }
-    heap_caps_free(jpeg);
-    heap_caps_free(opus_buf);
 
     uint16_t total_frags = static_cast<uint16_t>(
-        (blob_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) / APP_IMAGE_FRAGMENT_DATA_SIZE);
-    uint16_t tx_session = has_opus ? (session_id | APP_AUDIO_SESSION_FLAG) : session_id;
-    ESP_LOGD(TAG, "sending blob: %u pkts, %u bytes (jpeg=%u opus=%u)",
-             total_frags, static_cast<unsigned>(blob_len),
-             static_cast<unsigned>(jpeg_len), static_cast<unsigned>(opus_len));
+        (jpeg_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) / APP_IMAGE_FRAGMENT_DATA_SIZE);
+    ESP_LOGD(TAG, "sending JPEG: %u pkts, %u bytes",
+             total_frags, static_cast<unsigned>(jpeg_len));
 
-    g_radio.send_image(blob, blob_len, tx_session);
+    g_radio.send_image(jpeg, jpeg_len, session_id);
 
     // Pipeline: the radio is now pushing this frame on the img_tx task (~140ms,
     // SPI + airtime) with the CPU otherwise idle (layer-2 blocking TX wait). Use
     // that window to pre-capture+encode the NEXT frame into the prefetch cache so
     // the next ImageCmd can send it immediately. Camera (LCD_CAM/DMA) and radio
     // (SPI) are independent buses, and img_tx runs one priority above this task,
-    // so a TX_DONE wakeup preempts the encode and the burst never stalls. Always
-    // runs now: opus is drained separately at send time (not tied to the capture
-    // instant), so prefetch no longer needs to be gated on audio.
+    // so a TX_DONE wakeup preempts the encode and the burst never stalls.
     // A prefetch that no next-frame request consumes is dropped by the staleness
     // guard in prefetch_take, so a single/auto capture only costs one idle encode.
     prefetch_produce();
 
-    // Ownership of `blob` has been handed to send_image / image_tx_task, which
+    // Ownership of `jpeg` has been handed to send_image / image_tx_task, which
     // frees it when the transfer finishes or aborts. Do NOT free it here: the
     // tx task may still be reading it (its own handshake budget is up to 30s,
     // which used to race this wait and cause a use-after-free). We wait only to
@@ -798,15 +657,8 @@ void image_capture_task(void *arg)
              static_cast<unsigned long>(t_tx_done - t_jpeg_done));
 
     if (!tx_done) {
-        // TX outran our 30s wait and is still running. Do NOT run the post-tx
-        // block: resume_audio_capture() clears image_tx_active_ (which the tx
-        // task still depends on) and the voice alarm plays a clip — both would
-        // race the still-active tx task on the radio from this thread. The tx
-        // task cleans up after itself when it finishes (clears image_tx_active_,
-        // ends the wake window, resumes audio capture). The camera node has no
-        // LCD, so there is nothing else to restore here. Just release the
-        // capture guard and exit.
-        ESP_LOGW(TAG, "image tx still active after 30s; skipping post-tx cleanup (tx task finishes on its own)");
+        // The TX task still owns the JPEG and will finish radio cleanup.
+        // Skip post-TX work that could contend with the active transfer.        ESP_LOGW(TAG, "image tx still active after 30s; skipping post-tx cleanup (tx task finishes on its own)");
         g_capture_busy = false;
         vTaskDelete(nullptr);
         return;
@@ -819,14 +671,9 @@ void image_capture_task(void *arg)
         ESP_LOGE(TAG, "lcd reinit after tx: %s", esp_err_to_name(lcd_e));
     }
 #endif
-#if APP_CAMERA_NODE_LCD_ENABLE && APP_AUDIO_FEATURES_ENABLE
-    bsp_audio_resume();
-#endif
     char status[48];
     snprintf(status, sizeof(status), "Done %u pkts", total_frags);
     bsp_lcd_set_camera_status(status);
-
-    g_radio.resume_audio_capture();
 
 #if APP_VOICE_ALARM_ENABLE
     if (g_voice_alarm_enabled && session_id >= 0xC000) {
@@ -880,17 +727,6 @@ bool on_image_capture_request(uint16_t session_id)
         ESP_LOGW(TAG, "ImageCmd ignored: session %u already dispatched", session_id);
         return true;
     }
-    if (g_audio_clip_enabled) {
-        static uint32_t s_last_node_capture_ms = 0;
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-        if (s_last_node_capture_ms != 0 &&
-            (now - s_last_node_capture_ms) < APP_AUDIO_CAPTURE_COOLDOWN_MS) {
-            ESP_LOGW(TAG, "ImageCmd ignored: audio cooldown");
-            g_radio.notify_capture_dropped();
-            return false;
-        }
-        s_last_node_capture_ms = now;
-    }
     g_capture_busy = true;
     s_last_dispatched_session = session_id;
     s_have_dispatched = true;
@@ -920,193 +756,6 @@ bool on_image_capture_request(uint16_t session_id)
     return true;
 }
 
-// Free both buffers an AVFrame owns. Safe on null fields.
-static void av_frame_free(AVFrame *f)
-{
-    if (!f) return;
-    if (f->rgb565)      heap_caps_free(f->rgb565);
-    if (f->opus_packed) heap_caps_free(f->opus_packed);
-    f->rgb565 = nullptr;
-    f->opus_packed = nullptr;
-}
-
-// Push one paired image+audio frame into the AV sync queue. Non-blocking so the
-// rx-complete path / pull loop is never stalled. On a full queue the OLDEST
-// pair is dropped (and freed) to make room, keeping playback close to real time
-// rather than backing up unbounded latency. Takes ownership of both buffers.
-static void av_queue_push(AVFrame *frame)
-{
-    if (!g_av_queue || !frame) { av_frame_free(frame); return; }
-
-    frame->enqueue_ms = static_cast<uint32_t>(esp_log_timestamp());
-
-    if (xQueueSend(g_av_queue, frame, 0) != pdTRUE) {
-        AVFrame old;
-        if (xQueueReceive(g_av_queue, &old, 0) == pdTRUE) {
-            av_frame_free(&old);
-        }
-        if (xQueueSend(g_av_queue, frame, 0) != pdTRUE) {
-            av_frame_free(frame);   // still no room; drop ours
-        }
-    }
-}
-
-// --- Howling (acoustic feedback) suppression --------------------------------
-// The gateway speaker sitting close to the node mic can form an acoustic
-// feedback loop (howling). Field data showed howling has two clean signatures
-// in the decoded playback PCM that normal audio never hits: heavy sample
-// saturation (clip%) and very high energy (rms). Autocorrelation / ZCR variance
-// were unreliable in practice, so detection uses only clip% + rms.
-//
-// State machine (per 10ms frame, 160 samples @ 16kHz):
-//   ACTIVE  -> a frame with clip >= ENTER_CLIP AND rms >= ENTER_RMS held for
-//              ENTER_FRAMES starts muting.
-//   MUTED   -> output is zeroed; when clip <= EXIT_CLIP AND rms <= EXIT_RMS for
-//              EXIT_FRAMES (one full echo round-trip) playback resumes.
-// Thresholds are intentionally loose: only unmistakable howling is muted, so
-// loud but legitimate audio is never cut. Muting the gateway speaker breaks the
-// loop, so the mic stops re-capturing the tone and levels fall back to normal.
-#define HOWL_CLIP_SAMPLE    29490   /* 0.9 * full scale: a "clipped" sample     */
-#define HOWL_ENTER_CLIP     5       /* % clipped samples to call it howling     */
-#define HOWL_ENTER_RMS      6000    /* energy floor to call it howling          */
-#define HOWL_ENTER_FRAMES   3       /* ~30ms sustained before muting            */
-#define HOWL_EXIT_CLIP      2       /* % clipped to consider the loop broken    */
-#define HOWL_EXIT_RMS       4500    /* energy ceiling to consider it gone       */
-#define HOWL_EXIT_FRAMES    50      /* ~500ms clear (> one echo round-trip)     */
-
-struct HowlSuppressor {
-    bool     muted;
-    uint16_t enter_run;   // consecutive frames meeting the enter condition
-    uint16_t exit_run;    // consecutive frames meeting the exit condition
-};
-
-// Analyze one decoded frame and update mute state. Returns true if this frame
-// should be silenced (zeroed) before playback.
-static bool howl_process(HowlSuppressor *h, const int16_t *pcm, int n)
-{
-    if (n <= 0) return h->muted;
-
-    int64_t sum_sq = 0;
-    int      clipped = 0;
-    for (int i = 0; i < n; i++) {
-        int32_t s = pcm[i];
-        sum_sq += (int64_t)s * s;
-        int32_t a = s < 0 ? -s : s;
-        if (a > HOWL_CLIP_SAMPLE) clipped++;
-    }
-    uint32_t rms = (uint32_t)sqrtf((float)(sum_sq / n));
-    uint32_t clip_pct = (uint32_t)(clipped * 100 / n);
-
-    if (!h->muted) {
-        bool howl = (clip_pct >= HOWL_ENTER_CLIP && rms >= HOWL_ENTER_RMS);
-        h->enter_run = howl ? (uint16_t)(h->enter_run + 1) : 0;
-        if (h->enter_run >= HOWL_ENTER_FRAMES) {
-            h->muted = true;
-            h->exit_run = 0;
-            ESP_LOGW(TAG, "howling detected (clip=%lu%% rms=%lu), muting",
-                     (unsigned long)clip_pct, (unsigned long)rms);
-        }
-    } else {
-        bool clear = (clip_pct <= HOWL_EXIT_CLIP && rms <= HOWL_EXIT_RMS);
-        h->exit_run = clear ? (uint16_t)(h->exit_run + 1) : 0;
-        if (h->exit_run >= HOWL_EXIT_FRAMES) {
-            h->muted = false;
-            h->enter_run = 0;
-            ESP_LOGI(TAG, "howling cleared, resuming playback");
-        }
-    }
-
-    return h->muted;
-}
-
-// Gateway AV playback task. Dequeues image+audio pairs, shows the image, then
-// decodes/writes the opus segment to I2S. No prebuffer: it plays as soon as a
-// frame exists (lowest latency). Catch-up: if the frame pulled off the queue
-// has already waited > APP_GW_AV_MAX_LATENCY_MS AND a newer frame is queued
-// behind it, the stale frame (image + audio together) is dropped so latency
-// cannot keep growing when frames arrive faster than they drain.
-void gateway_audio_task(void *arg)
-{
-    (void)arg;
-
-    OpusCodec codec;
-    if (codec.init_decoder_only() != ESP_OK) {
-        ESP_LOGE(TAG, "gateway_audio_task: codec init failed");
-        vTaskDelete(nullptr);
-        return;
-    }
-    // PA is NOT left on continuously: a class-D amp switching next to the LR2021
-    // front-end raises the packet error rate. It is enabled just before the
-    // first write and disabled when the queue runs dry, so the radio sees a
-    // quiet front-end whenever no sound is being produced.
-    ESP_LOGI(TAG, "gateway audio task started (PA gated on playback)");
-
-    int16_t pcm[APP_AUDIO_FRAME_SAMPLES];
-    int16_t stereo[APP_AUDIO_FRAME_SAMPLES * 2];
-    HowlSuppressor howl = {};   // acoustic-feedback (howling) mute state
-
-    for (;;) {
-        // Block until a frame is available. No prebuffer -> play immediately.
-        AVFrame frame;
-        if (xQueueReceive(g_av_queue, &frame, pdMS_TO_TICKS(300)) != pdTRUE) {
-            if (g_audio_playing_state) {
-                g_audio_playing_state = false;   // queue dry -> silence the amp
-                bsp_audio_pa_enable(false);
-            }
-            continue;
-        }
-
-        // Catch-up: drop this frame if it has been waiting too long AND a newer
-        // frame is already queued. Image + audio are dropped together so they
-        // stay in sync; we only ever advance to a frame that is fresh enough or
-        // is the last one in the queue (never leaving nothing to play).
-        while ((static_cast<uint32_t>(esp_log_timestamp()) - frame.enqueue_ms)
-                   > APP_GW_AV_MAX_LATENCY_MS
-               && uxQueueMessagesWaiting(g_av_queue) > 0) {
-            av_frame_free(&frame);
-            xQueueReceive(g_av_queue, &frame, 0);
-        }
-
-        if (!g_audio_playing_state) {
-            g_audio_playing_state = true;
-            bsp_audio_pa_enable(true);   // enable just before the first write
-            ESP_LOGI(TAG, "audio playback started, PA on");
-        }
-
-        // AV sync: display THIS frame's image right before playing its audio.
-        // Because we only reach here at the audio drain rate (I2S clock paced),
-        // the image cadence tracks the audio timeline instead of racing ahead
-        // at RF-arrival speed. The rotate+invalidate is a few ms; the LVGL flush
-        // then overlaps the ~220ms audio playback below on the LVGL task.
-        if (frame.rgb565) {
-            ui_gw_rx_complete(frame.rgb565, frame.width, frame.height,
-                              frame.jpeg_size, frame.transfer_ms);
-            heap_caps_free(frame.rgb565);
-            frame.rgb565 = nullptr;
-        }
-
-        size_t pos = 0;
-        while (frame.opus_packed && pos < frame.opus_len) {
-            uint8_t flen = frame.opus_packed[pos++];
-            if (flen == 0 || pos + flen > frame.opus_len) break;
-            int n = codec.decode(&frame.opus_packed[pos], flen, pcm, APP_AUDIO_FRAME_SAMPLES);
-            pos += flen;
-            if (n <= 0) continue;
-            // Break the acoustic feedback loop: zero this frame while howling.
-            bool mute = howl_process(&howl, pcm, n);
-            for (int i = 0; i < n; i++) {
-                int16_t s = mute ? 0 : pcm[i];
-                stereo[2 * i] = s;
-                stereo[2 * i + 1] = s;
-            }
-            size_t written = 0;
-            bsp_audio_write(stereo, n * 2 * sizeof(int16_t), &written);
-        }
-        av_frame_free(&frame);
-    }
-}
-
-// Callback: device B receives complete image
 void play_audio_clip(const uint8_t *opus_packed, size_t total_len)
 {
     OpusCodec clip_codec;
@@ -1143,57 +792,20 @@ void on_image_rx_complete(ImageTransfer *xfer)
 {
     if (!xfer || !xfer->rx_complete()) return;
 
-    // Per-frame consumption timing (gateway side). The node cannot push faster
-    // than the gateway can decode + rotate + flush to the LCD + persist; this
-    // breakdown measures that ceiling so the stream cadence (and any future node
-    // self-push flow control) can be sized against it. period = wall-clock gap
-    // between consecutive completed frames = the real end-to-end frame rate.
     uint32_t t_rx = static_cast<uint32_t>(esp_log_timestamp());
-    uint32_t t_decode_ms = 0, t_display_ms = 0, t_save_ms = 0;
+    uint32_t t_decode_ms = 0;
+    uint32_t t_display_ms = 0;
     static uint32_t s_last_frame_ms = 0;
 
-    // AV sync staging: when a frame carries audio, the decoded image is copied
-    // here (SPIRAM) and later paired with its opus segment into g_av_queue so
-    // gateway_audio_task displays it in lockstep with playback. Null when the
-    // image was already shown inline (no audio, or SPIRAM copy failed).
-    uint16_t *av_pending_rgb565 = nullptr;
-    uint32_t  av_pending_w = 0, av_pending_h = 0;
-
-    if (g_audio_clip_enabled) {
-        s_last_gw_capture_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    }
-
-    uint16_t sid = xfer->rx_session_id();
-    bool has_audio = (sid & APP_AUDIO_SESSION_FLAG) != 0;
-
-    // Reassemble the received data
-    uint8_t *raw = nullptr;
-    size_t raw_len = 0;
-    esp_err_t e = xfer->rx_reassemble(&raw, &raw_len);
-    if (e != ESP_OK || !raw) {
+    uint8_t *jpeg = nullptr;
+    size_t jpeg_len = 0;
+    esp_err_t e = xfer->rx_reassemble(&jpeg, &jpeg_len);
+    if (e != ESP_OK || !jpeg) {
         ESP_LOGE(TAG, "rx_reassemble failed: %d", e);
         xfer->rx_reset();
         return;
     }
 
-    const uint8_t *jpeg_data = raw;
-    size_t jpeg_len = raw_len;
-    const uint8_t *opus_data = nullptr;
-    size_t opus_len = 0;
-
-    if (has_audio && raw_len > 4) {
-        uint32_t jlen = static_cast<uint32_t>(raw[0])
-                      | (static_cast<uint32_t>(raw[1]) << 8)
-                      | (static_cast<uint32_t>(raw[2]) << 16)
-                      | (static_cast<uint32_t>(raw[3]) << 24);
-        if (jlen <= raw_len - 4) {
-            jpeg_data = &raw[4];
-            jpeg_len = jlen;
-            opus_data = &raw[4 + jlen];
-            opus_len = raw_len - 4 - jlen;
-        }
-    }
-    // Decode and display JPEG
     jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
     dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
 
@@ -1201,7 +813,7 @@ void on_image_rx_complete(ImageTransfer *xfer)
     jpeg_error_t jerr = jpeg_dec_open(&dec_cfg, &decoder);
     if (jerr == JPEG_ERR_OK && decoder) {
         jpeg_dec_io_t io = {};
-        io.inbuf = const_cast<unsigned char *>(jpeg_data);
+        io.inbuf = jpeg;
         io.inbuf_len = static_cast<int>(jpeg_len);
 
         jpeg_dec_header_info_t header = {};
@@ -1214,37 +826,15 @@ void on_image_rx_complete(ImageTransfer *xfer)
                 jerr = jpeg_dec_process(decoder, &io);
                 t_decode_ms = static_cast<uint32_t>(esp_log_timestamp()) - t_rx;
                 if (jerr == JPEG_ERR_OK) {
-                    uint32_t w = header.width;
-                    uint32_t h = header.height;
                     uint32_t t_disp0 = static_cast<uint32_t>(esp_log_timestamp());
                     if (g_app_mode == AppMode::radio) {
-                        if (has_audio && opus_len > 0) {
-                            // AV sync path: hand the image to gateway_audio_task
-                            // paired with its audio, so display is paced by the
-                            // I2S clock instead of racing ahead at RF speed. Copy
-                            // rgb565 into SPIRAM (decode buffer is freed here).
-                            av_pending_rgb565 = static_cast<uint16_t *>(
-                                heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM));
-                            if (av_pending_rgb565) {
-                                memcpy(av_pending_rgb565, rgb565, (size_t)w * h * 2);
-                                av_pending_w = w;
-                                av_pending_h = h;
-                            } else {
-                                // SPIRAM full: fall back to immediate display so
-                                // the frame is not lost (audio will be ahead).
-                                ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565),
-                                                  w, h, static_cast<uint32_t>(raw_len),
-                                                  g_radio.last_transfer_ms());
-                            }
-                        } else {
-                            // No audio: display immediately for lowest latency.
-                            // Synchronous cost only (rotate + mark dirty); the LCD
-                            // flush happens async on the LVGL task (core 1).
-                            ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565), w, h,
-                                              static_cast<uint32_t>(raw_len), g_radio.last_transfer_ms());
-                        }
+                        ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565),
+                                          header.width, header.height,
+                                          static_cast<uint32_t>(jpeg_len),
+                                          g_radio.last_transfer_ms());
                     } else {
-                        bsp_lcd_show_rgb565_photo(reinterpret_cast<const uint16_t *>(rgb565), w, h);
+                        bsp_lcd_show_rgb565_photo(reinterpret_cast<const uint16_t *>(rgb565),
+                                                  header.width, header.height);
                         bsp_lcd_set_camera_status("Photo received");
                     }
                     t_display_ms = static_cast<uint32_t>(esp_log_timestamp()) - t_disp0;
@@ -1255,58 +845,23 @@ void on_image_rx_complete(ImageTransfer *xfer)
         jpeg_dec_close(decoder);
     }
 
-    // Save to image store for HTTP gallery
-    uint32_t t_save0 = static_cast<uint32_t>(esp_log_timestamp());
-    image_store_save(jpeg_data, jpeg_len, opus_data, opus_len, sid);
-    t_save_ms = static_cast<uint32_t>(esp_log_timestamp()) - t_save0;
-
-    // Enqueue the AV pair for synced playback. Non-blocking: the old blocking
-    // play_audio_clip() ran the whole segment inline on the rx path and stalled
-    // the pull loop, capping frame rate. gateway_audio_task now displays the
-    // image + decodes/plays audio off this thread, paced by the I2S clock so
-    // video stays in sync with audio. If the image was already shown inline
-    // (SPIRAM copy failed) av_pending_rgb565 is null and only audio is queued.
-    if (av_pending_rgb565 || (opus_data && opus_len > 0)) {
-        AVFrame frame = {};
-        frame.rgb565      = av_pending_rgb565;
-        frame.width       = av_pending_w;
-        frame.height      = av_pending_h;
-        frame.jpeg_size   = static_cast<uint32_t>(raw_len);
-        frame.transfer_ms = g_radio.last_transfer_ms();
-        if (opus_data && opus_len > 0) {
-            frame.opus_packed = static_cast<uint8_t *>(
-                heap_caps_malloc(opus_len, MALLOC_CAP_SPIRAM));
-            if (frame.opus_packed) {
-                memcpy(frame.opus_packed, opus_data, opus_len);
-                frame.opus_len = opus_len;
-            }
-        }
-        av_queue_push(&frame);   // takes ownership of both buffers
-    }
-
-    heap_caps_free(raw);
+    heap_caps_free(jpeg);
     xfer->rx_reset();
 
-    // One line per frame: radio transfer (airtime + handshake, from the node's
-    // ImageStart to last fragment) vs gateway consume (decode + display + save),
-    // and the wall-clock period between frames = the real achieved fps.
     uint32_t transfer_ms = g_radio.last_transfer_ms();
     uint32_t now_ms = static_cast<uint32_t>(esp_log_timestamp());
     uint32_t period_ms = (s_last_frame_ms != 0) ? (now_ms - s_last_frame_ms) : 0;
     s_last_frame_ms = now_ms;
-    uint32_t consume_ms = t_decode_ms + t_display_ms + t_save_ms;
+    uint32_t consume_ms = t_decode_ms + t_display_ms;
     if (period_ms > 0) {
         ESP_LOGI(TAG, "[FRAME] period=%lums (%lu.%lu fps) | transfer=%lums consume=%lums "
-                      "(decode=%lu display=%lu save=%lu)",
+                      "(decode=%lu display=%lu)",
                  (unsigned long)period_ms,
                  (unsigned long)(1000 / period_ms), (unsigned long)((10000 / period_ms) % 10),
                  (unsigned long)transfer_ms, (unsigned long)consume_ms,
-                 (unsigned long)t_decode_ms, (unsigned long)t_display_ms, (unsigned long)t_save_ms);
+                 (unsigned long)t_decode_ms, (unsigned long)t_display_ms);
     }
 
-    // Continuous video stream: if the gateway UI is still streaming, auto-request
-    // the next frame after a short delay. Scheduled on a one-shot timer so the
-    // new request runs off the radio task instead of re-entering it here.
     if (g_app_mode == AppMode::radio && ui_gw_stream_active()) {
         if (!g_stream_next_timer) {
             const esp_timer_create_args_t args = {
@@ -1477,14 +1032,6 @@ void on_image_rx_eot_nack(uint16_t missing_count, bool is_first_eot)
 
 // Gateway UI capture callback — triggers remote photo via radio
 
-void cooldown_retry_cb(void *arg)
-{
-    ESP_LOGI(TAG, "Cooldown expired, auto-triggering capture");
-    s_last_gw_capture_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    image_store_abort_transfer();
-    g_radio.trigger_image_capture();
-}
-
 // Continuous video stream: request the next frame. Runs in the esp_timer task,
 // scheduled by on_image_rx_complete. Re-checks ui_gw_stream_active() so a stream
 // the user just stopped (left the image page) does not fire one extra request.
@@ -1494,39 +1041,12 @@ void stream_next_frame_cb(void *arg)
     if (g_app_mode != AppMode::radio) return;
     if (!ui_gw_stream_active()) return;
     ESP_LOGI(TAG, "stream: request next frame");
-    image_store_abort_transfer();
     g_radio.trigger_image_capture();
 }
 
 bool on_gw_capture(void)
 {
-    if (g_audio_clip_enabled) {
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-        if (s_last_gw_capture_ms != 0 &&
-            (now - s_last_gw_capture_ms) < APP_AUDIO_CAPTURE_COOLDOWN_MS) {
-            uint32_t remaining_ms = APP_AUDIO_CAPTURE_COOLDOWN_MS - (now - s_last_gw_capture_ms);
-            ESP_LOGW(TAG, "UI capture: audio cooldown, auto-retry in %lums",
-                     (unsigned long)remaining_ms);
-            if (!g_cooldown_retry_timer) {
-                const esp_timer_create_args_t args = {
-                    .callback = cooldown_retry_cb,
-                    .arg = nullptr,
-                    .dispatch_method = ESP_TIMER_TASK,
-                    .name = "cooldown_retry",
-                };
-                esp_timer_create(&args, &g_cooldown_retry_timer);
-            }
-            esp_timer_stop(g_cooldown_retry_timer);
-            esp_timer_start_once(g_cooldown_retry_timer, (uint64_t)remaining_ms * 1000);
-            return false;
-        }
-        s_last_gw_capture_ms = now;
-    }
-    if (g_cooldown_retry_timer) {
-        esp_timer_stop(g_cooldown_retry_timer);
-    }
     ESP_LOGI(TAG, "UI capture: trigger remote photo");
-    image_store_abort_transfer();
     g_radio.trigger_image_capture();
     return true;
 }
@@ -1538,7 +1058,6 @@ void on_gw_rx_abort(void)
 {
     ESP_LOGI(TAG, "UI: left transfer page, aborting image RX");
     g_radio.abort_image_rx();
-    image_store_abort_transfer();
 }
 
 // Gateway UI interval change callback — sends config to camera node
@@ -1546,18 +1065,6 @@ bool on_gw_interval_change(uint32_t interval_sec)
 {
     ESP_LOGI(TAG, "UI interval change: %lus", static_cast<unsigned long>(interval_sec));
     return g_radio.send_config(APP_CFG_KEY_INTERVAL, interval_sec);
-}
-
-bool on_gw_audio_clip_change(uint32_t enable)
-{
-    ESP_LOGI(TAG, "UI audio clip: %s", enable ? "on" : "off");
-    // Commit local state only on success so the UI switch stays the single
-    // source of truth (mismatch would desync the capture cooldown logic).
-    bool ok = g_radio.send_config(APP_CFG_KEY_AUDIO_CLIP, enable);
-    if (ok) {
-        g_audio_clip_enabled = (enable != 0);
-    }
-    return ok;
 }
 
 bool on_gw_sound_trigger_change(uint32_t level)
@@ -1601,10 +1108,6 @@ void on_wifi_prov_request(void)
     ESP_LOGI(TAG, "WiFi provisioning requested");
     esp_err_t err = wifi_mgr_start_provisioning();
     if (err == ESP_OK) {
-        httpd_handle_t h = wifi_mgr_get_httpd();
-        if (h) {
-            image_store_register_httpd(h);
-        }
         const char *name = wifi_mgr_get_service_name();
         char payload[200];
         snprintf(payload, sizeof(payload),
@@ -1635,11 +1138,6 @@ void on_wifi_state_change(wifi_mgr_state_t state)
 
     if (state == WIFI_MGR_CONNECTED) {
         wifi_mgr_ensure_httpd();
-        httpd_handle_t h = wifi_mgr_get_httpd();
-        if (h) {
-            image_store_register_httpd(h);
-        }
-        image_store_start_sntp();
     }
 }
 
@@ -1813,23 +1311,6 @@ extern "C" void app_main(void)
                     nvs_close(gw_nvs);
                 }
 
-                // AV sync playback (gateway only): create the paired image+audio
-                // queue and start the player task. Pinned to core 1 (with LVGL)
-                // at a priority below the UI so display refresh stays smooth.
-                g_av_queue = xQueueCreate(APP_GW_AV_QUEUE_SIZE, sizeof(AVFrame));
-                if (!g_av_queue) {
-                    ESP_LOGE(TAG, "gateway AV queue create failed");
-                } else {
-                    // 8KB stack: the Opus decoder uses several KB internally,
-                    // plus the pcm/stereo frame buffers are on-stack locals.
-                    // 4KB overflows and corrupts adjacent memory (crashes at the
-                    // next tick, not at the write, so it looks like a scheduler
-                    // fault). play_audio_clip never hit this because it ran on a
-                    // larger task stack.
-                    xTaskCreatePinnedToCore(gateway_audio_task, "gw_audio", 8192,
-                                            nullptr, 4, &g_audio_task, 1);
-                    ESP_LOGI(TAG, "gateway audio task created");
-                }
             }
 #else
             ESP_LOGW(TAG, "radio initialized but tasks/RX disabled for camera isolation");
@@ -1838,16 +1319,14 @@ extern "C" void app_main(void)
             if ((e = g_radio.start()) != ESP_OK) {
                 ESP_LOGE(TAG, "radio task start (camera mode): %s", esp_err_to_name(e));
             }
-            g_radio.enable_opus_preenc(true);
             ESP_LOGI(TAG, "camera mode: radio initialized for image transfer");
             g_capture_interval_sec = load_capture_interval();
-            g_audio_clip_enabled = load_config_u8("audio_clip", 0) != 0;
             g_radio.set_sound_trigger_level(load_config_u8("snd_trig", 0));
             g_radio.set_pir_enabled(load_config_u8("pir", 0) != 0);
             g_voice_alarm_enabled = load_config_u8("alarm", 0) != 0;
             g_low_power_enabled = load_config_u8("lowpwr", 0) != 0;
-            ESP_LOGI(TAG, "NVS: audio=%d snd=%d pir=%d alarm=%d lowpwr=%d",
-                     g_audio_clip_enabled, load_config_u8("snd_trig", 0),
+            ESP_LOGI(TAG, "NVS: snd=%d pir=%d alarm=%d lowpwr=%d",
+                     load_config_u8("snd_trig", 0),
                      load_config_u8("pir", 0), g_voice_alarm_enabled, g_low_power_enabled);
             start_auto_capture_timer();
             update_camera_timer_status();
@@ -1900,7 +1379,6 @@ extern "C" void app_main(void)
             } else {
                 ui_gw_set_capture_cb(on_gw_capture);
                 ui_gw_set_interval_cb(on_gw_interval_change);
-                ui_gw_set_audio_clip_cb(on_gw_audio_clip_change);
                 ui_gw_set_sound_trigger_cb(on_gw_sound_trigger_change);
                 ui_gw_set_pir_trigger_cb(on_gw_pir_trigger_change);
                 ui_gw_set_voice_alarm_cb(on_gw_voice_alarm_change);
@@ -1911,23 +1389,6 @@ extern "C" void app_main(void)
 
                 wifi_mgr_set_state_cb(on_wifi_state_change);
                 wifi_mgr_init();
-                image_store_init();
-                image_store_restore_time();
-                {
-                    httpd_handle_t h = wifi_mgr_get_httpd();
-                    if (h) image_store_register_httpd(h);
-                }
-
-                // Sync audio clip state from gateway UI NVS
-                {
-                    nvs_handle_t h;
-                    uint8_t val = 0;
-                    if (nvs_open("ui_gw", NVS_READONLY, &h) == ESP_OK) {
-                        nvs_get_u8(h, "audio", &val);
-                        nvs_close(h);
-                    }
-                    g_audio_clip_enabled = (val != 0);
-                }
             }
         }
     }

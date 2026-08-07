@@ -13,7 +13,6 @@
 #include "opus_codec.hpp"
 #include "audio_processor.hpp"
 #include "image_transfer.hpp"
-#include "opus_ringbuf.hpp"
 
 // Returns true if the node accepted the request (or is legitimately re-acking a
 // same-session retransmit), false if it dropped it (busy / cooldown / wrong
@@ -70,9 +69,6 @@ public:
     ImageTransfer &image_xfer() { return image_xfer_; }
     uint32_t last_transfer_ms() const { return image_rx_transfer_ms_; }
     bool image_tx_busy() const { return image_tx_active_; }
-    void pause_audio_capture() { image_tx_active_ = true; }
-    void resume_audio_capture() { image_tx_active_ = false; }
-    void enable_opus_preenc(bool en) { opus_preenc_enabled_ = en; }
     void set_sound_trigger_level(uint32_t level) { sound_trigger_level_ = level; }
     void set_pir_enabled(bool en) { pir_enabled_ = en; }
     void IRAM_ATTR pir_trigger() { pir_triggered_ = true; }
@@ -106,12 +102,6 @@ public:
     // the clip and re-sleeps on the next idle pass after audio_playback_end().
     void audio_playback_begin() { audio_playing_ = true; }
     void audio_playback_end() { audio_playing_ = false; }
-
-    // Opus pre-encode ring: snapshot() dumps the whole ring (sound-trigger
-    // retrospective path); drain() returns only frames written since the last
-    // drain and advances the read cursor (continuous streaming path).
-    size_t snapshot_opus(uint8_t *out, size_t max_bytes);
-    size_t drain_opus(uint8_t *out, size_t max_bytes);
 
 private:
     enum class Mode {
@@ -222,7 +212,6 @@ private:
     OpusCodec codec_;
     AudioProcessor audio_proc_;
     ImageTransfer image_xfer_;
-    OpusRingBuf opus_ringbuf_;
     QueueHandle_t voice_queue_ = nullptr;
     QueueHandle_t tx_queue_ = nullptr;
     QueueHandle_t image_tx_queue_ = nullptr;
@@ -268,10 +257,6 @@ private:
     low_power_standby_cb_t low_power_standby_cb_ = nullptr;
     uint16_t image_session_id_ = 1;
     volatile bool image_tx_active_ = false;
-    bool opus_preenc_enabled_ = false;
-    // Last cumulative opus-ring drop count seen by drain_opus(), so we only log
-    // the per-drain delta instead of the running total on every frame.
-    uint32_t opus_dropped_last_ = 0;
     uint32_t image_tx_inter_packet_us_ = APP_IMAGE_TX_INTER_PACKET_US;
     uint32_t image_rx_last_frag_ms_ = 0;
     uint32_t image_rx_last_progress_ms_ = 0;

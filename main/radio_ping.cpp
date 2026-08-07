@@ -143,11 +143,6 @@ esp_err_t RadioPing::init()
         return ESP_ERR_NO_MEM;
     }
 
-    size_t opus_ring_frames = APP_OPUS_RING_SECONDS * 1000 / APP_AUDIO_FRAME_MS;
-    if (!opus_ringbuf_.init(opus_ring_frames)) {
-        ESP_LOGW(TAG, "opus ring buffer alloc failed (PSRAM?)");
-    }
-
 #if !APP_RADIO_HW_INIT_ENABLE
     ESP_LOGW(TAG, "LR2021 hardware init disabled for camera isolation");
     return ESP_OK;
@@ -394,14 +389,8 @@ void RadioPing::task()
 void RadioPing::tx_task()
 {
     while (true) {
-        // NOTE: only `suspended_` gates the whole loop. image_tx_active_ is
-        // deliberately NOT gated here: mic sampling + Opus pre-encoding must keep
-        // running while an image is being captured/transmitted so the streaming
-        // drain() sees a continuous, gap-free audio timeline. This path touches
-        // no radio state (all ral_* / TX-queue access lives in task()/schedule_tx,
-        // a separate task) and only writes the SPSC opus ring, so it cannot race
-        // the radio core. Trigger DISPATCH is still gated on !image_tx_active_
-        // below, since firing a new capture mid-transfer is pointless.
+        // Sound detection remains a local trigger input. It never enters the
+        // image payload; dispatch is gated while an image transfer is active.
         if (suspended_) {
             vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
             continue;
@@ -443,22 +432,9 @@ void RadioPing::tx_task()
             continue;
         }
 
-        // Opus pre-encode ALWAYS runs (not gated on image_tx_active_) so the
-        // streaming ring keeps filling during image capture/TX and drain() gets a
-        // continuous timeline. Writes only the SPSC ring; no radio access.
-        if (opus_preenc_enabled_) {
-            uint8_t enc_buf[APP_OPUS_MAX_PACKET_BYTES];
-            int enc_len = codec_.encode(tx_pcm_, APP_AUDIO_FRAME_SAMPLES,
-                                        enc_buf, APP_OPUS_MAX_PACKET_BYTES);
-            if (enc_len > 0 && enc_len <= 255) {
-                opus_ringbuf_.write(enc_buf, static_cast<uint8_t>(enc_len));
-            }
-        }
-
         // Trigger DETECTION + DISPATCH is gated on !image_tx_active_: firing a new
         // capture while one is already being captured/transmitted is pointless (the
-        // capture path is single-flight) and would race the in-flight transfer. The
-        // encode above already ran, so the ring is up to date regardless.
+        // capture path is single-flight) and would race the in-flight transfer.
         if (!image_tx_active_) {
             if (sound_trigger_level_ > 0) {
                 int64_t sum_sq = 0;
@@ -501,9 +477,8 @@ void RadioPing::tx_task()
                 }
             }
 
-            // Fire a pending sound trigger once the delay has elapsed. By now the
-            // Opus ring holds the frames at/after the trigger moment, so the
-            // capture task's snapshot_opus() includes the sound that caused it.
+            // Fire a pending sound trigger once the short debounce delay has
+            // elapsed.
             if (sound_trigger_pending_ && esp_timer_get_time() >= sound_trigger_fire_us_) {
                 sound_trigger_pending_ = false;
                 ESP_LOGI(TAG, "sound trigger firing (delayed %ums)",
@@ -2314,46 +2289,6 @@ void RadioPing::send_config_ack(uint8_t key, uint32_t value)
     if (!ptt_active_) {
         schedule_rx();
     }
-}
-
-size_t RadioPing::drain_opus(uint8_t *out, size_t max_bytes)
-{
-    size_t drained = opus_ringbuf_.drain(out, max_bytes);
-    uint32_t total_dropped = opus_ringbuf_.dropped_count();
-    uint32_t delta = total_dropped - opus_dropped_last_;
-    if (delta > 0) {
-        opus_dropped_last_ = total_dropped;
-        ESP_LOGW(TAG, "opus drain: dropped %lu oldest frames (backlog overflow)",
-                 static_cast<unsigned long>(delta));
-    }
-
-    // DIAGNOSTIC (temporary): measure the real audio production rate. Count frames
-    // in the drained [len][data]... stream and the wall time since the previous
-    // drain. frames*10ms should ~= dt_ms if the mic->encode path runs at realtime;
-    // frames << dt_ms/10 means the node is under-producing (I2S reads failing
-    // during capture) and the gap is a supply problem, not a gateway buffering one.
-    uint32_t frames = 0;
-    for (size_t p = 0; p < drained; ) {
-        uint8_t flen = out[p];
-        if (flen == 0 || p + 1 + flen > drained) break;
-        frames++;
-        p += 1 + flen;
-    }
-    static uint32_t s_last_drain_ms = 0;
-    uint32_t now_ms = static_cast<uint32_t>(esp_log_timestamp());
-    uint32_t dt_ms = (s_last_drain_ms != 0) ? (now_ms - s_last_drain_ms) : 0;
-    s_last_drain_ms = now_ms;
-    ESP_LOGI(TAG, "opus drain: %lu frames (%lums audio) over dt=%lums -> %lu%% realtime",
-             (unsigned long)frames, (unsigned long)(frames * APP_AUDIO_FRAME_MS),
-             (unsigned long)dt_ms,
-             (unsigned long)(dt_ms ? (frames * APP_AUDIO_FRAME_MS * 100 / dt_ms) : 0));
-
-    return drained;
-}
-
-size_t RadioPing::snapshot_opus(uint8_t *out, size_t max_bytes)
-{
-    return opus_ringbuf_.snapshot(out, max_bytes);
 }
 
 bool RadioPing::configure_lora_cad()

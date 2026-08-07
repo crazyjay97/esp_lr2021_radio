@@ -147,8 +147,6 @@ static bool s_stats_first_eot_seen = false;
 static lv_obj_t *s_cfg_touch_btns[8] = {NULL};
 static lv_obj_t *s_cfg_touch_lbls[8] = {NULL};
 static int s_volume_level = 13; /* 0~15, default 13 → 130% */
-static ui_gw_audio_clip_cb_t s_audio_clip_cb = NULL;
-static bool s_audio_clip_on = false;
 static ui_gw_sound_trigger_cb_t s_sound_trigger_cb = NULL;
 static int s_sound_trigger_idx = 0;
 static const char *s_trigger_labels[] = {"Off", "Low", "Med", "High"};
@@ -538,11 +536,8 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
     case 0: /* Capture */
         if (s_capture_cb) {
             show_page(UI_PAGE_RX);
-            if (s_capture_cb()) {
-                update_title("Waiting...", "RX", COL_AMBER);
-            } else {
-                update_title("Audio preparing...", "WAIT", COL_AMBER);
-            }
+            s_capture_cb();
+            update_title("Waiting...", "RX", COL_AMBER);
         }
         break;
     case 2: /* Interval cycle */ {
@@ -732,9 +727,7 @@ static void cfg_style_value(int idx, const char *text)
     lv_label_set_text(s_cfg_touch_lbls[idx], text);
 }
 
-/* Gray out + disable (or restore) a config control by index. Used to lock the
- * Sound trigger and Audio Clip controls while Low Power is on, since the node
- * disables those functions in low power. */
+/* Gray out or restore a config control. */
 static void cfg_set_ctrl_enabled(int idx, bool enabled)
 {
     lv_obj_t *btn = s_cfg_touch_btns[idx];
@@ -748,24 +741,16 @@ static void cfg_set_ctrl_enabled(int idx, bool enabled)
     }
 }
 
-/* Apply the Low Power lock: when on, force Audio Clip + Sound trigger off in the
- * UI/NVS (no config is sent — the node disables them on its own in low power)
- * and gray them out; when off, re-enable the controls (they stay off). */
+/* Low power disables the local sound-trigger control. */
 static void cfg_apply_low_power_lock(bool low_power_on)
 {
     if (low_power_on) {
-        if (s_audio_clip_on) {
-            s_audio_clip_on = false;
-            gw_nvs_save_u8("audio", 0);
-            if (s_cfg_touch_btns[1]) lv_obj_clear_state(s_cfg_touch_btns[1], LV_STATE_CHECKED);
-        }
         if (s_sound_trigger_idx != 0) {
             s_sound_trigger_idx = 0;
             gw_nvs_save_u8("snd", 0);
             cfg_style_value(4, s_trigger_labels[0]);
         }
     }
-    cfg_set_ctrl_enabled(1, !low_power_on);  /* Audio Clip */
     cfg_set_ctrl_enabled(4, !low_power_on);  /* Sound trigger */
 }
 
@@ -777,18 +762,6 @@ static void cfg_switch_cb(lv_event_t *e)
     bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
 
     switch (idx) {
-    case 1: /* Audio clip */
-        if (s_audio_clip_cb) {
-            if (s_audio_clip_cb(on ? 1 : 0)) {
-                s_audio_clip_on = on;
-                gw_nvs_save_u8("audio", on ? 1 : 0);
-            } else {
-                /* revert switch */
-                if (on) lv_obj_clear_state(sw, LV_STATE_CHECKED);
-                else lv_obj_add_state(sw, LV_STATE_CHECKED);
-            }
-        }
-        break;
     case 5: /* PIR */
         if (s_pir_trigger_cb) {
             if (s_pir_trigger_cb(on ? 1 : 0)) {
@@ -816,7 +789,7 @@ static void cfg_switch_cb(lv_event_t *e)
             if (s_low_power_cb(on ? 1 : 0)) {
                 s_low_power_on = on;
                 gw_nvs_save_u8("lowpwr", on ? 1 : 0);
-                /* Lock/unlock Audio Clip + Sound trigger to match low power. */
+                /* Lock/unlock Sound trigger to match low power. */
                 cfg_apply_low_power_lock(on);
             } else {
                 if (on) lv_obj_clear_state(sw, LV_STATE_CHECKED);
@@ -880,8 +853,6 @@ static void create_config_page(void)
     /* ── AUDIO section ── */
     lv_obj_t *sec_audio = cfg_create_section(cont, "AUDIO");
 
-    cfg_create_toggle_row(sec_audio, "Audio Clip", "Record 5s with photo", 1, s_audio_clip_on);
-
     cfg_create_toggle_row(sec_audio, "Voice Alarm", "Play alert on trigger", 6, s_alarm_on);
 
     char vol_buf[8];
@@ -894,10 +865,8 @@ static void create_config_page(void)
 
     cfg_create_toggle_row(sec_sys, "Low Power", "CAD sleep standby", 7, s_low_power_on);
 
-    /* If low power is already on, gray out Audio Clip + Sound trigger to match
-     * the node (which keeps those functions disabled in low power). */
+    /* If low power is already on, gray out Sound trigger to match the node. */
     if (s_low_power_on) {
-        cfg_set_ctrl_enabled(1, false);  /* Audio Clip */
         cfg_set_ctrl_enabled(4, false);  /* Sound trigger */
     }
 
@@ -919,8 +888,7 @@ static void create_config_page(void)
 
     {
         char buf[80];
-        snprintf(buf, sizeof(buf), "WiFi: %s\nGallery: http://192.168.4.1",
-                 wifi_mgr_get_service_name());
+        snprintf(buf, sizeof(buf), "WiFi: %s", wifi_mgr_get_service_name());
         lv_label_set_text(s_cfg_wifi_lbl, buf);
     }
 
@@ -1077,15 +1045,14 @@ esp_err_t ui_gw_init(void)
     }
 
     s_volume_level = gw_nvs_load_u8("vol", 13);
-    s_audio_clip_on = gw_nvs_load_u8("audio", 0) != 0;
     s_sound_trigger_idx = gw_nvs_load_u8("snd", 0);
     if (s_sound_trigger_idx > 3) s_sound_trigger_idx = 0;
     s_pir_on = gw_nvs_load_u8("pir", 0) != 0;
     s_alarm_on = gw_nvs_load_u8("alarm", 0) != 0;
     s_low_power_on = gw_nvs_load_u8("lowpwr", 0) != 0;
     bsp_audio_set_volume((uint8_t)(s_volume_level * 10));
-    ESP_LOGI(TAG, "NVS load: vol=%d audio=%d snd=%d pir=%d alarm=%d",
-             s_volume_level, s_audio_clip_on, s_sound_trigger_idx, s_pir_on, s_alarm_on);
+    ESP_LOGI(TAG, "NVS load: vol=%d snd=%d pir=%d alarm=%d",
+             s_volume_level, s_sound_trigger_idx, s_pir_on, s_alarm_on);
 
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
     create_shared_layout();
@@ -1114,11 +1081,6 @@ void ui_gw_set_capture_cb(ui_gw_capture_cb_t cb)
 void ui_gw_set_interval_cb(ui_gw_interval_cb_t cb)
 {
     s_interval_cb = cb;
-}
-
-void ui_gw_set_audio_clip_cb(ui_gw_audio_clip_cb_t cb)
-{
-    s_audio_clip_cb = cb;
 }
 
 void ui_gw_set_sound_trigger_cb(ui_gw_sound_trigger_cb_t cb)
@@ -1158,11 +1120,8 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
             if (s_page != UI_PAGE_RX) {
                 show_page(UI_PAGE_RX);
             }
-            if (s_capture_cb()) {
-                update_title("Waiting...", "RX", COL_AMBER);
-            } else {
-                update_title("Audio preparing...", "WAIT", COL_AMBER);
-            }
+            s_capture_cb();
+            update_title("Waiting...", "RX", COL_AMBER);
         }
     } else if (key == BSP_BTN_VOL_UP) {
         /* K4 = Link page */
@@ -1383,8 +1342,7 @@ void ui_gw_wifi_update(const char *state_str, const char *ssid, int8_t rssi)
 
     if (s_cfg_wifi_lbl && s_cfg_wifi_btn) {
         char buf[80];
-        snprintf(buf, sizeof(buf), "WiFi: %s\nGallery: http://192.168.4.1",
-                 wifi_mgr_get_service_name());
+        snprintf(buf, sizeof(buf), "WiFi: %s", wifi_mgr_get_service_name());
         lv_label_set_text(s_cfg_wifi_lbl, buf);
     }
 

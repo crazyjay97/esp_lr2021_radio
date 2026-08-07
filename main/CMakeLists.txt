@@ -4,7 +4,6 @@ idf_component_register(SRCS
                            "audio_processor.cpp"
                            "camera_dvp.cpp"
                            "image_transfer.cpp"
-                           "image_store.c"
                            "opus_codec.cpp"
                            "radio_ping.cpp"
                            "ui_gateway.c"

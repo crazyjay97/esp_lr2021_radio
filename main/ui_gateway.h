@@ -20,7 +20,6 @@ typedef enum {
 
 typedef bool (*ui_gw_capture_cb_t)(void);
 typedef bool (*ui_gw_interval_cb_t)(uint32_t interval_sec);
-typedef bool (*ui_gw_audio_clip_cb_t)(uint32_t enable);
 typedef bool (*ui_gw_sound_trigger_cb_t)(uint32_t level);
 typedef bool (*ui_gw_pir_trigger_cb_t)(uint32_t enable);
 typedef bool (*ui_gw_voice_alarm_cb_t)(uint32_t enable);
@@ -47,7 +46,6 @@ bool ui_gw_stream_active(void);
 
 void ui_gw_set_capture_cb(ui_gw_capture_cb_t cb);
 void ui_gw_set_interval_cb(ui_gw_interval_cb_t cb);
-void ui_gw_set_audio_clip_cb(ui_gw_audio_clip_cb_t cb);
 void ui_gw_set_sound_trigger_cb(ui_gw_sound_trigger_cb_t cb);
 void ui_gw_set_pir_trigger_cb(ui_gw_pir_trigger_cb_t cb);
 void ui_gw_set_voice_alarm_cb(ui_gw_voice_alarm_cb_t cb);
