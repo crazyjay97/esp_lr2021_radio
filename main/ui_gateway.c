@@ -74,6 +74,9 @@ static uint8_t gw_nvs_load_u8(const char *key, uint8_t def)
 typedef enum {
     UI_EVENT_RX_BEGIN = 0,
     UI_EVENT_RX_PROGRESS,
+    UI_EVENT_RX_CRC_ERROR,
+    UI_EVENT_RX_FAILED,
+    UI_EVENT_RX_EOT_STATS,
     UI_EVENT_VBAT,
 } ui_event_type_t;
 
@@ -84,6 +87,7 @@ typedef struct {
     uint16_t total;
     uint16_t vbat_mv;
     int16_t rssi;
+    char title[32];
 } ui_event_t;
 
 /* ─── State ─── */
@@ -1202,11 +1206,27 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
     xSemaphoreGiveRecursive(s_lock);
 }
 
-static void apply_rx_begin(uint16_t session_id, uint16_t total_frags)
+static void reset_rx_progress(uint16_t total_frags)
 {
     s_rx_total = total_frags;
     s_rx_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_rx_last_rssi = 0;
+
+    if (s_rx_pct_lbl) lv_label_set_text(s_rx_pct_lbl, "0%");
+    if (s_rx_bar) lv_bar_set_value(s_rx_bar, 0, LV_ANIM_OFF);
+    if (s_rx_frag_lbl) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "0 / %u", total_frags);
+        lv_label_set_text(s_rx_frag_lbl, buf);
+    }
+    if (s_rx_rate_lbl) lv_label_set_text(s_rx_rate_lbl, "-- kbps");
+    if (s_rx_retry_lbl) lv_label_set_text(s_rx_retry_lbl, "00:00.0");
+    if (s_rx_rssi_lbl) lv_label_set_text(s_rx_rssi_lbl, "-- dBm");
+}
+
+static void apply_rx_begin(uint16_t session_id, uint16_t total_frags)
+{
+    reset_rx_progress(total_frags);
 
     s_stats_total_frags = total_frags;
     s_stats_first_missing = 0;
@@ -1221,16 +1241,16 @@ static void apply_rx_begin(uint16_t session_id, uint16_t total_frags)
     snprintf(title, sizeof(title), "Receiving #%03u", session_id);
     update_title(title, "RX", COL_AMBER);
 
-    if (s_rx_pct_lbl) lv_label_set_text(s_rx_pct_lbl, "0%");
-    if (s_rx_bar) lv_bar_set_value(s_rx_bar, 0, LV_ANIM_OFF);
-    if (s_rx_frag_lbl) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "0 / %u", total_frags);
-        lv_label_set_text(s_rx_frag_lbl, buf);
+}
+
+static void apply_rx_error(const char *title, bool retry)
+{
+    if (s_page != UI_PAGE_RX) {
+        show_page(UI_PAGE_RX);
     }
-    if (s_rx_rate_lbl) lv_label_set_text(s_rx_rate_lbl, "-- kbps");
-    if (s_rx_retry_lbl) lv_label_set_text(s_rx_retry_lbl, "00:00.0");
-    if (s_rx_rssi_lbl) lv_label_set_text(s_rx_rssi_lbl, "-- dBm");
+    reset_rx_progress(retry ? s_rx_total : 0);
+    update_title(title && title[0] ? title : "RX ERROR",
+                 retry ? "RETRY" : "FAIL", COL_VBAT_RED);
 }
 
 static void apply_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
@@ -1282,6 +1302,16 @@ static void ui_event_timer_cb(lv_timer_t *t)
             apply_rx_begin(event.session_id, event.total);
         } else if (event.type == UI_EVENT_RX_PROGRESS) {
             apply_rx_progress(event.received, event.total, event.rssi);
+        } else if (event.type == UI_EVENT_RX_CRC_ERROR) {
+            apply_rx_error("CRC ERROR", true);
+        } else if (event.type == UI_EVENT_RX_FAILED) {
+            apply_rx_error(event.title, false);
+        } else if (event.type == UI_EVENT_RX_EOT_STATS) {
+            if (event.session_id != 0) {
+                s_stats_first_missing = event.received;
+                s_stats_first_eot_seen = true;
+            }
+            s_stats_total_retransmitted += event.received;
         } else if (event.type == UI_EVENT_VBAT) {
             apply_vbat(event.vbat_mv);
         }
@@ -1292,6 +1322,17 @@ static bool post_ui_event(const ui_event_t *event)
 {
     if (!s_ui_event_queue || !event) return false;
     return xQueueSend(s_ui_event_queue, event, 0) == pdTRUE;
+}
+
+static bool post_important_ui_event(const ui_event_t *event)
+{
+    if (post_ui_event(event)) return true;
+
+    ui_event_t dropped;
+    if (s_ui_event_queue && xQueueReceive(s_ui_event_queue, &dropped, 0) == pdTRUE) {
+        return post_ui_event(event);
+    }
+    return false;
 }
 
 void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags)
@@ -1317,6 +1358,14 @@ void ui_gw_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
     };
     (void)post_ui_event(&event);
 }
+
+void ui_gw_rx_crc_error(void)
+{
+    const ui_event_t event = {
+        .type = UI_EVENT_RX_CRC_ERROR,
+    };
+    (void)post_important_ui_event(&event);
+}
 /* PLACEHOLDER_RX_COMPLETE */
 
 void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
@@ -1339,6 +1388,7 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
         ESP_LOGE(TAG, "invalid display image: %lux%lu",
                  (unsigned long)w, (unsigned long)h);
         xSemaphoreGiveRecursive(s_lock);
+        ui_gw_rx_failed("DISPLAY ERROR");
         return;
     }
 
@@ -1361,23 +1411,24 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
 
 void ui_gw_rx_failed(const char *reason)
 {
-    if (!s_lock) return;
-    xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
-
-    show_page(UI_PAGE_IMAGE);
-    update_title("Latest", "FAIL", lv_color_hex(0xA94442));
-    lv_label_set_text(s_status_lbl_r, reason ? reason : "RX Failed");
-
-    xSemaphoreGiveRecursive(s_lock);
+    ui_event_t event = {
+        .type = UI_EVENT_RX_FAILED,
+    };
+    snprintf(event.title, sizeof(event.title), "%s",
+             reason && reason[0] ? reason : "RX ERROR");
+    (void)post_important_ui_event(&event);
 }
 
 void ui_gw_rx_eot_nack(uint16_t missing_count, bool is_first_eot)
 {
-    if (is_first_eot) {
-        s_stats_first_missing = missing_count;
-        s_stats_first_eot_seen = true;
-    }
-    s_stats_total_retransmitted += missing_count;
+    const ui_event_t event = {
+        .type = UI_EVENT_RX_EOT_STATS,
+        .session_id = is_first_eot ? 1U : 0U,
+        .received = missing_count,
+        .total = 0,
+        .rssi = 0,
+    };
+    (void)post_ui_event(&event);
 }
 
 void ui_gw_set_wifi_prov_cb(ui_gw_wifi_prov_cb_t cb)

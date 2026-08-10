@@ -773,6 +773,9 @@ void on_image_rx_complete(ImageTransfer *xfer)
     esp_err_t e = xfer->rx_reassemble(&raw, &raw_len);
     if (e != ESP_OK || !raw) {
         ESP_LOGE(TAG, "rx_reassemble failed: %d", e);
+        if (g_app_mode == AppMode::radio) {
+            ui_gw_rx_failed(e == ESP_ERR_NO_MEM ? "RX MEMORY ERROR" : "REASSEMBLE ERROR");
+        }
         xfer->rx_reset();
         return;
     }
@@ -1023,6 +1026,19 @@ void on_image_rx_progress(uint16_t session_id, uint16_t received,
             return;
         }
         ui_gw_rx_progress(received, total, rssi);
+    }
+}
+
+void on_image_rx_error(ImageRxError error)
+{
+    if (g_app_mode != AppMode::radio) return;
+
+    if (error == ImageRxError::crc_mismatch) {
+        ui_gw_rx_crc_error();
+    } else if (error == ImageRxError::no_memory) {
+        ui_gw_rx_failed("RX MEMORY ERROR");
+    } else {
+        ui_gw_rx_failed("RX TIMEOUT");
     }
 }
 
@@ -1442,6 +1458,7 @@ extern "C" void app_main(void)
             g_radio.set_image_request_rejected_cb(on_image_request_rejected);
             g_radio.set_image_rx_complete_cb(on_image_rx_complete);
             g_radio.set_image_rx_progress_cb(on_image_rx_progress);
+            g_radio.set_image_rx_error_cb(on_image_rx_error);
             g_radio.set_vbat_received_cb(on_vbat_received);
             g_radio.set_image_rx_eot_cb(on_image_rx_eot_nack);
             g_radio.set_config_received_cb(on_config_received);

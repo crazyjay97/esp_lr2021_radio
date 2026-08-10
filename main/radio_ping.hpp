@@ -24,11 +24,18 @@ enum class ImageCmdAckStatus : uint8_t {
     rejected = 4,
 };
 
+enum class ImageRxError : uint8_t {
+    crc_mismatch = 0,
+    timeout,
+    no_memory,
+};
+
 typedef ImageCmdAckStatus (*image_capture_cb_t)(uint16_t session_id);
 typedef void (*image_request_rejected_cb_t)(ImageCmdAckStatus status);
 typedef void (*image_rx_complete_cb_t)(ImageTransfer *xfer);
 typedef void (*image_rx_progress_cb_t)(uint16_t session_id, uint16_t received,
                                        uint16_t total, int16_t rssi);
+typedef void (*image_rx_error_cb_t)(ImageRxError error);
 typedef void (*image_rx_eot_cb_t)(uint16_t missing_count, bool is_first_eot);
 typedef void (*config_received_cb_t)(uint8_t key, uint32_t value);
 // Called on the gateway when a node's battery voltage arrives (via ImageStart
@@ -70,6 +77,7 @@ public:
     void set_image_request_rejected_cb(image_request_rejected_cb_t cb) { image_request_rejected_cb_ = cb; }
     void set_image_rx_complete_cb(image_rx_complete_cb_t cb) { image_rx_complete_cb_ = cb; }
     void set_image_rx_progress_cb(image_rx_progress_cb_t cb) { image_rx_progress_cb_ = cb; }
+    void set_image_rx_error_cb(image_rx_error_cb_t cb) { image_rx_error_cb_ = cb; }
     void set_vbat_received_cb(vbat_received_cb_t cb) { vbat_received_cb_ = cb; }
     void set_image_rx_eot_cb(image_rx_eot_cb_t cb) { image_rx_eot_cb_ = cb; }
     void set_config_received_cb(config_received_cb_t cb) { config_received_cb_ = cb; }
@@ -278,6 +286,7 @@ private:
     image_request_rejected_cb_t image_request_rejected_cb_ = nullptr;
     image_rx_complete_cb_t image_rx_complete_cb_ = nullptr;
     image_rx_progress_cb_t image_rx_progress_cb_ = nullptr;
+    image_rx_error_cb_t image_rx_error_cb_ = nullptr;
     vbat_received_cb_t vbat_received_cb_ = nullptr;
     image_rx_eot_cb_t image_rx_eot_cb_ = nullptr;
     config_received_cb_t config_received_cb_ = nullptr;

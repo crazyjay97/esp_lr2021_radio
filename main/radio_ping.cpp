@@ -1964,6 +1964,14 @@ void RadioPing::handle_image_start(uint16_t len)
 
     // Prepare RX buffer
     image_xfer_.rx_begin(session_id, total_frags);
+    if (!image_xfer_.rx_active()) {
+        image_rx_pending_ = false;
+        if (image_rx_error_cb_) {
+            image_rx_error_cb_(ImageRxError::no_memory);
+        }
+        schedule_rx();
+        return;
+    }
     image_rx_pending_ = true;
     image_rx_nack_sent_ = 0;
     image_rx_eot_count_ = 0;
@@ -2027,10 +2035,17 @@ void RadioPing::handle_image_data(uint16_t len)
         return;
     }
 
-    image_xfer_.rx_fragment(session_id, frag_index, total_frags,
-                            &rx_buf_[kHeaderSize], frag_len);
-    image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
+    bool complete = image_xfer_.rx_fragment(session_id, frag_index, total_frags,
+                                            &rx_buf_[kHeaderSize], frag_len);
+    uint32_t now_ms = smtc_modem_hal_get_time_in_ms();
+    image_rx_last_frag_ms_ = now_ms;
     image_rx_pending_ = true;
+    if (image_rx_progress_cb_ &&
+        (complete || now_ms - image_rx_last_progress_ms_ >= 25U)) {
+        image_rx_progress_cb_(session_id, image_xfer_.rx_received_count(),
+                              image_xfer_.rx_total_count(), image_rx_last_rssi_);
+        image_rx_last_progress_ms_ = now_ms;
+    }
     if (frag_index == 0) {
         image_rx_nack_sent_ = 0;
     }
@@ -2091,6 +2106,14 @@ void RadioPing::handle_image_eot()
         return;
     }
 
+    if (session_id != image_xfer_.rx_session_id() ||
+        total_frags != image_xfer_.rx_total_count()) {
+        ESP_LOGW(TAG, "ignoring stale ImageEOT: session=%u total=%u, active=%u/%u",
+                 session_id, total_frags, image_xfer_.rx_session_id(),
+                 image_xfer_.rx_total_count());
+        return;
+    }
+
     // Exit continuous RX to send response
     if (mode_ == Mode::rx_pending) {
         smtc_modem_hal_protect_api_call();
@@ -2124,9 +2147,20 @@ void RadioPing::handle_image_eot()
                      static_cast<unsigned long>(image_rx_expected_crc32_),
                      static_cast<unsigned long>(actual_crc32));
             image_xfer_.rx_begin(session_id, total_frags);
+            if (!image_xfer_.rx_active()) {
+                image_rx_pending_ = false;
+                if (image_rx_error_cb_) {
+                    image_rx_error_cb_(ImageRxError::no_memory);
+                }
+                schedule_rx();
+                return;
+            }
             image_rx_pending_ = true;
             image_rx_last_frag_ms_ = smtc_modem_hal_get_time_in_ms();
             image_rx_last_progress_ms_ = 0;
+            if (image_rx_error_cb_) {
+                image_rx_error_cb_(ImageRxError::crc_mismatch);
+            }
             missing_count = image_xfer_.rx_get_missing(missing_indices, APP_IMAGE_NACK_MAX_INDICES);
         } else {
             // ESP_LOGI(TAG, "image RX crc32 ok: 0x%08lx",
@@ -2201,8 +2235,18 @@ void RadioPing::check_image_rx_timeout()
                          static_cast<unsigned long>(image_rx_expected_crc32_),
                          static_cast<unsigned long>(actual_crc32));
                 image_xfer_.rx_begin(image_xfer_.rx_session_id(), image_xfer_.rx_total_count());
+                if (!image_xfer_.rx_active()) {
+                    image_rx_pending_ = false;
+                    if (image_rx_error_cb_) {
+                        image_rx_error_cb_(ImageRxError::no_memory);
+                    }
+                    return;
+                }
                 image_rx_last_frag_ms_ = now;
                 image_rx_last_progress_ms_ = 0;
+                if (image_rx_error_cb_) {
+                    image_rx_error_cb_(ImageRxError::crc_mismatch);
+                }
                 return;
             }
         }
@@ -2222,6 +2266,9 @@ void RadioPing::check_image_rx_timeout()
     // ESP_LOGW(TAG, "image RX: timeout (10s no activity), giving up. %u/%u received",
     //          image_xfer_.rx_received_count(), image_xfer_.rx_total_count());
     image_rx_pending_ = false;
+    if (image_rx_error_cb_) {
+        image_rx_error_cb_(ImageRxError::timeout);
+    }
     image_xfer_.rx_reset();
     image_rx_nack_sent_ = 0;
 }
