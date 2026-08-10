@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_jpeg_common.h"
 #include "qrcodegen.h"
 #include "wifi_manager.h"
 #include "nvs.h"
@@ -75,6 +76,7 @@ typedef enum {
     UI_EVENT_RX_BEGIN = 0,
     UI_EVENT_RX_PROGRESS,
     UI_EVENT_RX_CRC_ERROR,
+    UI_EVENT_RX_COMPLETE,
     UI_EVENT_RX_FAILED,
     UI_EVENT_RX_EOT_STATS,
     UI_EVENT_VBAT,
@@ -87,6 +89,11 @@ typedef struct {
     uint16_t total;
     uint16_t vbat_mv;
     int16_t rssi;
+    uint16_t *rgb565;
+    uint32_t image_width;
+    uint32_t image_height;
+    uint32_t jpeg_size;
+    uint32_t elapsed_ms;
     char title[32];
 } ui_event_t;
 
@@ -1289,6 +1296,58 @@ static void apply_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
     if (s_rx_retry_lbl) lv_label_set_text(s_rx_retry_lbl, buf);
 }
 
+static void release_ui_event(ui_event_t *event)
+{
+    if (!event) return;
+    if (event->type == UI_EVENT_RX_COMPLETE && event->rgb565) {
+        jpeg_free_align(event->rgb565);
+        event->rgb565 = NULL;
+    }
+}
+
+static void apply_rx_complete(ui_event_t *event)
+{
+    if (!event) return;
+
+    if (!s_img_canvas_buf || !event->rgb565 ||
+        event->image_width != APP_IMAGE_TX_WIDTH ||
+        event->image_height != APP_IMAGE_TX_HEIGHT) {
+        ESP_LOGE(TAG, "invalid display image: %lux%lu",
+                 (unsigned long)event->image_width,
+                 (unsigned long)event->image_height);
+        apply_rx_error("DISPLAY ERROR", false);
+        release_ui_event(event);
+        return;
+    }
+
+    s_link_rssi = s_rx_last_rssi;
+    s_link_elapsed_ms = event->elapsed_ms;
+    s_link_jpeg_size = event->jpeg_size;
+    if (event->elapsed_ms > 0) {
+        s_link_rate = (uint32_t)((uint64_t)event->jpeg_size * 8000 /
+                                 event->elapsed_ms);
+    } else {
+        s_link_rate = 0;
+    }
+
+    /* The sender already scales and rotates the JPEG to the native 240x320
+     * portrait layout. Copy pixels directly and only swap R/B for the panel. */
+    const uint32_t pixel_count = APP_IMAGE_TX_WIDTH * APP_IMAGE_TX_HEIGHT;
+    for (uint32_t i = 0; i < pixel_count; i++) {
+        uint16_t px = event->rgb565[i];
+        uint16_t r = (px >> 11) & 0x1F;
+        uint16_t g = (px >> 5) & 0x3F;
+        uint16_t b = px & 0x1F;
+        s_img_canvas_buf[i].full = (b << 11) | (g << 5) | r;
+    }
+    s_has_image = true;
+    show_page(UI_PAGE_IMAGE);
+    ESP_LOGI(TAG, "image displayed: %lu bytes, %lums RF",
+             (unsigned long)event->jpeg_size,
+             (unsigned long)event->elapsed_ms);
+    release_ui_event(event);
+}
+
 static void ui_event_timer_cb(lv_timer_t *t)
 {
     (void)t;
@@ -1304,6 +1363,8 @@ static void ui_event_timer_cb(lv_timer_t *t)
             apply_rx_progress(event.received, event.total, event.rssi);
         } else if (event.type == UI_EVENT_RX_CRC_ERROR) {
             apply_rx_error("CRC ERROR", true);
+        } else if (event.type == UI_EVENT_RX_COMPLETE) {
+            apply_rx_complete(&event);
         } else if (event.type == UI_EVENT_RX_FAILED) {
             apply_rx_error(event.title, false);
         } else if (event.type == UI_EVENT_RX_EOT_STATS) {
@@ -1330,6 +1391,7 @@ static bool post_important_ui_event(const ui_event_t *event)
 
     ui_event_t dropped;
     if (s_ui_event_queue && xQueueReceive(s_ui_event_queue, &dropped, 0) == pdTRUE) {
+        release_ui_event(&dropped);
         return post_ui_event(event);
     }
     return false;
@@ -1366,47 +1428,19 @@ void ui_gw_rx_crc_error(void)
     };
     (void)post_important_ui_event(&event);
 }
-/* PLACEHOLDER_RX_COMPLETE */
 
-void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
+bool ui_gw_rx_complete(uint16_t *rgb565, uint32_t w, uint32_t h,
                        uint32_t jpeg_size, uint32_t elapsed_ms)
 {
-    if (!s_lock) return;
-    xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
-
-    s_link_rssi = s_rx_last_rssi;
-    s_link_elapsed_ms = elapsed_ms;
-    s_link_jpeg_size = jpeg_size;
-    if (elapsed_ms > 0) {
-        s_link_rate = (uint32_t)((uint64_t)jpeg_size * 8000 / elapsed_ms);
-    } else {
-        s_link_rate = 0;
-    }
-
-    if (!s_img_canvas_buf || !rgb565 ||
-        w != APP_IMAGE_TX_WIDTH || h != APP_IMAGE_TX_HEIGHT) {
-        ESP_LOGE(TAG, "invalid display image: %lux%lu",
-                 (unsigned long)w, (unsigned long)h);
-        xSemaphoreGiveRecursive(s_lock);
-        ui_gw_rx_failed("DISPLAY ERROR");
-        return;
-    }
-
-    /* The sender already scales and rotates the JPEG to the native 240x320
-     * portrait layout. Copy pixels directly and only swap R/B for the panel. */
-    const uint32_t pixel_count = APP_IMAGE_TX_WIDTH * APP_IMAGE_TX_HEIGHT;
-    for (uint32_t i = 0; i < pixel_count; i++) {
-        uint16_t px = rgb565[i];
-        uint16_t r = (px >> 11) & 0x1F;
-        uint16_t g = (px >> 5) & 0x3F;
-        uint16_t b = px & 0x1F;
-        s_img_canvas_buf[i].full = (b << 11) | (g << 5) | r;
-    }
-    s_has_image = true;
-
-    show_page(UI_PAGE_IMAGE);
-
-    xSemaphoreGiveRecursive(s_lock);
+    const ui_event_t event = {
+        .type = UI_EVENT_RX_COMPLETE,
+        .rgb565 = rgb565,
+        .image_width = w,
+        .image_height = h,
+        .jpeg_size = jpeg_size,
+        .elapsed_ms = elapsed_ms,
+    };
+    return post_important_ui_event(&event);
 }
 
 void ui_gw_rx_failed(const char *reason)

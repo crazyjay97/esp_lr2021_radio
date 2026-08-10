@@ -10,6 +10,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
@@ -51,6 +52,16 @@ RadioPing g_radio;
 volatile bool g_capture_busy = false;
 AppMode g_app_mode = AppMode::camera;
 bool g_radio_active = false;
+
+struct ImageRxWork {
+    uint8_t *raw;
+    size_t raw_len;
+    uint16_t session_id;
+    uint32_t transfer_ms;
+    int64_t queued_at_us;
+};
+QueueHandle_t g_image_rx_work_queue = nullptr;
+volatile bool g_image_rx_processing = false;
 
 // Auto-capture timer state
 esp_timer_handle_t g_auto_capture_timer = nullptr;
@@ -754,37 +765,23 @@ void play_audio_clip(const uint8_t *opus_packed, size_t total_len)
     bsp_audio_pa_enable(false);
 }
 
-void on_image_rx_complete(ImageTransfer *xfer)
+void process_image_rx_work(ImageRxWork *work)
 {
-    ESP_LOGI(TAG, "on_image_rx_complete: xfer=%p complete=%d",
-             xfer, xfer ? xfer->rx_complete() : -1);
-    if (!xfer || !xfer->rx_complete()) return;
-
-    if (g_audio_clip_enabled) {
-        s_last_gw_capture_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    }
-
-    uint16_t sid = xfer->rx_session_id();
-    bool has_audio = (sid & APP_AUDIO_SESSION_FLAG) != 0;
-
-    // Reassemble the received data
-    uint8_t *raw = nullptr;
-    size_t raw_len = 0;
-    esp_err_t e = xfer->rx_reassemble(&raw, &raw_len);
-    if (e != ESP_OK || !raw) {
-        ESP_LOGE(TAG, "rx_reassemble failed: %d", e);
-        if (g_app_mode == AppMode::radio) {
-            ui_gw_rx_failed(e == ESP_ERR_NO_MEM ? "RX MEMORY ERROR" : "REASSEMBLE ERROR");
-        }
-        xfer->rx_reset();
+    if (!work || !work->raw || work->raw_len == 0) {
+        if (work && work->raw) heap_caps_free(work->raw);
         return;
     }
+
+    uint8_t *raw = work->raw;
+    const size_t raw_len = work->raw_len;
+    const uint16_t sid = work->session_id;
+    const bool has_audio = (sid & APP_AUDIO_SESSION_FLAG) != 0;
+    const int64_t worker_started_us = esp_timer_get_time();
 
     const uint8_t *jpeg_data = raw;
     size_t jpeg_len = raw_len;
     const uint8_t *opus_data = nullptr;
     size_t opus_len = 0;
-
     if (has_audio && raw_len > 4) {
         uint32_t jlen = static_cast<uint32_t>(raw[0])
                       | (static_cast<uint32_t>(raw[1]) << 8)
@@ -797,15 +794,17 @@ void on_image_rx_complete(ImageTransfer *xfer)
             opus_len = raw_len - 4 - jlen;
         }
     }
-    ESP_LOGI(TAG, "transfer received: %u bytes (jpeg=%u opus=%u)",
+    ESP_LOGI(TAG, "transfer worker: %u bytes (jpeg=%u opus=%u), queue=%lums",
              static_cast<unsigned>(raw_len),
              static_cast<unsigned>(jpeg_len),
-             static_cast<unsigned>(opus_len));
+             static_cast<unsigned>(opus_len),
+             static_cast<unsigned long>((worker_started_us - work->queued_at_us) / 1000));
 
-    // Decode only the sender-preprocessed 240x320 JPEG. Legacy 640x480 images
-    // are intentionally rejected so the LCD and web gallery share one format.
     bool image_ready = false;
     const char *image_failure = "JPEG decode failed";
+    uint8_t *rgb565 = nullptr;
+    uint32_t decoded_width = 0;
+    uint32_t decoded_height = 0;
     jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
     dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
 
@@ -829,15 +828,13 @@ void on_image_rx_complete(ImageTransfer *xfer)
                      APP_IMAGE_TX_WIDTH, APP_IMAGE_TX_HEIGHT);
             image_failure = "Bad image size";
         } else {
-            ESP_LOGI(TAG, "JPEG header accepted: %ux%u, %u bytes",
-                     header.width, header.height, static_cast<unsigned>(jpeg_len));
             int outbuf_len = 0;
             jerr = jpeg_dec_get_outbuf_len(decoder, &outbuf_len);
             if (jerr != JPEG_ERR_OK || outbuf_len <= 0) {
                 ESP_LOGE(TAG, "jpeg_dec_get_outbuf_len failed: %d len=%d",
                          jerr, outbuf_len);
             } else {
-                uint8_t *rgb565 = static_cast<uint8_t *>(
+                rgb565 = static_cast<uint8_t *>(
                     jpeg_calloc_align(static_cast<size_t>(outbuf_len), 16));
                 if (!rgb565) {
                     ESP_LOGE(TAG, "RGB565 alloc failed: %d bytes", outbuf_len);
@@ -846,50 +843,118 @@ void on_image_rx_complete(ImageTransfer *xfer)
                     io.outbuf = rgb565;
                     jerr = jpeg_dec_process(decoder, &io);
                     if (jerr == JPEG_ERR_OK) {
-                        if (g_app_mode == AppMode::radio) {
-                            ui_gw_rx_complete(
-                                reinterpret_cast<const uint16_t *>(rgb565),
-                                header.width, header.height,
-                                static_cast<uint32_t>(raw_len),
-                                g_radio.last_transfer_ms());
-                        } else {
-                            bsp_lcd_show_rgb565_photo(
-                                reinterpret_cast<const uint16_t *>(rgb565),
-                                header.width, header.height);
-                            bsp_lcd_set_camera_status("Photo received");
-                        }
-                        image_ready = true;
+                        decoded_width = header.width;
+                        decoded_height = header.height;
                     } else {
                         ESP_LOGE(TAG, "jpeg_dec_process failed: %d", jerr);
                     }
-                    jpeg_free_align(rgb565);
                 }
             }
         }
         jpeg_dec_close(decoder);
     }
 
-    if (!image_ready) {
-        if (g_app_mode == AppMode::radio) {
-            ui_gw_rx_failed(image_failure);
+    if (rgb565 && decoded_width != 0 && decoded_height != 0) {
+        if (ui_gw_rx_complete(reinterpret_cast<uint16_t *>(rgb565),
+                              decoded_width, decoded_height,
+                              static_cast<uint32_t>(raw_len),
+                              work->transfer_ms)) {
+            rgb565 = nullptr;
+            image_ready = true;
         } else {
-            bsp_lcd_set_camera_status(image_failure);
+            image_failure = "UI QUEUE FULL";
         }
+    }
+    if (rgb565) jpeg_free_align(rgb565);
+
+    if (!image_ready) {
+        ui_gw_rx_failed(image_failure);
         heap_caps_free(raw);
+        return;
+    }
+
+    ESP_LOGI(TAG, "image display queued: sid=%u, processing=%lums",
+             sid,
+             static_cast<unsigned long>((esp_timer_get_time() - worker_started_us) / 1000));
+    image_store_save(jpeg_data, jpeg_len, opus_data, opus_len, sid);
+    if (opus_data && opus_len > 0) {
+        play_audio_clip(opus_data, opus_len);
+    }
+    heap_caps_free(raw);
+}
+
+void image_rx_worker_task(void *arg)
+{
+    (void)arg;
+    ImageRxWork work = {};
+    while (true) {
+        if (xQueueReceive(g_image_rx_work_queue, &work, portMAX_DELAY) == pdTRUE) {
+            process_image_rx_work(&work);
+            g_image_rx_processing = false;
+        }
+    }
+}
+
+esp_err_t start_image_rx_worker()
+{
+    if (g_image_rx_work_queue) return ESP_OK;
+
+    g_image_rx_work_queue = xQueueCreate(1, sizeof(ImageRxWork));
+    if (!g_image_rx_work_queue) return ESP_ERR_NO_MEM;
+
+    BaseType_t ok = xTaskCreatePinnedToCore(image_rx_worker_task, "image_rx",
+                                            APP_IMAGE_RX_TASK_STACK_BYTES, nullptr,
+                                            APP_IMAGE_RX_TASK_PRIORITY, nullptr,
+                                            APP_IMAGE_RX_TASK_CORE);
+    if (ok != pdPASS) {
+        vQueueDelete(g_image_rx_work_queue);
+        g_image_rx_work_queue = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+void on_image_rx_complete(ImageTransfer *xfer)
+{
+    ESP_LOGI(TAG, "on_image_rx_complete: xfer=%p complete=%d",
+             xfer, xfer ? xfer->rx_complete() : -1);
+    if (!xfer || !xfer->rx_complete()) return;
+
+    if (g_audio_clip_enabled) {
+        s_last_gw_capture_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    }
+
+    const uint16_t sid = xfer->rx_session_id();
+    const uint32_t transfer_ms = g_radio.last_transfer_ms();
+    uint8_t *raw = nullptr;
+    size_t raw_len = 0;
+    esp_err_t e = xfer->rx_reassemble(&raw, &raw_len);
+    if (e != ESP_OK || !raw) {
+        ESP_LOGE(TAG, "rx_reassemble failed: %d", e);
+        ui_gw_rx_failed(e == ESP_ERR_NO_MEM ? "RX MEMORY ERROR" : "REASSEMBLE ERROR");
         xfer->rx_reset();
         return;
     }
 
-    // Save to image store for HTTP gallery
-    image_store_save(jpeg_data, jpeg_len, opus_data, opus_len, sid);
-
-    // Play audio if present
-    if (opus_data && opus_len > 0) {
-        play_audio_clip(opus_data, opus_len);
-    }
-
-    heap_caps_free(raw);
     xfer->rx_reset();
+    const ImageRxWork work = {
+        .raw = raw,
+        .raw_len = raw_len,
+        .session_id = sid,
+        .transfer_ms = transfer_ms,
+        .queued_at_us = esp_timer_get_time(),
+    };
+    g_image_rx_processing = true;
+    if (!g_image_rx_work_queue ||
+        xQueueSend(g_image_rx_work_queue, &work, 0) != pdTRUE) {
+        g_image_rx_processing = false;
+        heap_caps_free(raw);
+        ESP_LOGE(TAG, "image processing queue unavailable/full");
+        ui_gw_rx_failed("PROCESS QUEUE FULL");
+        return;
+    }
+    ESP_LOGI(TAG, "image processing queued: sid=%u, %u bytes",
+             sid, static_cast<unsigned>(raw_len));
 }
 
 void camera_capture_task(void *arg)
@@ -1087,7 +1152,7 @@ bool on_gw_capture(void)
 {
     // A transfer is already running — don't preempt it (that deadlocks the
     // half-duplex radio) and don't abort the HTTP download. Ignore the request.
-    if (g_radio.image_busy()) {
+    if (g_radio.image_busy() || g_image_rx_processing) {
         ESP_LOGW(TAG, "UI capture: transfer in progress, ignoring");
         return false;
     }
@@ -1137,7 +1202,7 @@ void on_gw_rx_abort(void)
 // ignore the capture key mid-transfer (no new request is started).
 bool on_gw_query_busy(void)
 {
-    return g_radio.image_busy();
+    return g_radio.image_busy() || g_image_rx_processing;
 }
 
 // Gateway UI interval change callback — sends config to camera node
@@ -1463,6 +1528,12 @@ extern "C" void app_main(void)
             g_radio.set_image_rx_eot_cb(on_image_rx_eot_nack);
             g_radio.set_config_received_cb(on_config_received);
             g_radio.set_low_power_standby_cb(on_low_power_standby);
+        }
+        if (g_app_mode == AppMode::radio && radio_ok) {
+            if ((e = start_image_rx_worker()) != ESP_OK) {
+                ESP_LOGE(TAG, "image RX worker start: %s", esp_err_to_name(e));
+                radio_ok = false;
+            }
         }
         if (g_app_mode == AppMode::radio && radio_ok) {
 #if APP_RADIO_TASKS_ENABLE

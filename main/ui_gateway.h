@@ -44,7 +44,10 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed);
 void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags);
 void ui_gw_rx_progress(uint16_t received, uint16_t total, int16_t rssi);
 void ui_gw_rx_crc_error(void);
-void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
+// On success, ownership of rgb565 transfers to the LVGL task, which releases
+// it with jpeg_free_align() after copying it to the canvas. On failure, the
+// caller retains ownership and must release it.
+bool ui_gw_rx_complete(uint16_t *rgb565, uint32_t w, uint32_t h,
                        uint32_t jpeg_size, uint32_t elapsed_ms);
 void ui_gw_rx_failed(const char *reason);
 

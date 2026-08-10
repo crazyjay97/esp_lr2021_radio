@@ -299,6 +299,9 @@
 #define APP_IMAGE_TASK_STACK_BYTES      16384U
 #define APP_IMAGE_TASK_PRIORITY         3
 #define APP_IMAGE_TASK_CORE             1
+#define APP_IMAGE_RX_TASK_STACK_BYTES   16384U
+#define APP_IMAGE_RX_TASK_PRIORITY      1
+#define APP_IMAGE_RX_TASK_CORE          1
 
 /* ----- Camera node LCD (set 0 to skip LCD release/reinit for faster capture) */
 #define APP_CAMERA_NODE_LCD_ENABLE      0
