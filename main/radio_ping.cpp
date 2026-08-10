@@ -2187,7 +2187,6 @@ void RadioPing::handle_image_eot()
     }
 
     if (missing_count == 0) {
-        image_rx_pending_ = false;
         image_rx_done_session_ = session_id;
         uint32_t now_ms = smtc_modem_hal_get_time_in_ms();
         uint32_t transfer_ms = now_ms - image_rx_start_ms_;
@@ -2203,6 +2202,7 @@ void RadioPing::handle_image_eot()
         if (image_rx_complete_cb_) {
             image_rx_complete_cb_(&image_xfer_);
         }
+        image_rx_pending_ = false;
     } else {
         ESP_LOGW(TAG, "image RX: sent ACK with %u missing, waiting for retransmit", missing_count);
         if (image_rx_eot_count_ == 1) {
@@ -2250,12 +2250,12 @@ void RadioPing::check_image_rx_timeout()
                 return;
             }
         }
-        image_rx_pending_ = false;
         image_rx_done_session_ = image_xfer_.rx_session_id();
         // ESP_LOGI(TAG, "image RX complete (no EOT seen before timeout)");
         if (image_rx_complete_cb_) {
             image_rx_complete_cb_(&image_xfer_);
         }
+        image_rx_pending_ = false;
         return;
     }
 

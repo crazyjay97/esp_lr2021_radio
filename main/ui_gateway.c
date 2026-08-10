@@ -185,6 +185,8 @@ static ui_gw_wifi_prov_cb_t s_wifi_prov_cb = NULL;
 static ui_gw_wifi_disconnect_cb_t s_wifi_disconnect_cb = NULL;
 static ui_gw_rx_abort_cb_t s_rx_abort_cb = NULL;
 static ui_gw_busy_cb_t s_busy_cb = NULL;
+static ui_gw_image_presented_cb_t s_image_presented_cb = NULL;
+static volatile uint16_t s_latest_rx_session_id = 0;
 
 /* PAGE_CONFIG WiFi status panel */
 static lv_obj_t *s_cfg_wifi_btn = NULL;
@@ -1060,7 +1062,8 @@ static const ui_page_t s_swipe_order[] = {UI_PAGE_IMAGE, UI_PAGE_LINK, UI_PAGE_C
 
 static void gesture_cb(lv_event_t *e)
 {
-    if (s_page == UI_PAGE_RX || s_page == UI_PAGE_QR) return;
+    if (s_page == UI_PAGE_RX || s_page == UI_PAGE_QR ||
+        (s_busy_cb && s_busy_cb())) return;
 
     lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_get_act());
     if (dir != LV_DIR_LEFT && dir != LV_DIR_RIGHT) return;
@@ -1098,6 +1101,7 @@ esp_err_t ui_gw_init(void)
     } else {
         xQueueReset(s_ui_event_queue);
     }
+    s_latest_rx_session_id = 0;
 
     s_volume_level = gw_nvs_load_u8("vol", 13);
     s_audio_clip_on = gw_nvs_load_u8("audio", 0) != 0;
@@ -1179,14 +1183,19 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
 
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
 
+    const bool is_page_key = key == BSP_BTN_VOL_DN ||
+                             key == BSP_BTN_VOL_UP ||
+                             key == BSP_BTN_USER1 ||
+                             key == BSP_BTN_PTT;
+    if (is_page_key && s_busy_cb && s_busy_cb()) {
+        ESP_LOGW(TAG, "key %d ignored: transfer/display in progress", key);
+        xSemaphoreGiveRecursive(s_lock);
+        return;
+    }
+
     if (key == BSP_BTN_VOL_DN) {
         /* K3 = Capture (works from any page) */
-        /* Ignore the key entirely while a transfer is already running: don't
-         * switch to the RX page and don't fire a new request. A second request
-         * mid-transfer deadlocks the half-duplex radio. */
-        if (s_busy_cb && s_busy_cb()) {
-            ESP_LOGW(TAG, "capture ignored: transfer in progress");
-        } else if (s_capture_cb) {
+        if (s_capture_cb) {
             if (s_page != UI_PAGE_RX) {
                 show_page(UI_PAGE_RX);
             }
@@ -1296,18 +1305,31 @@ static void apply_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
     if (s_rx_retry_lbl) lv_label_set_text(s_rx_retry_lbl, buf);
 }
 
-static void release_ui_event(ui_event_t *event)
+static void release_ui_event(ui_event_t *event, bool displayed)
 {
-    if (!event) return;
-    if (event->type == UI_EVENT_RX_COMPLETE && event->rgb565) {
+    if (!event || event->type != UI_EVENT_RX_COMPLETE) return;
+
+    uint16_t session_id = event->session_id;
+    if (event->rgb565) {
         jpeg_free_align(event->rgb565);
         event->rgb565 = NULL;
+    }
+    if (s_image_presented_cb) {
+        s_image_presented_cb(session_id, displayed);
     }
 }
 
 static void apply_rx_complete(ui_event_t *event)
 {
     if (!event) return;
+
+    if (event->session_id == 0 ||
+        event->session_id != s_latest_rx_session_id) {
+        ESP_LOGW(TAG, "discard stale image: session=%u latest=%u",
+                 event->session_id, s_latest_rx_session_id);
+        release_ui_event(event, false);
+        return;
+    }
 
     if (!s_img_canvas_buf || !event->rgb565 ||
         event->image_width != APP_IMAGE_TX_WIDTH ||
@@ -1316,7 +1338,7 @@ static void apply_rx_complete(ui_event_t *event)
                  (unsigned long)event->image_width,
                  (unsigned long)event->image_height);
         apply_rx_error("DISPLAY ERROR", false);
-        release_ui_event(event);
+        release_ui_event(event, false);
         return;
     }
 
@@ -1345,7 +1367,7 @@ static void apply_rx_complete(ui_event_t *event)
     ESP_LOGI(TAG, "image displayed: %lu bytes, %lums RF",
              (unsigned long)event->jpeg_size,
              (unsigned long)event->elapsed_ms);
-    release_ui_event(event);
+    release_ui_event(event, true);
 }
 
 static void ui_event_timer_cb(lv_timer_t *t)
@@ -1391,7 +1413,7 @@ static bool post_important_ui_event(const ui_event_t *event)
 
     ui_event_t dropped;
     if (s_ui_event_queue && xQueueReceive(s_ui_event_queue, &dropped, 0) == pdTRUE) {
-        release_ui_event(&dropped);
+        release_ui_event(&dropped, false);
         return post_ui_event(event);
     }
     return false;
@@ -1399,6 +1421,7 @@ static bool post_important_ui_event(const ui_event_t *event)
 
 void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags)
 {
+    s_latest_rx_session_id = session_id;
     const ui_event_t event = {
         .type = UI_EVENT_RX_BEGIN,
         .session_id = session_id,
@@ -1406,7 +1429,7 @@ void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags)
         .total = total_frags,
         .rssi = 0,
     };
-    (void)post_ui_event(&event);
+    (void)post_important_ui_event(&event);
 }
 
 void ui_gw_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
@@ -1429,11 +1452,13 @@ void ui_gw_rx_crc_error(void)
     (void)post_important_ui_event(&event);
 }
 
-bool ui_gw_rx_complete(uint16_t *rgb565, uint32_t w, uint32_t h,
+bool ui_gw_rx_complete(uint16_t session_id, uint16_t *rgb565,
+                       uint32_t w, uint32_t h,
                        uint32_t jpeg_size, uint32_t elapsed_ms)
 {
     const ui_event_t event = {
         .type = UI_EVENT_RX_COMPLETE,
+        .session_id = session_id,
         .rgb565 = rgb565,
         .image_width = w,
         .image_height = h,
@@ -1483,6 +1508,11 @@ void ui_gw_set_rx_abort_cb(ui_gw_rx_abort_cb_t cb)
 void ui_gw_set_busy_cb(ui_gw_busy_cb_t cb)
 {
     s_busy_cb = cb;
+}
+
+void ui_gw_set_image_presented_cb(ui_gw_image_presented_cb_t cb)
+{
+    s_image_presented_cb = cb;
 }
 
 void ui_gw_wifi_update(const char *state_str, const char *ssid, int8_t rssi)

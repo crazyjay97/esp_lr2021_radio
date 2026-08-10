@@ -62,6 +62,8 @@ struct ImageRxWork {
 };
 QueueHandle_t g_image_rx_work_queue = nullptr;
 volatile bool g_image_rx_processing = false;
+volatile bool g_image_ui_pending = false;
+volatile uint16_t g_image_ui_pending_session = 0;
 
 // Auto-capture timer state
 esp_timer_handle_t g_auto_capture_timer = nullptr;
@@ -765,6 +767,19 @@ void play_audio_clip(const uint8_t *opus_packed, size_t total_len)
     bsp_audio_pa_enable(false);
 }
 
+void on_gw_image_presented(uint16_t session_id, bool displayed)
+{
+    if (!g_image_ui_pending || session_id != g_image_ui_pending_session) {
+        ESP_LOGW(TAG, "unexpected image UI ack: session=%u pending=%u active=%d",
+                 session_id, g_image_ui_pending_session, g_image_ui_pending);
+        return;
+    }
+
+    g_image_ui_pending = false;
+    ESP_LOGI(TAG, "image UI complete: sid=%u displayed=%d",
+             session_id, displayed);
+}
+
 void process_image_rx_work(ImageRxWork *work)
 {
     if (!work || !work->raw || work->raw_len == 0) {
@@ -855,13 +870,18 @@ void process_image_rx_work(ImageRxWork *work)
     }
 
     if (rgb565 && decoded_width != 0 && decoded_height != 0) {
-        if (ui_gw_rx_complete(reinterpret_cast<uint16_t *>(rgb565),
-                              decoded_width, decoded_height,
+        g_image_ui_pending_session = sid;
+        g_image_ui_pending = true;
+        if (ui_gw_rx_complete(sid,
+                              reinterpret_cast<uint16_t *>(rgb565),
+                              decoded_width,
+                              decoded_height,
                               static_cast<uint32_t>(raw_len),
                               work->transfer_ms)) {
             rgb565 = nullptr;
             image_ready = true;
         } else {
+            g_image_ui_pending = false;
             image_failure = "UI QUEUE FULL";
         }
     }
@@ -920,6 +940,7 @@ void on_image_rx_complete(ImageTransfer *xfer)
              xfer, xfer ? xfer->rx_complete() : -1);
     if (!xfer || !xfer->rx_complete()) return;
 
+    g_image_rx_processing = true;
     if (g_audio_clip_enabled) {
         s_last_gw_capture_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
     }
@@ -933,6 +954,7 @@ void on_image_rx_complete(ImageTransfer *xfer)
         ESP_LOGE(TAG, "rx_reassemble failed: %d", e);
         ui_gw_rx_failed(e == ESP_ERR_NO_MEM ? "RX MEMORY ERROR" : "REASSEMBLE ERROR");
         xfer->rx_reset();
+        g_image_rx_processing = false;
         return;
     }
 
@@ -944,7 +966,6 @@ void on_image_rx_complete(ImageTransfer *xfer)
         .transfer_ms = transfer_ms,
         .queued_at_us = esp_timer_get_time(),
     };
-    g_image_rx_processing = true;
     if (!g_image_rx_work_queue ||
         xQueueSend(g_image_rx_work_queue, &work, 0) != pdTRUE) {
         g_image_rx_processing = false;
@@ -1142,17 +1163,22 @@ void on_image_rx_eot_nack(uint16_t missing_count, bool is_first_eot)
 
 void cooldown_retry_cb(void *arg)
 {
+    if (g_radio.image_busy() || g_image_rx_processing || g_image_ui_pending) {
+        ESP_LOGW(TAG, "cooldown retry ignored: transfer/display in progress");
+        return;
+    }
     ESP_LOGI(TAG, "Cooldown expired, auto-triggering capture");
     s_last_gw_capture_ms = (uint32_t)(esp_timer_get_time() / 1000);
     image_store_abort_transfer();
-    g_radio.trigger_image_capture();
+    (void)g_radio.trigger_image_capture();
 }
 
 bool on_gw_capture(void)
 {
     // A transfer is already running — don't preempt it (that deadlocks the
     // half-duplex radio) and don't abort the HTTP download. Ignore the request.
-    if (g_radio.image_busy() || g_image_rx_processing) {
+    if (g_radio.image_busy() || g_image_rx_processing ||
+        g_image_ui_pending) {
         ESP_LOGW(TAG, "UI capture: transfer in progress, ignoring");
         return false;
     }
@@ -1184,8 +1210,7 @@ bool on_gw_capture(void)
     }
     ESP_LOGI(TAG, "UI capture: trigger remote photo");
     image_store_abort_transfer();
-    g_radio.trigger_image_capture();
-    return true;
+    return g_radio.trigger_image_capture();
 }
 
 // Gateway UI: user left the transfer page — abort the in-progress RX so the
@@ -1202,7 +1227,8 @@ void on_gw_rx_abort(void)
 // ignore the capture key mid-transfer (no new request is started).
 bool on_gw_query_busy(void)
 {
-    return g_radio.image_busy() || g_image_rx_processing;
+    return g_radio.image_busy() || g_image_rx_processing ||
+           g_image_ui_pending;
 }
 
 // Gateway UI interval change callback — sends config to camera node
@@ -1627,6 +1653,7 @@ extern "C" void app_main(void)
                 ui_gw_set_wifi_disconnect_cb(on_wifi_disconnect_request);
                 ui_gw_set_rx_abort_cb(on_gw_rx_abort);
                 ui_gw_set_busy_cb(on_gw_query_busy);
+                ui_gw_set_image_presented_cb(on_gw_image_presented);
 
                 wifi_mgr_set_state_cb(on_wifi_state_change);
                 wifi_mgr_init();

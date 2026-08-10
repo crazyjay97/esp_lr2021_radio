@@ -30,11 +30,13 @@ typedef void (*ui_gw_wifi_disconnect_cb_t)(void);
 // Called when the user leaves the transfer (RX) page: abort the current RX.
 typedef void (*ui_gw_rx_abort_cb_t)(void);
 // Returns true while an image transfer (request or RX) is already in progress.
-// The UI queries this before handling a capture key so a new capture cannot be
-// started on top of an active transfer (which would deadlock the half-duplex
-// radio). When busy, the capture key press is ignored entirely — no page
-// switch, no capture request.
+// The UI queries this before handling capture, navigation keys, or gestures so
+// an active transfer cannot be aborted or covered by a stale page transition.
 typedef bool (*ui_gw_busy_cb_t)(void);
+// Called after an owned RGB565 event is either displayed or discarded. Queue
+// eviction can invoke it from an event producer task; it must not block or call
+// LVGL.
+typedef void (*ui_gw_image_presented_cb_t)(uint16_t session_id, bool displayed);
 
 esp_err_t ui_gw_init(void);
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed);
@@ -47,7 +49,8 @@ void ui_gw_rx_crc_error(void);
 // On success, ownership of rgb565 transfers to the LVGL task, which releases
 // it with jpeg_free_align() after copying it to the canvas. On failure, the
 // caller retains ownership and must release it.
-bool ui_gw_rx_complete(uint16_t *rgb565, uint32_t w, uint32_t h,
+bool ui_gw_rx_complete(uint16_t session_id, uint16_t *rgb565,
+                       uint32_t w, uint32_t h,
                        uint32_t jpeg_size, uint32_t elapsed_ms);
 void ui_gw_rx_failed(const char *reason);
 
@@ -64,6 +67,7 @@ void ui_gw_set_wifi_prov_cb(ui_gw_wifi_prov_cb_t cb);
 void ui_gw_set_wifi_disconnect_cb(ui_gw_wifi_disconnect_cb_t cb);
 void ui_gw_set_rx_abort_cb(ui_gw_rx_abort_cb_t cb);
 void ui_gw_set_busy_cb(ui_gw_busy_cb_t cb);
+void ui_gw_set_image_presented_cb(ui_gw_image_presented_cb_t cb);
 
 void ui_gw_wifi_update(const char *state_str, const char *ssid, int8_t rssi);
 void ui_gw_show_qr(const char *payload);
