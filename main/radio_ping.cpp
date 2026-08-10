@@ -2259,11 +2259,11 @@ void RadioPing::check_image_rx_timeout()
         return;
     }
 
-    if (now - image_rx_last_frag_ms_ < 10000U) {
+    if (now - image_rx_last_frag_ms_ < 5000U) {
         return;
     }
 
-    // ESP_LOGW(TAG, "image RX: timeout (10s no activity), giving up. %u/%u received",
+    // ESP_LOGW(TAG, "image RX: timeout (5s no activity), giving up. %u/%u received",
     //          image_xfer_.rx_received_count(), image_xfer_.rx_total_count());
     image_rx_pending_ = false;
     if (image_rx_error_cb_) {
