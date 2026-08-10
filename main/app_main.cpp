@@ -39,8 +39,6 @@ constexpr const char *TAG = "app";
 constexpr const char *kNvsNs = "app";
 constexpr const char *kModeKey = "mode";
 
-uint32_t s_last_gw_capture_ms = 0;
-
 enum class AppMode : uint8_t {
     camera = 0,
     radio = 1,
@@ -60,8 +58,19 @@ struct ImageRxWork {
     uint32_t transfer_ms;
     int64_t queued_at_us;
 };
+struct ImagePostWork {
+    uint8_t *raw;
+    size_t raw_len;
+    size_t jpeg_offset;
+    size_t jpeg_len;
+    size_t opus_offset;
+    size_t opus_len;
+    uint16_t session_id;
+};
 QueueHandle_t g_image_rx_work_queue = nullptr;
+QueueHandle_t g_image_post_work_queue = nullptr;
 volatile bool g_image_rx_processing = false;
+volatile bool g_image_postprocessing = false;
 volatile bool g_image_ui_pending = false;
 volatile uint16_t g_image_ui_pending_session = 0;
 
@@ -77,7 +86,6 @@ int64_t g_last_capture_time_us = 0;
 // K6 short/long press state
 int64_t g_ptt_press_time_us = 0;
 bool g_ptt_held_long = false;
-esp_timer_handle_t g_cooldown_retry_timer = nullptr;
 esp_timer_handle_t g_ptt_timer = nullptr;
 
 const char *mode_name(AppMode mode)
@@ -780,10 +788,39 @@ void on_gw_image_presented(uint16_t session_id, bool displayed)
              session_id, displayed);
 }
 
+void process_image_post_work(ImagePostWork *work)
+{
+    if (!work || !work->raw || work->raw_len == 0 ||
+        work->jpeg_offset > work->raw_len ||
+        work->jpeg_len > work->raw_len - work->jpeg_offset ||
+        (work->opus_len > 0 &&
+         (work->opus_offset > work->raw_len ||
+          work->opus_len > work->raw_len - work->opus_offset))) {
+        if (work && work->raw) heap_caps_free(work->raw);
+        return;
+    }
+
+    g_image_postprocessing = true;
+    const uint8_t *jpeg_data = work->raw + work->jpeg_offset;
+    const uint8_t *opus_data = work->opus_len > 0
+                                   ? work->raw + work->opus_offset
+                                   : nullptr;
+    image_store_save(jpeg_data, work->jpeg_len,
+                     opus_data, work->opus_len,
+                     work->session_id);
+    if (opus_data && work->opus_len > 0) {
+        play_audio_clip(opus_data, work->opus_len);
+    }
+    heap_caps_free(work->raw);
+    work->raw = nullptr;
+    g_image_postprocessing = false;
+}
+
 void process_image_rx_work(ImageRxWork *work)
 {
     if (!work || !work->raw || work->raw_len == 0) {
         if (work && work->raw) heap_caps_free(work->raw);
+        g_image_rx_processing = false;
         return;
     }
 
@@ -890,17 +927,31 @@ void process_image_rx_work(ImageRxWork *work)
     if (!image_ready) {
         ui_gw_rx_failed(image_failure);
         heap_caps_free(raw);
+        g_image_rx_processing = false;
         return;
     }
 
     ESP_LOGI(TAG, "image display queued: sid=%u, processing=%lums",
              sid,
              static_cast<unsigned long>((esp_timer_get_time() - worker_started_us) / 1000));
-    image_store_save(jpeg_data, jpeg_len, opus_data, opus_len, sid);
-    if (opus_data && opus_len > 0) {
-        play_audio_clip(opus_data, opus_len);
+    const ImagePostWork post_work = {
+        .raw = raw,
+        .raw_len = raw_len,
+        .jpeg_offset = static_cast<size_t>(jpeg_data - raw),
+        .jpeg_len = jpeg_len,
+        .opus_offset = opus_data ? static_cast<size_t>(opus_data - raw) : 0,
+        .opus_len = opus_len,
+        .session_id = sid,
+    };
+    if (!g_image_post_work_queue ||
+        xQueueSend(g_image_post_work_queue, &post_work, 0) != pdTRUE) {
+        heap_caps_free(raw);
     }
-    heap_caps_free(raw);
+
+    // From this point the decoded image is owned by the UI queue. Storage and
+    // optional audio playback continue independently and must not keep capture
+    // keys blocked or delay the next JPEG decode.
+    g_image_rx_processing = false;
 }
 
 void image_rx_worker_task(void *arg)
@@ -910,24 +961,58 @@ void image_rx_worker_task(void *arg)
     while (true) {
         if (xQueueReceive(g_image_rx_work_queue, &work, portMAX_DELAY) == pdTRUE) {
             process_image_rx_work(&work);
-            g_image_rx_processing = false;
+        }
+    }
+}
+
+void image_post_worker_task(void *arg)
+{
+    (void)arg;
+    ImagePostWork work = {};
+    while (true) {
+        if (xQueueReceive(g_image_post_work_queue, &work, portMAX_DELAY) == pdTRUE) {
+            process_image_post_work(&work);
         }
     }
 }
 
 esp_err_t start_image_rx_worker()
 {
-    if (g_image_rx_work_queue) return ESP_OK;
+    if (g_image_rx_work_queue && g_image_post_work_queue) return ESP_OK;
+    if (g_image_rx_work_queue || g_image_post_work_queue) return ESP_ERR_INVALID_STATE;
 
     g_image_rx_work_queue = xQueueCreate(1, sizeof(ImageRxWork));
     if (!g_image_rx_work_queue) return ESP_ERR_NO_MEM;
+    g_image_post_work_queue = xQueueCreate(APP_IMAGE_POST_QUEUE_LENGTH,
+                                           sizeof(ImagePostWork));
+    if (!g_image_post_work_queue) {
+        vQueueDelete(g_image_rx_work_queue);
+        g_image_rx_work_queue = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
 
-    BaseType_t ok = xTaskCreatePinnedToCore(image_rx_worker_task, "image_rx",
+    TaskHandle_t post_task = nullptr;
+    BaseType_t ok = xTaskCreatePinnedToCore(image_post_worker_task, "image_post",
+                                            APP_IMAGE_POST_TASK_STACK_BYTES, nullptr,
+                                            APP_IMAGE_POST_TASK_PRIORITY, &post_task,
+                                            APP_IMAGE_POST_TASK_CORE);
+    if (ok != pdPASS) {
+        vQueueDelete(g_image_post_work_queue);
+        vQueueDelete(g_image_rx_work_queue);
+        g_image_post_work_queue = nullptr;
+        g_image_rx_work_queue = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
+
+    ok = xTaskCreatePinnedToCore(image_rx_worker_task, "image_rx",
                                             APP_IMAGE_RX_TASK_STACK_BYTES, nullptr,
                                             APP_IMAGE_RX_TASK_PRIORITY, nullptr,
                                             APP_IMAGE_RX_TASK_CORE);
     if (ok != pdPASS) {
+        vTaskDelete(post_task);
+        vQueueDelete(g_image_post_work_queue);
         vQueueDelete(g_image_rx_work_queue);
+        g_image_post_work_queue = nullptr;
         g_image_rx_work_queue = nullptr;
         return ESP_ERR_NO_MEM;
     }
@@ -941,10 +1026,6 @@ void on_image_rx_complete(ImageTransfer *xfer)
     if (!xfer || !xfer->rx_complete()) return;
 
     g_image_rx_processing = true;
-    if (g_audio_clip_enabled) {
-        s_last_gw_capture_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
-    }
-
     const uint16_t sid = xfer->rx_session_id();
     const uint32_t transfer_ms = g_radio.last_transfer_ms();
     uint8_t *raw = nullptr;
@@ -1161,18 +1242,6 @@ void on_image_rx_eot_nack(uint16_t missing_count, bool is_first_eot)
 
 // Gateway UI capture callback — triggers remote photo via radio
 
-void cooldown_retry_cb(void *arg)
-{
-    if (g_radio.image_busy() || g_image_rx_processing || g_image_ui_pending) {
-        ESP_LOGW(TAG, "cooldown retry ignored: transfer/display in progress");
-        return;
-    }
-    ESP_LOGI(TAG, "Cooldown expired, auto-triggering capture");
-    s_last_gw_capture_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    image_store_abort_transfer();
-    (void)g_radio.trigger_image_capture();
-}
-
 bool on_gw_capture(void)
 {
     // A transfer is already running — don't preempt it (that deadlocks the
@@ -1183,31 +1252,6 @@ bool on_gw_capture(void)
         return false;
     }
 
-    if (g_audio_clip_enabled) {
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-        if (s_last_gw_capture_ms != 0 &&
-            (now - s_last_gw_capture_ms) < APP_AUDIO_CAPTURE_COOLDOWN_MS) {
-            uint32_t remaining_ms = APP_AUDIO_CAPTURE_COOLDOWN_MS - (now - s_last_gw_capture_ms);
-            ESP_LOGW(TAG, "UI capture: audio cooldown, auto-retry in %lums",
-                     (unsigned long)remaining_ms);
-            if (!g_cooldown_retry_timer) {
-                const esp_timer_create_args_t args = {
-                    .callback = cooldown_retry_cb,
-                    .arg = nullptr,
-                    .dispatch_method = ESP_TIMER_TASK,
-                    .name = "cooldown_retry",
-                };
-                esp_timer_create(&args, &g_cooldown_retry_timer);
-            }
-            esp_timer_stop(g_cooldown_retry_timer);
-            esp_timer_start_once(g_cooldown_retry_timer, (uint64_t)remaining_ms * 1000);
-            return false;
-        }
-        s_last_gw_capture_ms = now;
-    }
-    if (g_cooldown_retry_timer) {
-        esp_timer_stop(g_cooldown_retry_timer);
-    }
     ESP_LOGI(TAG, "UI capture: trigger remote photo");
     image_store_abort_transfer();
     return g_radio.trigger_image_capture();

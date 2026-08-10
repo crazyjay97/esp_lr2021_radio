@@ -42,6 +42,7 @@ static lv_obj_t *s_camera_canvas;
 static lv_color_t *s_camera_canvas_buf;
 static bsp_lcd_capture_cb_t s_capture_cb;
 static void *s_capture_user;
+static lv_disp_drv_t *volatile s_pending_flush_drv;
 
 typedef struct {
     uint8_t cmd;
@@ -157,6 +158,22 @@ static esp_err_t lcd_draw_rgb565_bitmap(uint32_t x0, uint32_t y0,
     return esp_lcd_panel_draw_bitmap(s_lcd_panel, x0, y0, x1, y1, pixels);
 }
 
+static bool lcd_color_trans_done_cb(esp_lcd_panel_io_handle_t panel_io,
+                                    esp_lcd_panel_io_event_data_t *event_data,
+                                    void *user_ctx)
+{
+    (void)panel_io;
+    (void)event_data;
+    (void)user_ctx;
+
+    lv_disp_drv_t *drv = s_pending_flush_drv;
+    if (drv != NULL) {
+        s_pending_flush_drv = NULL;
+        lv_disp_flush_ready(drv);
+    }
+    return false;
+}
+
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
                           lv_color_t *color_map)
 {
@@ -169,15 +186,17 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
     for (uint32_t i = 0; i < pixel_count; i++) {
         px[i] = (px[i] >> 8) | (px[i] << 8);
     }
+    s_pending_flush_drv = drv;
     esp_err_t err = lcd_draw_rgb565_bitmap(area->x1, area->y1,
                                            area->x2 + 1, area->y2 + 1,
                                            (const uint16_t *)color_map);
     if (err != ESP_OK) {
+        if (s_pending_flush_drv == drv) {
+            s_pending_flush_drv = NULL;
+        }
         ESP_LOGE(TAG, "lvgl flush failed: %s", esp_err_to_name(err));
         lv_disp_flush_ready(drv);
-        return;
     }
-    lv_disp_flush_ready(drv);
 }
 
 static esp_err_t touch_reset(void)
@@ -437,6 +456,8 @@ esp_err_t bsp_lcd_init(void)
         .spi_mode = 0,
         .pclk_hz = APP_LCD_SPI_PCLK_HZ,
         .trans_queue_depth = APP_LCD_SPI_QUEUE_DEPTH,
+        .on_color_trans_done = lcd_color_trans_done_cb,
+        .user_ctx = NULL,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
     };
