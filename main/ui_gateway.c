@@ -71,6 +71,8 @@ static uint8_t gw_nvs_load_u8(const char *key, uint8_t def)
 
 #define UI_EVENT_QUEUE_LENGTH  8
 #define UI_EVENT_TIMER_MS      10
+#define RX_COMFORT_PROGRESS_MS 1000U
+#define RX_COMFORT_MAX_PCT     99U
 
 typedef enum {
     UI_EVENT_RX_BEGIN = 0,
@@ -152,6 +154,10 @@ static lv_obj_t *s_rx_rssi_lbl = NULL;
 static uint16_t s_rx_total = 0;
 static uint32_t s_rx_start_ms = 0;
 static int16_t s_rx_last_rssi = 0;
+static uint32_t s_rx_comfort_start_ms = 0;
+static uint8_t s_rx_display_pct = 0;
+static uint8_t s_rx_actual_pct = 0;
+static bool s_rx_comfort_active = false;
 
 /* PAGE_LINK objects */
 static lv_obj_t *s_link_labels[5] = {NULL};
@@ -218,6 +224,7 @@ static void gw_vbat_refresh(void);
 static void gw_vbat_timer_cb(lv_timer_t *t);
 
 /* PLACEHOLDER_IMPL */
+static void start_rx_comfort_progress(uint16_t total_frags);
 static void apply_rx_begin(uint16_t session_id, uint16_t total_frags);
 static void apply_rx_progress(uint16_t received, uint16_t total, int16_t rssi);
 static void apply_vbat(uint16_t vbat_mv);
@@ -478,6 +485,7 @@ static void create_rx_page(void)
     create_kv_row(panel, "RSSI", "-- dBm", &s_rx_rssi_lbl);
 
     update_title("Receiving", "RX", COL_AMBER);
+    start_rx_comfort_progress(0);
 }
 
 /* PLACEHOLDER_LINK_PAGE */
@@ -1201,6 +1209,8 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
         if (s_capture_cb) {
             if (s_page != UI_PAGE_RX) {
                 show_page(UI_PAGE_RX);
+            } else {
+                start_rx_comfort_progress(0);
             }
             if (s_capture_cb()) {
                 update_title("Waiting...", "RX", COL_AMBER);
@@ -1225,14 +1235,23 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
     xSemaphoreGiveRecursive(s_lock);
 }
 
-static void reset_rx_progress(uint16_t total_frags)
+static void set_rx_display_progress(uint8_t pct)
+{
+    s_rx_display_pct = pct;
+
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%u%%", pct);
+    if (s_rx_pct_lbl) lv_label_set_text(s_rx_pct_lbl, buf);
+    if (s_rx_bar) lv_bar_set_value(s_rx_bar, pct, LV_ANIM_OFF);
+}
+
+static void reset_rx_stats(uint16_t total_frags)
 {
     s_rx_total = total_frags;
     s_rx_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_rx_last_rssi = 0;
+    s_rx_actual_pct = 0;
 
-    if (s_rx_pct_lbl) lv_label_set_text(s_rx_pct_lbl, "0%");
-    if (s_rx_bar) lv_bar_set_value(s_rx_bar, 0, LV_ANIM_OFF);
     if (s_rx_frag_lbl) {
         char buf[32];
         snprintf(buf, sizeof(buf), "0 / %u", total_frags);
@@ -1243,23 +1262,66 @@ static void reset_rx_progress(uint16_t total_frags)
     if (s_rx_rssi_lbl) lv_label_set_text(s_rx_rssi_lbl, "-- dBm");
 }
 
+static void start_rx_comfort_progress(uint16_t total_frags)
+{
+    reset_rx_stats(total_frags);
+    s_rx_comfort_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_rx_comfort_active = true;
+    set_rx_display_progress(0);
+}
+
+static void stop_rx_progress(uint16_t total_frags)
+{
+    reset_rx_stats(total_frags);
+    s_rx_comfort_start_ms = 0;
+    s_rx_comfort_active = false;
+    set_rx_display_progress(0);
+}
+
+static void update_rx_comfort_progress(void)
+{
+    if (!s_rx_comfort_active || s_page != UI_PAGE_RX) return;
+
+    if (s_rx_actual_pct > s_rx_display_pct) {
+        s_rx_comfort_active = false;
+        set_rx_display_progress(s_rx_actual_pct);
+        return;
+    }
+
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t elapsed_ms = now_ms - s_rx_comfort_start_ms;
+    uint8_t comfort_pct = RX_COMFORT_MAX_PCT;
+    if (elapsed_ms < RX_COMFORT_PROGRESS_MS) {
+        uint64_t remain = RX_COMFORT_PROGRESS_MS - elapsed_ms;
+        uint64_t remain_cubed = remain * remain * remain;
+        uint64_t duration_cubed = (uint64_t)RX_COMFORT_PROGRESS_MS *
+                                  RX_COMFORT_PROGRESS_MS *
+                                  RX_COMFORT_PROGRESS_MS;
+        comfort_pct = (uint8_t)((uint64_t)RX_COMFORT_MAX_PCT *
+                      (duration_cubed - remain_cubed) /
+                      duration_cubed);
+    }
+
+    if (comfort_pct > s_rx_display_pct) {
+        set_rx_display_progress(comfort_pct);
+    }
+}
+
 static void apply_rx_begin(uint16_t session_id, uint16_t total_frags)
 {
-    reset_rx_progress(total_frags);
+    if (s_page != UI_PAGE_RX) {
+        show_page(UI_PAGE_RX);
+    }
+    reset_rx_stats(total_frags);
 
     s_stats_total_frags = total_frags;
     s_stats_first_missing = 0;
     s_stats_total_retransmitted = 0;
     s_stats_first_eot_seen = false;
 
-    if (s_page != UI_PAGE_RX) {
-        show_page(UI_PAGE_RX);
-    }
-
     char title[32];
     snprintf(title, sizeof(title), "Receiving #%03u", session_id);
     update_title(title, "RX", COL_AMBER);
-
 }
 
 static void apply_rx_error(const char *title, bool retry)
@@ -1267,7 +1329,11 @@ static void apply_rx_error(const char *title, bool retry)
     if (s_page != UI_PAGE_RX) {
         show_page(UI_PAGE_RX);
     }
-    reset_rx_progress(retry ? s_rx_total : 0);
+    if (retry) {
+        start_rx_comfort_progress(s_rx_total);
+    } else {
+        stop_rx_progress(0);
+    }
     update_title(title && title[0] ? title : "RX ERROR",
                  retry ? "RETRY" : "FAIL", COL_VBAT_RED);
 }
@@ -1278,6 +1344,8 @@ static void apply_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
 
     s_rx_last_rssi = rssi;
     uint32_t pct = total > 0 ? (uint32_t)received * 100 / total : 0;
+    if (pct > 100) pct = 100;
+    s_rx_actual_pct = (uint8_t)pct;
 
     char buf[32];
 
@@ -1285,9 +1353,11 @@ static void apply_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
         snprintf(buf, sizeof(buf), "%d dBm", rssi);
         lv_label_set_text(s_rx_rssi_lbl, buf);
     }
-    snprintf(buf, sizeof(buf), "%lu%%", (unsigned long)pct);
-    if (s_rx_pct_lbl) lv_label_set_text(s_rx_pct_lbl, buf);
-    if (s_rx_bar) lv_bar_set_value(s_rx_bar, (int32_t)pct, LV_ANIM_OFF);
+    if (s_rx_comfort_active) {
+        update_rx_comfort_progress();
+    } else {
+        set_rx_display_progress(s_rx_actual_pct);
+    }
 
     snprintf(buf, sizeof(buf), "%u / %u", received, total);
     if (s_rx_frag_lbl) lv_label_set_text(s_rx_frag_lbl, buf);
@@ -1431,6 +1501,7 @@ static void ui_event_timer_cb(lv_timer_t *t)
             apply_vbat(event.vbat_mv);
         }
     }
+    update_rx_comfort_progress();
     check_image_presented();
 }
 
