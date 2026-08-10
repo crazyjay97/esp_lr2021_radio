@@ -1014,11 +1014,12 @@ void on_lcd_capture(void *user)
 }
 
 // Radio mode: progress callback for UI update during image RX
-void on_image_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
+void on_image_rx_progress(uint16_t session_id, uint16_t received,
+                          uint16_t total, int16_t rssi)
 {
     if (g_app_mode == AppMode::radio) {
         if (received == 0) {
-            ui_gw_rx_begin(0, total);
+            ui_gw_rx_begin(session_id, total);
             return;
         }
         ui_gw_rx_progress(received, total, rssi);

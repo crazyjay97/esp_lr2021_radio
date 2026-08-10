@@ -1971,10 +1971,10 @@ void RadioPing::handle_image_start(uint16_t len)
     image_rx_last_progress_ms_ = smtc_modem_hal_get_time_in_ms();
     image_rx_expected_crc32_ = expected_crc32;
 
-    // Update UI first (before sending ACK), so LVGL work finishes
-    // before node starts blasting data
+    // Queue the UI update before sending ACK. The callback only copies a small
+    // value event now, so it never waits for LVGL or performs an LCD flush here.
     if (image_rx_progress_cb_) {
-        image_rx_progress_cb_(0, total_frags, 0);
+        image_rx_progress_cb_(session_id, 0, total_frags, 0);
     }
 
     // Send ACK (ready) — missing_count=0 means "ready"
@@ -2101,10 +2101,11 @@ void RadioPing::handle_image_eot()
     }
 
     // Update UI before sending NACK — node won't retransmit until it
-    // receives our reply, so LVGL work here won't cause packet loss
+    // receives our reply; queued UI work cannot block this radio task.
     if (image_rx_progress_cb_) {
         uint16_t total = image_xfer_.rx_total_count();
-        image_rx_progress_cb_(image_xfer_.rx_received_count(), total, image_rx_last_rssi_);
+        image_rx_progress_cb_(session_id, image_xfer_.rx_received_count(),
+                              total, image_rx_last_rssi_);
     }
 
     // Build ACK with missing indices

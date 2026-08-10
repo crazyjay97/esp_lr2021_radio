@@ -27,7 +27,8 @@ enum class ImageCmdAckStatus : uint8_t {
 typedef ImageCmdAckStatus (*image_capture_cb_t)(uint16_t session_id);
 typedef void (*image_request_rejected_cb_t)(ImageCmdAckStatus status);
 typedef void (*image_rx_complete_cb_t)(ImageTransfer *xfer);
-typedef void (*image_rx_progress_cb_t)(uint16_t received, uint16_t total, int16_t rssi);
+typedef void (*image_rx_progress_cb_t)(uint16_t session_id, uint16_t received,
+                                       uint16_t total, int16_t rssi);
 typedef void (*image_rx_eot_cb_t)(uint16_t missing_count, bool is_first_eot);
 typedef void (*config_received_cb_t)(uint8_t key, uint32_t value);
 // Called on the gateway when a node's battery voltage arrives (via ImageStart

@@ -39,6 +39,8 @@ typedef bool (*ui_gw_busy_cb_t)(void);
 esp_err_t ui_gw_init(void);
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed);
 
+// RX begin/progress are non-blocking event posts. LVGL objects are updated by
+// the gateway UI timer from lv_timer_handler(), never by the radio task.
 void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags);
 void ui_gw_rx_progress(uint16_t received, uint16_t total, int16_t rssi);
 void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
@@ -63,7 +65,8 @@ void ui_gw_wifi_update(const char *state_str, const char *ssid, int8_t rssi);
 void ui_gw_show_qr(const char *payload);
 void ui_gw_hide_qr(void);
 
-/* Update the node's battery voltage display (mV). Call with 0 to hide. */
+/* Non-blocking update of the node battery voltage display (mV).
+ * Call with 0 to hide. */
 void ui_gw_update_vbat(uint16_t vbat_mv);
 
 #ifdef __cplusplus

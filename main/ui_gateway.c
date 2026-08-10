@@ -9,6 +9,7 @@
 #include "wifi_manager.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include <stdio.h>
 #include <string.h>
@@ -67,11 +68,31 @@ static uint8_t gw_nvs_load_u8(const char *key, uint8_t def)
 #define SCR_W       240
 #define SCR_H       320
 
+#define UI_EVENT_QUEUE_LENGTH  8
+#define UI_EVENT_TIMER_MS      10
+
+typedef enum {
+    UI_EVENT_RX_BEGIN = 0,
+    UI_EVENT_RX_PROGRESS,
+    UI_EVENT_VBAT,
+} ui_event_type_t;
+
+typedef struct {
+    ui_event_type_t type;
+    uint16_t session_id;
+    uint16_t received;
+    uint16_t total;
+    uint16_t vbat_mv;
+    int16_t rssi;
+} ui_event_t;
+
 /* ─── State ─── */
 static ui_page_t s_page = UI_PAGE_IMAGE;
 static ui_gw_capture_cb_t s_capture_cb = NULL;
 static ui_gw_interval_cb_t s_interval_cb = NULL;
 static SemaphoreHandle_t s_lock = NULL; // points to bsp_lcd's LVGL lock
+static QueueHandle_t s_ui_event_queue = NULL;
+static lv_timer_t *s_ui_event_timer = NULL;
 
 /* Interval presets */
 static const uint32_t s_interval_presets[] = {0, 10, 30, 60, 300, 600, 900, 1200, 1800, 3600};
@@ -181,6 +202,10 @@ static void gw_vbat_refresh(void);
 static void gw_vbat_timer_cb(lv_timer_t *t);
 
 /* PLACEHOLDER_IMPL */
+static void apply_rx_begin(uint16_t session_id, uint16_t total_frags);
+static void apply_rx_progress(uint16_t received, uint16_t total, int16_t rssi);
+static void apply_vbat(uint16_t vbat_mv);
+static void ui_event_timer_cb(lv_timer_t *t);
 
 /* ─── Shared layout ─── */
 static void create_shared_layout(void)
@@ -1053,6 +1078,15 @@ esp_err_t ui_gw_init(void)
         ESP_LOGE(TAG, "LVGL lock not available");
         return ESP_ERR_INVALID_STATE;
     }
+    if (!s_ui_event_queue) {
+        s_ui_event_queue = xQueueCreate(UI_EVENT_QUEUE_LENGTH, sizeof(ui_event_t));
+        if (!s_ui_event_queue) {
+            ESP_LOGE(TAG, "UI event queue allocation failed");
+            return ESP_ERR_NO_MEM;
+        }
+    } else {
+        xQueueReset(s_ui_event_queue);
+    }
 
     s_volume_level = gw_nvs_load_u8("vol", 13);
     s_audio_clip_on = gw_nvs_load_u8("audio", 0) != 0;
@@ -1077,6 +1111,14 @@ esp_err_t ui_gw_init(void)
     (void)bsp_vbat_read_mv();
     gw_vbat_refresh();
     s_gw_vbat_timer = lv_timer_create(gw_vbat_timer_cb, 60000, NULL);
+    if (!s_ui_event_timer) {
+        s_ui_event_timer = lv_timer_create(ui_event_timer_cb, UI_EVENT_TIMER_MS, NULL);
+        if (!s_ui_event_timer) {
+            ESP_LOGE(TAG, "UI event timer allocation failed");
+            xSemaphoreGiveRecursive(s_lock);
+            return ESP_ERR_NO_MEM;
+        }
+    }
 
     xSemaphoreGiveRecursive(s_lock);
 
@@ -1160,11 +1202,8 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
     xSemaphoreGiveRecursive(s_lock);
 }
 
-void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags)
+static void apply_rx_begin(uint16_t session_id, uint16_t total_frags)
 {
-    if (!s_lock) return;
-    xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
-
     s_rx_total = total_frags;
     s_rx_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_rx_last_rssi = 0;
@@ -1182,22 +1221,21 @@ void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags)
     snprintf(title, sizeof(title), "Receiving #%03u", session_id);
     update_title(title, "RX", COL_AMBER);
 
-    // Show total frag count and force flush this label only
+    if (s_rx_pct_lbl) lv_label_set_text(s_rx_pct_lbl, "0%");
+    if (s_rx_bar) lv_bar_set_value(s_rx_bar, 0, LV_ANIM_OFF);
     if (s_rx_frag_lbl) {
         char buf[32];
         snprintf(buf, sizeof(buf), "0 / %u", total_frags);
         lv_label_set_text(s_rx_frag_lbl, buf);
-        lv_obj_invalidate(s_rx_frag_lbl);
-        lv_refr_now(NULL);
     }
-
-    xSemaphoreGiveRecursive(s_lock);
+    if (s_rx_rate_lbl) lv_label_set_text(s_rx_rate_lbl, "-- kbps");
+    if (s_rx_retry_lbl) lv_label_set_text(s_rx_retry_lbl, "00:00.0");
+    if (s_rx_rssi_lbl) lv_label_set_text(s_rx_rssi_lbl, "-- dBm");
 }
 
-void ui_gw_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
+static void apply_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
 {
-    if (!s_lock || s_page != UI_PAGE_RX) return;
-    xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+    if (s_page != UI_PAGE_RX) return;
 
     s_rx_last_rssi = rssi;
     uint32_t pct = total > 0 ? (uint32_t)received * 100 / total : 0;
@@ -1229,10 +1267,56 @@ void ui_gw_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
              (unsigned long)(secs / 60), (unsigned long)(secs % 60),
              (unsigned long)tenths);
     if (s_rx_retry_lbl) lv_label_set_text(s_rx_retry_lbl, buf);
-
-    xSemaphoreGiveRecursive(s_lock);
 }
 
+static void ui_event_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_ui_event_queue) return;
+
+    /* This callback runs from lv_timer_handler() while the BSP owns the LVGL
+     * recursive lock, so all object access stays in the LVGL task context. */
+    ui_event_t event;
+    while (xQueueReceive(s_ui_event_queue, &event, 0) == pdTRUE) {
+        if (event.type == UI_EVENT_RX_BEGIN) {
+            apply_rx_begin(event.session_id, event.total);
+        } else if (event.type == UI_EVENT_RX_PROGRESS) {
+            apply_rx_progress(event.received, event.total, event.rssi);
+        } else if (event.type == UI_EVENT_VBAT) {
+            apply_vbat(event.vbat_mv);
+        }
+    }
+}
+
+static bool post_ui_event(const ui_event_t *event)
+{
+    if (!s_ui_event_queue || !event) return false;
+    return xQueueSend(s_ui_event_queue, event, 0) == pdTRUE;
+}
+
+void ui_gw_rx_begin(uint16_t session_id, uint16_t total_frags)
+{
+    const ui_event_t event = {
+        .type = UI_EVENT_RX_BEGIN,
+        .session_id = session_id,
+        .received = 0,
+        .total = total_frags,
+        .rssi = 0,
+    };
+    (void)post_ui_event(&event);
+}
+
+void ui_gw_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
+{
+    const ui_event_t event = {
+        .type = UI_EVENT_RX_PROGRESS,
+        .session_id = 0,
+        .received = received,
+        .total = total,
+        .rssi = rssi,
+    };
+    (void)post_ui_event(&event);
+}
 /* PLACEHOLDER_RX_COMPLETE */
 
 void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
@@ -1385,11 +1469,8 @@ static void gw_vbat_timer_cb(lv_timer_t *t)
     xSemaphoreGiveRecursive(s_lock);
 }
 
-void ui_gw_update_vbat(uint16_t vbat_mv)
+static void apply_vbat(uint16_t vbat_mv)
 {
-    if (!s_lock) return;
-    xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
-
     s_node_vbat_mv = vbat_mv;
 
     if (s_status_lbl_r) {
@@ -1404,10 +1485,20 @@ void ui_gw_update_vbat(uint16_t vbat_mv)
         lv_label_set_text(s_status_lbl_r, buf);
         lv_obj_set_style_text_color(s_status_lbl_r, vbat_level_color(vbat_mv), 0);
     }
-
-    xSemaphoreGiveRecursive(s_lock);
 }
 
+void ui_gw_update_vbat(uint16_t vbat_mv)
+{
+    const ui_event_t event = {
+        .type = UI_EVENT_VBAT,
+        .session_id = 0,
+        .received = 0,
+        .total = 0,
+        .rssi = 0,
+        .vbat_mv = vbat_mv,
+    };
+    (void)post_ui_event(&event);
+}
 void ui_gw_show_qr(const char *payload)
 {
     if (!s_lock) return;
