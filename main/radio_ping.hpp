@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 
@@ -49,7 +50,7 @@ public:
     // Called from the UI thread when the user leaves the transfer page; only
     // sets a request flag so the actual radio-state teardown happens in the
     // radio task (check_image_rx_abort), keeping all radio access serialized.
-    void abort_image_rx() { image_rx_abort_req_ = true; }
+    void abort_image_rx();
     // Image transfer: A sends JPEG fragments to B.
     // Takes ownership of `jpeg` (must be a heap_caps allocation): the tx task
     // frees it when the transfer completes/aborts. Callers must not free it.
@@ -142,9 +143,13 @@ private:
     void handle_image_cmd();
     void handle_image_cmd_ack();
     // len = received packet length, needed to validate the trailing CRC32.
+    // Consume an external capture request in the radio task, then start it.
+    // UI/esp_timer callers only set image_capture_req_ and wake this task.
+    void check_image_capture_request();
+    void start_image_capture_request();
     // Send one ImageCmd packet for image_req_session_ (build + TX only; the
     // LoRa wakeup + FLRC reconfig is done once per round by
-    // start_image_req_round). Shared by trigger_image_capture and the retry poll.
+    // start_image_req_round). Shared by the initial request and retry poll.
     void send_image_cmd_once();
     // Low power: begin a new request round. Sends the ~520ms LoRa wakeup preamble
     // (to trip the node's CAD scan) + FLRC reconfig, then arms the round so
@@ -262,7 +267,8 @@ private:
     uint32_t image_rx_last_progress_ms_ = 0;
     uint32_t image_rx_expected_crc32_ = 0;
     bool image_rx_pending_ = false;
-    volatile bool image_rx_abort_req_ = false;
+    std::atomic<bool> image_capture_req_{false};
+    std::atomic<bool> image_rx_abort_req_{false};
     uint16_t image_rx_nack_sent_ = 0;
     uint16_t image_rx_eot_count_ = 0;
     int16_t image_rx_last_rssi_ = 0;
@@ -282,6 +288,7 @@ private:
     // wakeup). Unused in non-low-power (there flooding is continuous, no rounds).
     uint32_t image_req_round_end_ms_ = 0;
     uint32_t image_cmd_sent_ms_ = 0;
+    uint32_t image_rx_request_ms_ = 0;
     uint32_t image_rx_start_ms_ = 0;
     uint32_t image_rx_transfer_ms_ = 0;
     uint32_t image_rx_done_ms_ = 0;

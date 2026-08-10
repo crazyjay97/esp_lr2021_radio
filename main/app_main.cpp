@@ -26,6 +26,8 @@
 #include "app_config.h"
 #include "bsp.h"
 
+#include <atomic>
+
 #if APP_VOICE_ALARM_ENABLE
 #include "warning_voice_opus.h"
 #endif
@@ -45,7 +47,8 @@ enum class AppMode : uint8_t {
 AudioDiagnostics g_audio;
 CameraUartStreamer g_camera_uart;
 RadioPing g_radio;
-volatile bool g_capture_busy = false;
+std::atomic<bool> g_capture_busy{false};
+std::atomic<uint16_t> g_active_capture_session{0};
 AppMode g_app_mode = AppMode::camera;
 bool g_radio_active = false;
 
@@ -543,6 +546,15 @@ static uint8_t *prefetch_take(size_t *out_len)
     return blob;
 }
 
+void finish_image_capture_task()
+{
+    // Clear the session before publishing idle, so a new request can never see
+    // an idle capture slot still carrying the previous session identifier.
+    g_active_capture_session.store(0, std::memory_order_release);
+    g_capture_busy.store(false, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+
 void image_capture_task(void *arg)
 {
     auto *ctx = static_cast<ImageCaptureCtx *>(arg);
@@ -570,8 +582,7 @@ void image_capture_task(void *arg)
         ESP_LOGE(TAG, "release lcd for image capture: %s", esp_err_to_name(e));
         bsp_lcd_reinit_after_camera();
         bsp_lcd_set_camera_status("LCD release failed");
-        g_capture_busy = false;
-        vTaskDelete(nullptr);
+        finish_image_capture_task();
         return;
     }
 #endif
@@ -607,8 +618,7 @@ void image_capture_task(void *arg)
             bsp_lcd_reinit_after_camera();
 #endif
             bsp_lcd_set_camera_status("Capture failed");
-            g_capture_busy = false;
-            vTaskDelete(nullptr);
+            finish_image_capture_task();
             return;
         }
 
@@ -627,8 +637,7 @@ void image_capture_task(void *arg)
             bsp_lcd_reinit_after_camera();
 #endif
             bsp_lcd_set_camera_status("JPEG encode failed");
-            g_capture_busy = false;
-            vTaskDelete(nullptr);
+            finish_image_capture_task();
             return;
         }
     }
@@ -679,8 +688,7 @@ void image_capture_task(void *arg)
     if (!tx_done) {
         // The TX task still owns the JPEG and will finish radio cleanup.
         // Skip post-TX work that could contend with the active transfer.        ESP_LOGW(TAG, "image tx still active after 30s; skipping post-tx cleanup (tx task finishes on its own)");
-        g_capture_busy = false;
-        vTaskDelete(nullptr);
+        finish_image_capture_task();
         return;
     }
 
@@ -711,16 +719,12 @@ void image_capture_task(void *arg)
     }
 #endif
 
-    g_capture_busy = false;
-    vTaskDelete(nullptr);
+    finish_image_capture_task();
 }
 
-// Callback: device A receives ImageCmd from B
-// Returns true if the request was accepted (or is a same-session retransmit we
-// already dispatched — re-ack it), false if dropped (not camera / busy /
-// cooldown / task-create failed). The radio layer only sends ImageCmdAck when
-// this returns true, so a dropped request leaves the gateway flooding until the
-// node is free — see image_capture_cb_t in radio_ping.hpp.
+// Callback: device A receives ImageCmd from B. A repeated request is deduplicated
+// only while that same session is actively being captured. Completed sessions
+// are deliberately forgotten because the gateway counter restarts after reboot.
 bool on_image_capture_request(uint16_t session_id)
 {
     if (g_app_mode != AppMode::camera) {
@@ -728,28 +732,26 @@ bool on_image_capture_request(uint16_t session_id)
         g_radio.notify_capture_dropped();
         return false;
     }
-    if (g_capture_busy) {
-        ESP_LOGW(TAG, "ImageCmd ignored: capture already busy");
-        g_radio.notify_capture_dropped();
+
+    uint16_t active_session = g_active_capture_session.load(std::memory_order_acquire);
+    if (g_capture_busy.load(std::memory_order_acquire)) {
+        if (active_session != 0 && session_id == active_session) {
+            // The gateway did not hear the earlier ACK. Re-ACK it without
+            // spawning another capture or clearing the active wake guard.
+            return true;
+        }
+        ESP_LOGW(TAG, "ImageCmd ignored: capture busy (session=%u active=%u)",
+                 session_id, active_session);
         return false;
     }
-    // Dedup gateway ImageCmd retransmits of the same session. The gateway resends
-    // ImageCmd until it gets an ack; if an ack is lost for the whole capture, a
-    // late retransmit can arrive after g_capture_busy cleared. handle_image_cmd
-    // still re-acks it (good), but we must not launch a second capture for a
-    // session we already handled. New requests always carry a new session_id.
-    static uint16_t s_last_dispatched_session = 0;
-    static bool s_have_dispatched = false;
-    if (s_have_dispatched && session_id == s_last_dispatched_session) {
-        // Retransmit of a session we already handled: re-ack it (return true) so
-        // the gateway's lost-ack self-heal still works, but do not launch a
-        // second capture.
-        ESP_LOGW(TAG, "ImageCmd ignored: session %u already dispatched", session_id);
-        return true;
+
+    bool expected_idle = false;
+    if (!g_capture_busy.compare_exchange_strong(expected_idle, true,
+                                                std::memory_order_acq_rel)) {
+        active_session = g_active_capture_session.load(std::memory_order_acquire);
+        return active_session != 0 && session_id == active_session;
     }
-    g_capture_busy = true;
-    s_last_dispatched_session = session_id;
-    s_have_dispatched = true;
+    g_active_capture_session.store(session_id, std::memory_order_release);
 
     // Low power: hold the node awake through the capture + push. Without this,
     // poll_once re-enters CAD light sleep (500ms halt) immediately after the
@@ -759,7 +761,9 @@ bool on_image_capture_request(uint16_t session_id)
 
     auto *ctx = new (std::nothrow) ImageCaptureCtx{ session_id };
     if (!ctx) {
-        g_capture_busy = false;
+        g_active_capture_session.store(0, std::memory_order_release);
+        g_capture_busy.store(false, std::memory_order_release);
+        g_radio.notify_capture_dropped();
         return false;
     }
 
@@ -769,7 +773,9 @@ bool on_image_capture_request(uint16_t session_id)
                                             APP_IMAGE_TASK_CORE);
     if (ok != pdPASS) {
         delete ctx;
-        g_capture_busy = false;
+        g_active_capture_session.store(0, std::memory_order_release);
+        g_capture_busy.store(false, std::memory_order_release);
+        g_radio.notify_capture_dropped();
         ESP_LOGE(TAG, "image capture task create failed");
         return false;
     }

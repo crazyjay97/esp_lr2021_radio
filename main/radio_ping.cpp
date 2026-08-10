@@ -379,8 +379,9 @@ void RadioPing::task()
             poll_once();
             update_playback_timeout();
             check_image_rx_timeout();
-            check_image_req_retry();
             check_image_rx_abort();
+            check_image_capture_request();
+            check_image_req_retry();
         }
         ulTaskNotifyTake(pdTRUE, ms_to_ticks_min_1(APP_RADIO_TASK_POLL_MS));
     }
@@ -525,7 +526,15 @@ void RadioPing::play_task()
 
 void RadioPing::poll_once()
 {
-    if (irq_pending_) {
+    // RX_DONE is a status bit, not an event counter. During a back-to-back image
+    // burst several packet completions can collapse into one DIO notification.
+    // The half-packet guard in handle_rx_packet intentionally leaves an
+    // incomplete next packet in the FIFO; if its completion edge is collapsed,
+    // waiting only for irq_pending_ can strand that packet forever. While an
+    // image request/RX is active, also poll the chip IRQ status every task pass
+    // so the completed packet is consumed even when no new GPIO edge arrives.
+    bool poll_image_irq = image_rx_pending_ && mode_ == Mode::rx_pending;
+    if (irq_pending_ || poll_image_irq) {
         irq_pending_ = false;
         ral_irq_t irq = RAL_IRQ_NONE;
         smtc_modem_hal_protect_api_call();
@@ -633,7 +642,8 @@ void RadioPing::handle_irq(ral_irq_t irq)
     Mode completed_mode = mode_;
 
     if (completed_mode == Mode::rx_pending) {
-        if ((irq & RAL_IRQ_RX_DONE) != 0) {
+        if ((irq & RAL_IRQ_RX_DONE) != 0 &&
+            (irq & (RAL_IRQ_RX_CRC_ERROR | RAL_IRQ_RX_HDR_ERROR)) == 0) {
             // During an image burst the radio stays in continuous RX. Re-arming
             // after each fragment would clear bytes of the next fragment that
             // are already entering the 1024-byte FIFO.
@@ -885,8 +895,9 @@ void RadioPing::capture_voice_packet()
 void RadioPing::handle_rx_packet()
 {
     // RX_DONE notifications can collapse while multiple 511-byte image packets
-    // accumulate in the 1024-byte FIFO. Drain every complete packet now; after
-    // the first read, a sub-511 level belongs to a packet still arriving.
+    // accumulate in the 1024-byte FIFO. Drain every complete image packet now.
+    // A stale RX_DONE may be handled while the next packet is still entering
+    // the FIFO, so a sub-511 FIFO level must never be used as a packet length.
     for (int drained = 0; ; drained++) {
         uint16_t level = 0;
         smtc_modem_hal_protect_api_call();
@@ -897,13 +908,26 @@ void RadioPing::handle_rx_packet()
         if (level_status != RAL_STATUS_OK || level == 0) {
             break;
         }
-        if (drained > 0 && level < APP_FLRC_BURST_PAYLOAD_LEN) {
-            break;
-        }
+        uint16_t take = APP_FLRC_BURST_PAYLOAD_LEN;
+        if (level < APP_FLRC_BURST_PAYLOAD_LEN) {
+            // Leave a partial next packet in the FIFO. For a genuine short
+            // control packet, GetRxPktLength must exactly match the FIFO level.
+            // Only inspect one short packet per RX_DONE so packet boundaries
+            // are never inferred from an aggregate FIFO level.
+            if (drained > 0) {
+                break;
+            }
 
-        uint16_t take = (level >= APP_FLRC_BURST_PAYLOAD_LEN)
-                            ? APP_FLRC_BURST_PAYLOAD_LEN
-                            : level;
+            uint16_t packet_len = 0;
+            smtc_modem_hal_protect_api_call();
+            ral_status_t size_status = ral_get_pkt_size(&radio_.ral, &packet_len);
+            smtc_modem_hal_unprotect_api_call();
+            if (size_status != RAL_STATUS_OK || packet_len == 0 ||
+                packet_len > APP_FLRC_MAX_PAYLOAD_BYTES || packet_len != level) {
+                break;
+            }
+            take = packet_len;
+        }
         ral_flrc_rx_pkt_status_t pkt_status = {};
 
         smtc_modem_hal_protect_api_call();
@@ -1192,23 +1216,64 @@ void RadioPing::image_tx_task_trampoline(void *arg)
 
 void RadioPing::trigger_image_capture()
 {
+    // UI and esp_timer callbacks must never touch the radio state directly.
+    // Collapse duplicate triggers into one pending request and wake the radio
+    // task; it owns all session teardown, mode changes and ImageCmd TX.
+    image_capture_req_.store(true, std::memory_order_release);
+    TaskHandle_t task = task_handle_;
+    if (task != nullptr) {
+        xTaskNotifyGive(task);
+    }
+}
+
+void RadioPing::abort_image_rx()
+{
+    // Leaving the page cancels a queued next-frame request as well as the
+    // current RX. The radio task performs the actual teardown.
+    image_capture_req_.store(false, std::memory_order_release);
+    image_rx_abort_req_.store(true, std::memory_order_release);
+    TaskHandle_t task = task_handle_;
+    if (task != nullptr) {
+        xTaskNotifyGive(task);
+    }
+}
+
+void RadioPing::check_image_capture_request()
+{
+    if (!image_capture_req_.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    start_image_capture_request();
+}
+
+void RadioPing::start_image_capture_request()
+{
     if (image_tx_active_) {
         ESP_LOGW(TAG, "image TX already active, ignoring trigger");
         return;
     }
 
-    // Abandon any in-progress RX (and its pending ImageCmd retry) before starting
-    // a new request. Otherwise the old session's tail (a few missing frags still
-    // being NACKed) fights the new ImageCmd flood on the half-duplex radio and
-    // neither finishes — both sides deadlock. Starting fresh drops the stale one.
+    // A repeated UI press while a request/transfer is active must not replace its
+    // session. The first camera wake + capture can take well over one second; a
+    // second press during the following burst used to reset the reassembly state,
+    // discard every fragment already on air, then report the old EOT as session/0.
+    // Keep the current request alive. Its existing retry and 10s RX timeout paths
+    // remain responsible for recovery if the peer really stops responding.
     if (image_rx_pending_ || image_req_active_) {
-        ESP_LOGI(TAG, "trigger: dropping stale RX (session=%u) for new request",
-                 image_xfer_.rx_session_id());
-        image_req_active_ = false;
-        image_rx_pending_ = false;
-        image_xfer_.rx_reset();
-        image_rx_nack_sent_ = 0;
+        uint16_t active_session = image_xfer_.rx_active()
+                                      ? image_xfer_.rx_session_id()
+                                      : image_req_session_;
+        ESP_LOGI(TAG, "capture trigger ignored: request/RX active (session=%u received=%u/%u)",
+                 active_session, image_xfer_.rx_received_count(),
+                 image_xfer_.rx_total_count());
+        return;
     }
+    // Always discard any completed/stale reassembly metadata before assigning a
+    // new request session. A late EOT from the previous session must not be able
+    // to complete against the new request's pending state.
+    image_xfer_.rx_reset();
+    image_rx_expected_crc32_ = 0;
+    image_rx_request_ms_ = 0;
 
     // Pick the session ONCE for this whole request. Retries reuse it (they do
     // NOT ++), so a resend can never spawn a second capture / a different JPEG.
@@ -1862,6 +1927,23 @@ void RadioPing::handle_image_start(uint16_t len)
     uint32_t expected_crc32 = get_u32_le(&rx_buf_[10]);
     uint16_t vbat_mv = has_vbat ? get_u16_le(&rx_buf_[14]) : 0;
 
+    // While a gateway request is waiting for ImageStart, only that request's
+    // session may start the transfer. Once reassembly is active, only a repeat
+    // ImageStart for the same RX session is valid. This keeps a delayed
+    // unsolicited/previous-session ImageStart from stopping the new ImageCmd
+    // retry and hijacking the first frame.
+    if (image_rx_pending_) {
+        uint16_t expected_session = image_xfer_.rx_active()
+                                        ? image_xfer_.rx_session_id()
+                                        : image_req_session_;
+        if (expected_session != 0 && session_id != expected_session) {
+            ESP_LOGW(TAG, "ImageStart ignored: session=%u expected=%u",
+                     session_id, expected_session);
+            return;
+        }
+    }
+    bool gateway_requested = image_rx_pending_ && session_id == image_req_session_;
+
     if (has_vbat) {
         // Start of a frame's RX — DEBUG so the per-frame transfer stays quiet;
         // the completion summary ("RX done") carries the useful outcome.
@@ -1898,6 +1980,9 @@ void RadioPing::handle_image_start(uint16_t len)
     }
 
     image_rx_start_ms_ = smtc_modem_hal_get_time_in_ms();
+    // Bind the timing origin to this RX session. Unsolicited node pushes have
+    // no ImageCmd preparation phase, so their request origin is ImageStart.
+    image_rx_request_ms_ = gateway_requested ? image_cmd_sent_ms_ : image_rx_start_ms_;
 
     // Prepare RX buffer
     image_xfer_.rx_begin(session_id, total_frags);
@@ -2031,6 +2116,18 @@ void RadioPing::handle_image_eot()
         return;
     }
 
+    // A late EOT must never operate on the pending state or reassembly buffer
+    // of another session. In particular, while a new request is waiting for its
+    // ImageStart the buffer is inactive and all old EOT packets are ignored.
+    if (!image_xfer_.rx_active() ||
+        session_id != image_xfer_.rx_session_id() ||
+        total_frags != image_xfer_.rx_total_count()) {
+        ESP_LOGW(TAG, "ImageEOT ignored: session=%u/%u total=%u/%u",
+                 session_id, image_xfer_.rx_session_id(),
+                 total_frags, image_xfer_.rx_total_count());
+        return;
+    }
+
     // Exit continuous RX to send response
     if (mode_ == Mode::rx_pending) {
         smtc_modem_hal_protect_api_call();
@@ -2096,8 +2193,11 @@ void RadioPing::handle_image_eot()
         image_rx_done_session_ = session_id;
         uint32_t now_ms = smtc_modem_hal_get_time_in_ms();
         uint32_t transfer_ms = now_ms - image_rx_start_ms_;
-        uint32_t prepare_ms = image_rx_start_ms_ - image_cmd_sent_ms_;
-        uint32_t total_ms = now_ms - image_cmd_sent_ms_;
+        int32_t prepare_delta =
+            static_cast<int32_t>(image_rx_start_ms_ - image_rx_request_ms_);
+        uint32_t prepare_ms =
+            prepare_delta >= 0 ? static_cast<uint32_t>(prepare_delta) : 0U;
+        uint32_t total_ms = prepare_ms + transfer_ms;
         image_rx_transfer_ms_ = transfer_ms;
         image_rx_done_ms_ = now_ms;
         ESP_LOGI(TAG, "RX done | prepare=%lums transfer=%lums total=%lums",
@@ -2174,9 +2274,9 @@ void RadioPing::check_image_rx_timeout()
 // for this session; the node's TX side self-aborts once its ACKs stop arriving.
 void RadioPing::check_image_rx_abort()
 {
-    if (!image_rx_abort_req_) return;
-    image_rx_abort_req_ = false;
+    if (!image_rx_abort_req_.exchange(false, std::memory_order_acq_rel)) return;
 
+    image_capture_req_.store(false, std::memory_order_release);
     if (image_rx_pending_ || image_req_active_) {
         ESP_LOGI(TAG, "image RX aborted by user (left transfer page)");
     }
@@ -2579,4 +2679,3 @@ void RadioPing::vbat_maintenance_tick()
         vbat_last_broadcast_ms_ = now;
     }
 }
-

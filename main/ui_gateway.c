@@ -535,6 +535,8 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
     switch (idx) {
     case 0: /* Capture */
         if (s_capture_cb) {
+            s_stream_mode = true;
+            s_stream_first_shown = false;
             show_page(UI_PAGE_RX);
             s_capture_cb();
             update_title("Waiting...", "RX", COL_AMBER);
