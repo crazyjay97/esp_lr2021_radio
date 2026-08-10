@@ -73,6 +73,7 @@ static uint8_t gw_nvs_load_u8(const char *key, uint8_t def)
 #define UI_EVENT_TIMER_MS      10
 #define RX_COMFORT_PROGRESS_MS 1000U
 #define RX_COMFORT_MAX_PCT     99U
+#define IMAGE_PRESENT_GUARD_MS 100U
 
 typedef enum {
     UI_EVENT_RX_BEGIN = 0,
@@ -196,6 +197,7 @@ static volatile uint16_t s_latest_rx_session_id = 0;
 static bool s_image_present_waiting = false;
 static uint16_t s_image_present_session_id = 0;
 static uint32_t s_image_present_frame_token = 0;
+static uint32_t s_image_present_guard_until_ms = 0;
 
 /* PAGE_CONFIG WiFi status panel */
 static lv_obj_t *s_cfg_wifi_btn = NULL;
@@ -229,6 +231,7 @@ static void apply_rx_begin(uint16_t session_id, uint16_t total_frags);
 static void apply_rx_progress(uint16_t received, uint16_t total, int16_t rssi);
 static void apply_vbat(uint16_t vbat_mv);
 static void ui_event_timer_cb(lv_timer_t *t);
+static bool image_present_guard_active(void);
 
 /* ─── Shared layout ─── */
 static void create_shared_layout(void)
@@ -570,6 +573,14 @@ static void cfg_wifi_btn_clicked_cb(lv_event_t *e)
 
 static void cfg_style_value(int idx, const char *text);
 
+static bool image_present_guard_active(void)
+{
+    if (s_image_present_guard_until_ms == 0) return false;
+
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    return (int32_t)(s_image_present_guard_until_ms - now_ms) > 0;
+}
+
 /* ─── Touch button clicked callback (value badges only) ─── */
 static void cfg_btn_clicked_cb(lv_event_t *e)
 {
@@ -580,8 +591,8 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
         /* Ignore the key entirely while a transfer is already running: don't
          * switch to the RX page and don't fire a new request. A second request
          * mid-transfer deadlocks the half-duplex radio. */
-        if (s_busy_cb && s_busy_cb()) {
-            ESP_LOGW(TAG, "capture ignored: transfer in progress");
+        if ((s_busy_cb && s_busy_cb()) || image_present_guard_active()) {
+            ESP_LOGW(TAG, "capture ignored: transfer/display guard in progress");
             break;
         }
         if (s_capture_cb) {
@@ -1198,7 +1209,8 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
                              key == BSP_BTN_VOL_UP ||
                              key == BSP_BTN_USER1 ||
                              key == BSP_BTN_PTT;
-    if (is_page_key && s_busy_cb && s_busy_cb()) {
+    if (is_page_key &&
+        ((s_busy_cb && s_busy_cb()) || image_present_guard_active())) {
         ESP_LOGW(TAG, "key %d ignored: transfer/display in progress", key);
         xSemaphoreGiveRecursive(s_lock);
         return;
@@ -1413,6 +1425,8 @@ static void check_image_presented(void)
     s_image_present_waiting = false;
     s_image_present_session_id = 0;
     s_image_present_frame_token = 0;
+    s_image_present_guard_until_ms =
+        (uint32_t)(esp_timer_get_time() / 1000) + IMAGE_PRESENT_GUARD_MS;
     if (s_image_presented_cb) {
         s_image_presented_cb(session_id, displayed);
     }
