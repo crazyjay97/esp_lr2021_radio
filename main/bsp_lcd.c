@@ -17,6 +17,7 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "lvgl.h"
 
@@ -26,6 +27,8 @@ static const char *TAG = "bsp_lcd";
 
 /* LR2021 uses SPI2 inside the module; keep the external LCD on SPI3. */
 #define BSP_LCD_SPI_HOST SPI3_HOST
+#define LCD_FLUSH_TIMEOUT_MS 200U
+#define LCD_FLUSH_WATCHDOG_PERIOD_MS 25U
 
 static esp_lcd_panel_io_handle_t s_lcd_io;
 static esp_lcd_panel_handle_t s_lcd_panel;
@@ -43,6 +46,16 @@ static lv_color_t *s_camera_canvas_buf;
 static bsp_lcd_capture_cb_t s_capture_cb;
 static void *s_capture_user;
 static lv_disp_drv_t *volatile s_pending_flush_drv;
+static volatile uint32_t s_pending_flush_started_ms;
+static volatile uint32_t s_pending_flush_seq;
+static volatile int16_t s_pending_flush_y1;
+static volatile int16_t s_pending_flush_y2;
+static volatile uint32_t s_completed_flush_seq;
+static volatile uint32_t s_refresh_started_seq;
+static volatile uint32_t s_refresh_completed_seq;
+static volatile uint32_t s_monitored_refresh_seq;
+static volatile uint32_t s_monitored_last_flush_seq;
+static esp_timer_handle_t s_flush_watchdog_timer;
 
 typedef struct {
     uint8_t cmd;
@@ -158,6 +171,80 @@ static esp_err_t lcd_draw_rgb565_bitmap(uint32_t x0, uint32_t y0,
     return esp_lcd_panel_draw_bitmap(s_lcd_panel, x0, y0, x1, y1, pixels);
 }
 
+static void lcd_flush_watchdog_cb(void *arg)
+{
+    (void)arg;
+
+    lv_disp_drv_t *drv = s_pending_flush_drv;
+    if (drv == NULL) {
+        return;
+    }
+
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t started_ms = s_pending_flush_started_ms;
+    if ((uint32_t)(now_ms - started_ms) < LCD_FLUSH_TIMEOUT_MS) {
+        return;
+    }
+
+    uint32_t seq = s_pending_flush_seq;
+    int16_t y1 = s_pending_flush_y1;
+    int16_t y2 = s_pending_flush_y2;
+
+    /* Confirm that the same transfer is still pending. A late completion may
+     * race with this timer, but a transfer that exceeded the deadline is no
+     * longer safe to recover by releasing LVGL's draw buffer. */
+    if (s_pending_flush_drv != drv || s_pending_flush_seq != seq) {
+        return;
+    }
+
+    ESP_LOGE(TAG, "LCD flush timeout: seq=%lu y=%d..%d elapsed=%lums; restarting",
+             (unsigned long)seq, y1, y2,
+             (unsigned long)(now_ms - started_ms));
+    esp_restart();
+}
+
+static esp_err_t lcd_flush_watchdog_start(void)
+{
+    if (s_flush_watchdog_timer != NULL) {
+        return ESP_OK;
+    }
+
+    const esp_timer_create_args_t args = {
+        .callback = lcd_flush_watchdog_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "lcd_flush_wd",
+    };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&args, &s_flush_watchdog_timer),
+                        TAG, "create LCD flush watchdog");
+
+    esp_err_t err = esp_timer_start_periodic(
+        s_flush_watchdog_timer,
+        (uint64_t)LCD_FLUSH_WATCHDOG_PERIOD_MS * 1000U);
+    if (err != ESP_OK) {
+        esp_timer_delete(s_flush_watchdog_timer);
+        s_flush_watchdog_timer = NULL;
+        return err;
+    }
+    return ESP_OK;
+}
+
+static bool sequence_reached(uint32_t current, uint32_t target)
+{
+    return (int32_t)(current - target) >= 0;
+}
+
+static void mark_flush_completed(uint32_t flush_seq)
+{
+    s_completed_flush_seq = flush_seq;
+
+    uint32_t refresh_seq = s_monitored_refresh_seq;
+    uint32_t last_flush_seq = s_monitored_last_flush_seq;
+    if (refresh_seq != 0 && sequence_reached(flush_seq, last_flush_seq)) {
+        s_refresh_completed_seq = refresh_seq;
+    }
+}
+
 static bool lcd_color_trans_done_cb(esp_lcd_panel_io_handle_t panel_io,
                                     esp_lcd_panel_io_event_data_t *event_data,
                                     void *user_ctx)
@@ -168,8 +255,10 @@ static bool lcd_color_trans_done_cb(esp_lcd_panel_io_handle_t panel_io,
 
     lv_disp_drv_t *drv = s_pending_flush_drv;
     if (drv != NULL) {
+        uint32_t flush_seq = s_pending_flush_seq;
         s_pending_flush_drv = NULL;
         lv_disp_flush_ready(drv);
+        mark_flush_completed(flush_seq);
     }
     return false;
 }
@@ -177,8 +266,12 @@ static bool lcd_color_trans_done_cb(esp_lcd_panel_io_handle_t panel_io,
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
                           lv_color_t *color_map)
 {
+    uint32_t flush_seq = s_pending_flush_seq + 1U;
+    s_pending_flush_seq = flush_seq;
+
     if (s_lcd_suspended || !s_lcd_ready) {
         lv_disp_flush_ready(drv);
+        mark_flush_completed(flush_seq);
         return;
     }
     uint32_t pixel_count = (area->x2 - area->x1 + 1) * (area->y2 - area->y1 + 1);
@@ -186,6 +279,9 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
     for (uint32_t i = 0; i < pixel_count; i++) {
         px[i] = (px[i] >> 8) | (px[i] << 8);
     }
+    s_pending_flush_started_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_pending_flush_y1 = area->y1;
+    s_pending_flush_y2 = area->y2;
     s_pending_flush_drv = drv;
     esp_err_t err = lcd_draw_rgb565_bitmap(area->x1, area->y1,
                                            area->x2 + 1, area->y2 + 1,
@@ -196,6 +292,29 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
         }
         ESP_LOGE(TAG, "lvgl flush failed: %s", esp_err_to_name(err));
         lv_disp_flush_ready(drv);
+        mark_flush_completed(flush_seq);
+    }
+}
+
+static void lvgl_monitor_cb(lv_disp_drv_t *drv, uint32_t time_ms,
+                            uint32_t pixel_count)
+{
+    (void)drv;
+    (void)time_ms;
+    (void)pixel_count;
+
+    uint32_t refresh_seq = s_refresh_started_seq + 1U;
+    uint32_t last_flush_seq = s_pending_flush_seq;
+
+    /* Publish the final flush sequence before the refresh sequence. The DMA
+     * callback can then close the same refresh whether it runs just before or
+     * just after this monitor callback. */
+    s_monitored_last_flush_seq = last_flush_seq;
+    s_monitored_refresh_seq = refresh_seq;
+    s_refresh_started_seq = refresh_seq;
+
+    if (sequence_reached(s_completed_flush_seq, last_flush_seq)) {
+        s_refresh_completed_seq = refresh_seq;
     }
 }
 
@@ -505,6 +624,8 @@ esp_err_t bsp_lcd_init(void)
                  esp_err_to_name(bl_err));
     }
 
+    ESP_RETURN_ON_ERROR(lcd_flush_watchdog_start(), TAG,
+                        "start LCD flush watchdog");
     s_lcd_ready = true;
     ESP_LOGI(TAG, "ST7789V3 LCD ready: %ux%u, SPI3 sclk=%d mosi=%d dc=%d cs=%d te=%d bl=P%d rst=P%d",
              APP_LCD_H_RES, APP_LCD_V_RES, BSP_LCD_SPI_SCLK_GPIO,
@@ -803,6 +924,7 @@ esp_err_t bsp_lcd_start_gateway_ui(void)
     disp_drv_gw.hor_res = APP_LCD_H_RES;
     disp_drv_gw.ver_res = APP_LCD_V_RES;
     disp_drv_gw.flush_cb = lvgl_flush_cb;
+    disp_drv_gw.monitor_cb = lvgl_monitor_cb;
     disp_drv_gw.draw_buf = &draw_buf_gw;
     s_lvgl_disp_drv = &disp_drv_gw;
     lv_disp_drv_register(&disp_drv_gw);
@@ -849,6 +971,16 @@ esp_err_t bsp_lcd_start_gateway_ui(void)
 SemaphoreHandle_t bsp_lcd_get_lvgl_lock(void)
 {
     return s_lvgl_lock;
+}
+
+uint32_t bsp_lcd_next_frame_token(void)
+{
+    return s_refresh_started_seq + 1U;
+}
+
+bool bsp_lcd_frame_token_complete(uint32_t token)
+{
+    return sequence_reached(s_refresh_completed_seq, token);
 }
 
 esp_err_t bsp_lcd_set_camera_status(const char *text)

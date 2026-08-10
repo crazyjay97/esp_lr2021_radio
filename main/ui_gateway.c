@@ -187,6 +187,9 @@ static ui_gw_rx_abort_cb_t s_rx_abort_cb = NULL;
 static ui_gw_busy_cb_t s_busy_cb = NULL;
 static ui_gw_image_presented_cb_t s_image_presented_cb = NULL;
 static volatile uint16_t s_latest_rx_session_id = 0;
+static bool s_image_present_waiting = false;
+static uint16_t s_image_present_session_id = 0;
+static uint32_t s_image_present_frame_token = 0;
 
 /* PAGE_CONFIG WiFi status panel */
 static lv_obj_t *s_cfg_wifi_btn = NULL;
@@ -1319,6 +1322,32 @@ static void release_ui_event(ui_event_t *event, bool displayed)
     }
 }
 
+static void free_complete_event_image(ui_event_t *event)
+{
+    if (!event || event->type != UI_EVENT_RX_COMPLETE) return;
+    if (event->rgb565) {
+        jpeg_free_align(event->rgb565);
+        event->rgb565 = NULL;
+    }
+}
+
+static void check_image_presented(void)
+{
+    if (!s_image_present_waiting ||
+        !bsp_lcd_frame_token_complete(s_image_present_frame_token)) {
+        return;
+    }
+
+    uint16_t session_id = s_image_present_session_id;
+    bool displayed = (s_page == UI_PAGE_IMAGE);
+    s_image_present_waiting = false;
+    s_image_present_session_id = 0;
+    s_image_present_frame_token = 0;
+    if (s_image_presented_cb) {
+        s_image_presented_cb(session_id, displayed);
+    }
+}
+
 static void apply_rx_complete(ui_event_t *event)
 {
     if (!event) return;
@@ -1364,10 +1393,13 @@ static void apply_rx_complete(ui_event_t *event)
     }
     s_has_image = true;
     show_page(UI_PAGE_IMAGE);
-    ESP_LOGI(TAG, "image displayed: %lu bytes, %lums RF",
+    free_complete_event_image(event);
+    s_image_present_waiting = true;
+    s_image_present_session_id = event->session_id;
+    s_image_present_frame_token = bsp_lcd_next_frame_token();
+    ESP_LOGI(TAG, "image display flush queued: %lu bytes, %lums RF",
              (unsigned long)event->jpeg_size,
              (unsigned long)event->elapsed_ms);
-    release_ui_event(event, true);
 }
 
 static void ui_event_timer_cb(lv_timer_t *t)
@@ -1399,6 +1431,7 @@ static void ui_event_timer_cb(lv_timer_t *t)
             apply_vbat(event.vbat_mv);
         }
     }
+    check_image_presented();
 }
 
 static bool post_ui_event(const ui_event_t *event)

@@ -50,6 +50,11 @@ esp_err_t bsp_lcd_start_lvgl_demo(void);
 esp_err_t bsp_lcd_start_camera_ui(bsp_lcd_capture_cb_t cb, void *user);
 esp_err_t bsp_lcd_start_gateway_ui(void);
 SemaphoreHandle_t bsp_lcd_get_lvgl_lock(void);
+/* Return the sequence number assigned to the next LVGL refresh whose final
+ * LCD transfer has not started yet. The token becomes complete only after the
+ * final color-transfer DMA callback for that refresh has run. */
+uint32_t bsp_lcd_next_frame_token(void);
+bool bsp_lcd_frame_token_complete(uint32_t token);
 esp_err_t bsp_lcd_set_camera_status(const char *text);
 esp_err_t bsp_lcd_clear_camera_photo(void);
 esp_err_t bsp_lcd_show_gray_photo(const uint8_t *gray,

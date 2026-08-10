@@ -33,9 +33,9 @@ typedef void (*ui_gw_rx_abort_cb_t)(void);
 // The UI queries this before handling capture, navigation keys, or gestures so
 // an active transfer cannot be aborted or covered by a stale page transition.
 typedef bool (*ui_gw_busy_cb_t)(void);
-// Called after an owned RGB565 event is either displayed or discarded. Queue
-// eviction can invoke it from an event producer task; it must not block or call
-// LVGL.
+// Called after an owned RGB565 event is discarded, or after the final LCD DMA
+// flush for the image page completes. Queue eviction can invoke the discarded
+// path from an event producer task; it must not block or call LVGL.
 typedef void (*ui_gw_image_presented_cb_t)(uint16_t session_id, bool displayed);
 
 esp_err_t ui_gw_init(void);
