@@ -80,7 +80,7 @@
 #define APP_FLRC_TX_POWER_DBM           22
 
 /* Use FEC during early tests; switch to RAL_FLRC_CR_1_1 only after range tests. */
-#define APP_FLRC_CODING_RATE            RAL_FLRC_CR_3_4
+#define APP_FLRC_CODING_RATE            RAL_FLRC_CR_1_1
 
 /* BT=0.5 keeps spectrum cleaner than no shaping at high FLRC data rates. */
 #define APP_FLRC_PULSE_SHAPE            RAL_FLRC_PULSE_SHAPE_BT_05
