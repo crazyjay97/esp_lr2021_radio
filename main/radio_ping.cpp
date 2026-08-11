@@ -526,15 +526,7 @@ void RadioPing::play_task()
 
 void RadioPing::poll_once()
 {
-    // RX_DONE is a status bit, not an event counter. During a back-to-back image
-    // burst several packet completions can collapse into one DIO notification.
-    // The half-packet guard in handle_rx_packet intentionally leaves an
-    // incomplete next packet in the FIFO; if its completion edge is collapsed,
-    // waiting only for irq_pending_ can strand that packet forever. While an
-    // image request/RX is active, also poll the chip IRQ status every task pass
-    // so the completed packet is consumed even when no new GPIO edge arrives.
-    bool poll_image_irq = image_rx_pending_ && mode_ == Mode::rx_pending;
-    if (irq_pending_ || poll_image_irq) {
+    if (irq_pending_) {
         irq_pending_ = false;
         ral_irq_t irq = RAL_IRQ_NONE;
         smtc_modem_hal_protect_api_call();
@@ -642,8 +634,7 @@ void RadioPing::handle_irq(ral_irq_t irq)
     Mode completed_mode = mode_;
 
     if (completed_mode == Mode::rx_pending) {
-        if ((irq & RAL_IRQ_RX_DONE) != 0 &&
-            (irq & (RAL_IRQ_RX_CRC_ERROR | RAL_IRQ_RX_HDR_ERROR)) == 0) {
+        if ((irq & RAL_IRQ_RX_DONE) != 0) {
             // During an image burst the radio stays in continuous RX. Re-arming
             // after each fragment would clear bytes of the next fragment that
             // are already entering the 1024-byte FIFO.
@@ -894,10 +885,12 @@ void RadioPing::capture_voice_packet()
 
 void RadioPing::handle_rx_packet()
 {
-    // RX_DONE notifications can collapse while multiple 511-byte image packets
-    // accumulate in the 1024-byte FIFO. Drain every complete image packet now.
-    // A stale RX_DONE may be handled while the next packet is still entering
-    // the FIFO, so a sub-511 FIFO level must never be used as a packet length.
+    // Drain the RX FIFO fully on each RX_DONE. This is essential for the FLRC
+    // burst image stream: at 2.6 Mbps a 511B fragment lands every ~2ms, faster
+    // than the poll loop can service one interrupt, so multiple fragments pile
+    // up in the 1024B RX FIFO before we get here. irq_pending_ is a bool, so N
+    // back-to-back RX_DONEs collapse into a single poll_once pass; reading by
+    // FIFO level until it drains keeps the read pointer aligned on boundaries.
     for (int drained = 0; ; drained++) {
         uint16_t level = 0;
         smtc_modem_hal_protect_api_call();
@@ -908,26 +901,14 @@ void RadioPing::handle_rx_packet()
         if (level_status != RAL_STATUS_OK || level == 0) {
             break;
         }
-        uint16_t take = APP_FLRC_BURST_PAYLOAD_LEN;
-        if (level < APP_FLRC_BURST_PAYLOAD_LEN) {
-            // Leave a partial next packet in the FIFO. For a genuine short
-            // control packet, GetRxPktLength must exactly match the FIFO level.
-            // Only inspect one short packet per RX_DONE so packet boundaries
-            // are never inferred from an aggregate FIFO level.
-            if (drained > 0) {
-                break;
-            }
-
-            uint16_t packet_len = 0;
-            smtc_modem_hal_protect_api_call();
-            ral_status_t size_status = ral_get_pkt_size(&radio_.ral, &packet_len);
-            smtc_modem_hal_unprotect_api_call();
-            if (size_status != RAL_STATUS_OK || packet_len == 0 ||
-                packet_len > APP_FLRC_MAX_PAYLOAD_BYTES || packet_len != level) {
-                break;
-            }
-            take = packet_len;
+        // Later iterations with a sub-fragment level mean the next fragment is
+        // still arriving. The first iteration may legitimately read a short
+        // control packet (or the remaining bytes reported by the FIFO).
+        if (drained > 0 && level < APP_FLRC_MAX_PAYLOAD_BYTES) {
+            break;
         }
+        uint16_t take = (level >= APP_FLRC_MAX_PAYLOAD_BYTES)
+                            ? APP_FLRC_MAX_PAYLOAD_BYTES : level;
         ral_flrc_rx_pkt_status_t pkt_status = {};
 
         smtc_modem_hal_protect_api_call();
