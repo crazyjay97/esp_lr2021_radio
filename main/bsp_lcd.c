@@ -44,6 +44,39 @@ static bsp_lcd_capture_cb_t s_capture_cb;
 static void *s_capture_user;
 
 typedef struct {
+    uint32_t sequence;
+    uint32_t period_us;
+    uint32_t total_us;
+    uint32_t flush_count;
+    uint32_t pixel_count;
+    uint32_t swap_us;
+    uint32_t submit_us;
+    uint32_t xfer_us;
+} lcd_refresh_stats_t;
+
+typedef struct {
+    int64_t submit_start_us;
+    bool is_last;
+} lcd_flush_pending_t;
+
+#define LCD_STATS_PENDING_MAX 16U
+
+static portMUX_TYPE s_lcd_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+static int64_t s_lcd_refresh_start_us;
+static int64_t s_lcd_last_refresh_done_us;
+static int64_t s_lcd_last_xfer_done_us;
+static uint32_t s_lcd_refresh_flush_count;
+static uint32_t s_lcd_refresh_pixel_count;
+static uint32_t s_lcd_refresh_swap_us;
+static uint32_t s_lcd_refresh_submit_us;
+static uint32_t s_lcd_refresh_xfer_us;
+static lcd_flush_pending_t s_lcd_pending[LCD_STATS_PENDING_MAX];
+static uint32_t s_lcd_pending_head;
+static uint32_t s_lcd_pending_tail;
+static uint32_t s_lcd_pending_count;
+static lcd_refresh_stats_t s_lcd_refresh_ready;
+
+typedef struct {
     uint8_t cmd;
     const uint8_t *data;
     uint8_t len;
@@ -163,6 +196,44 @@ static bool lvgl_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
 {
     (void)panel_io;
     (void)edata;
+    const int64_t done_us = esp_timer_get_time();
+
+    portENTER_CRITICAL_ISR(&s_lcd_stats_mux);
+    if (s_lcd_pending_count > 0) {
+        const lcd_flush_pending_t pending = s_lcd_pending[s_lcd_pending_head];
+        s_lcd_pending_head = (s_lcd_pending_head + 1U) % LCD_STATS_PENDING_MAX;
+        s_lcd_pending_count--;
+
+        int64_t xfer_start_us = pending.submit_start_us;
+        if (s_lcd_last_xfer_done_us > xfer_start_us) {
+            xfer_start_us = s_lcd_last_xfer_done_us;
+        }
+        if (done_us >= xfer_start_us) {
+            s_lcd_refresh_xfer_us += (uint32_t)(done_us - xfer_start_us);
+        }
+        s_lcd_last_xfer_done_us = done_us;
+
+        if (pending.is_last && s_lcd_refresh_flush_count > 0) {
+            s_lcd_refresh_ready.sequence++;
+            s_lcd_refresh_ready.period_us = s_lcd_last_refresh_done_us > 0
+                                                ? (uint32_t)(done_us - s_lcd_last_refresh_done_us)
+                                                : 0;
+            s_lcd_refresh_ready.total_us = (uint32_t)(done_us - s_lcd_refresh_start_us);
+            s_lcd_refresh_ready.flush_count = s_lcd_refresh_flush_count;
+            s_lcd_refresh_ready.pixel_count = s_lcd_refresh_pixel_count;
+            s_lcd_refresh_ready.swap_us = s_lcd_refresh_swap_us;
+            s_lcd_refresh_ready.submit_us = s_lcd_refresh_submit_us;
+            s_lcd_refresh_ready.xfer_us = s_lcd_refresh_xfer_us;
+            s_lcd_last_refresh_done_us = done_us;
+            s_lcd_refresh_flush_count = 0;
+            s_lcd_refresh_pixel_count = 0;
+            s_lcd_refresh_swap_us = 0;
+            s_lcd_refresh_submit_us = 0;
+            s_lcd_refresh_xfer_us = 0;
+        }
+    }
+    portEXIT_CRITICAL_ISR(&s_lcd_stats_mux);
+
     lv_disp_flush_ready((lv_disp_drv_t *)user_ctx);
     return false;
 }
@@ -182,19 +253,73 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
         lv_disp_flush_ready(drv);
         return;
     }
+    const int64_t flush_start_us = esp_timer_get_time();
     uint32_t pixel_count = (area->x2 - area->x1 + 1) * (area->y2 - area->y1 + 1);
+    const bool is_last = lv_disp_flush_is_last(drv);
+
+    portENTER_CRITICAL(&s_lcd_stats_mux);
+    if (s_lcd_refresh_flush_count == 0) {
+        s_lcd_refresh_start_us = flush_start_us;
+    }
+    s_lcd_refresh_flush_count++;
+    s_lcd_refresh_pixel_count += pixel_count;
+    portEXIT_CRITICAL(&s_lcd_stats_mux);
+
     uint16_t *px = (uint16_t *)color_map;
     for (uint32_t i = 0; i < pixel_count; i++) {
         px[i] = (px[i] >> 8) | (px[i] << 8);
     }
+    const int64_t swap_done_us = esp_timer_get_time();
+    const int64_t submit_start_us = swap_done_us;
+
+    portENTER_CRITICAL(&s_lcd_stats_mux);
+    s_lcd_refresh_swap_us += (uint32_t)(swap_done_us - flush_start_us);
+    s_lcd_pending[s_lcd_pending_tail].submit_start_us = submit_start_us;
+    s_lcd_pending[s_lcd_pending_tail].is_last = is_last;
+    s_lcd_pending_tail = (s_lcd_pending_tail + 1U) % LCD_STATS_PENDING_MAX;
+    s_lcd_pending_count++;
+    portEXIT_CRITICAL(&s_lcd_stats_mux);
+
     esp_err_t err = lcd_draw_rgb565_bitmap(area->x1, area->y1,
                                            area->x2 + 1, area->y2 + 1,
                                            (const uint16_t *)color_map);
+    const int64_t submit_done_us = esp_timer_get_time();
+
+    portENTER_CRITICAL(&s_lcd_stats_mux);
+    s_lcd_refresh_submit_us += (uint32_t)(submit_done_us - submit_start_us);
+    portEXIT_CRITICAL(&s_lcd_stats_mux);
+
     if (err != ESP_OK) {
+        portENTER_CRITICAL(&s_lcd_stats_mux);
+        s_lcd_refresh_flush_count = 0;
+        s_lcd_refresh_pixel_count = 0;
+        s_lcd_refresh_swap_us = 0;
+        s_lcd_refresh_submit_us = 0;
+        s_lcd_refresh_xfer_us = 0;
+        if (s_lcd_pending_count > 0) {
+            s_lcd_pending_tail = (s_lcd_pending_tail + LCD_STATS_PENDING_MAX - 1U) %
+                                 LCD_STATS_PENDING_MAX;
+            s_lcd_pending_count--;
+        }
+        portEXIT_CRITICAL(&s_lcd_stats_mux);
         ESP_LOGE(TAG, "lvgl flush failed: %s", esp_err_to_name(err));
         lv_disp_flush_ready(drv);
         return;
     }
+}
+
+static bool lcd_refresh_stats_take(uint32_t *last_sequence,
+                                   lcd_refresh_stats_t *stats)
+{
+    bool updated = false;
+    portENTER_CRITICAL(&s_lcd_stats_mux);
+    if (s_lcd_refresh_ready.sequence != *last_sequence) {
+        *stats = s_lcd_refresh_ready;
+        *last_sequence = stats->sequence;
+        updated = true;
+    }
+    portEXIT_CRITICAL(&s_lcd_stats_mux);
+    return updated;
 }
 
 static esp_err_t touch_reset(void)
@@ -407,6 +532,7 @@ static esp_err_t lvgl_create_camera_ui(void)
 static void lvgl_task(void *arg)
 {
     (void)arg;
+    uint32_t last_lcd_stats_sequence = 0;
     while (true) {
         if (s_lvgl_lock) {
             xSemaphoreTakeRecursive(s_lvgl_lock, portMAX_DELAY);
@@ -414,6 +540,25 @@ static void lvgl_task(void *arg)
         lv_timer_handler();
         if (s_lvgl_lock) {
             xSemaphoreGiveRecursive(s_lvgl_lock);
+        }
+
+        lcd_refresh_stats_t stats = {0};
+        if (lcd_refresh_stats_take(&last_lcd_stats_sequence, &stats) &&
+            stats.pixel_count >= (APP_LCD_H_RES * APP_LCD_V_RES) / 2U) {
+            const uint32_t idle_us = stats.total_us > stats.xfer_us
+                                         ? stats.total_us - stats.xfer_us
+                                         : 0;
+            ESP_LOGI(TAG,
+                     "[LCD] period=%luus total=%luus flushes=%lu pixels=%lu "
+                     "swap=%luus submit=%luus xfer=%luus idle=%luus",
+                     (unsigned long)stats.period_us,
+                     (unsigned long)stats.total_us,
+                     (unsigned long)stats.flush_count,
+                     (unsigned long)stats.pixel_count,
+                     (unsigned long)stats.swap_us,
+                     (unsigned long)stats.submit_us,
+                     (unsigned long)stats.xfer_us,
+                     (unsigned long)idle_us);
         }
         vTaskDelay(pdMS_TO_TICKS(APP_LCD_LVGL_TASK_DELAY_MS));
     }
