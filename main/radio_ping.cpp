@@ -47,6 +47,14 @@ constexpr uint8_t kPacketTypeImageCmdAck = 11;
 constexpr uint8_t kPacketTypeVbat = 12;
 constexpr uint16_t kHeaderSize = 14;
 
+// Continuous-stream fast path. The gateway places the next session in bytes
+// 12..13 of the previous frame's final empty-missing ACK. The node holds that
+// session until the old capture task has released its busy state.
+std::atomic<bool> s_image_stream_active{false};
+std::atomic<uint16_t> s_chained_capture_session{0};
+std::atomic<uint16_t> s_image_tx_session{0};
+uint16_t s_image_rx_done_next_session = 0;
+
 /* Low-power node battery voltage maintenance cadence and broadcast interval. */
 constexpr uint32_t kVbatLowPowerSampleIntervalMs = 60000;     /* 60 s */
 constexpr uint32_t kVbatBroadcastIntervalMs = 300000;         /* 5 min */
@@ -381,6 +389,17 @@ void RadioPing::task()
             check_image_rx_timeout();
             check_image_rx_abort();
             check_image_capture_request();
+
+            uint16_t chained_session =
+                s_chained_capture_session.load(std::memory_order_acquire);
+            if (chained_session != 0 && !image_tx_active_ && image_capture_cb_ &&
+                image_capture_cb_(chained_session)) {
+                uint16_t expected = chained_session;
+                (void)s_chained_capture_session.compare_exchange_strong(
+                    expected, 0, std::memory_order_acq_rel);
+                ESP_LOGD(TAG, "chained capture accepted: session=%u", chained_session);
+            }
+
             check_image_req_retry();
         }
         ulTaskNotifyTake(pdTRUE, ms_to_ticks_min_1(APP_RADIO_TASK_POLL_MS));
@@ -1200,6 +1219,7 @@ void RadioPing::trigger_image_capture()
     // UI and esp_timer callbacks must never touch the radio state directly.
     // Collapse duplicate triggers into one pending request and wake the radio
     // task; it owns all session teardown, mode changes and ImageCmd TX.
+    s_image_stream_active.store(true, std::memory_order_release);
     image_capture_req_.store(true, std::memory_order_release);
     TaskHandle_t task = task_handle_;
     if (task != nullptr) {
@@ -1211,6 +1231,7 @@ void RadioPing::abort_image_rx()
 {
     // Leaving the page cancels a queued next-frame request as well as the
     // current RX. The radio task performs the actual teardown.
+    s_image_stream_active.store(false, std::memory_order_release);
     image_capture_req_.store(false, std::memory_order_release);
     image_rx_abort_req_.store(true, std::memory_order_release);
     TaskHandle_t task = task_handle_;
@@ -1418,6 +1439,7 @@ void RadioPing::image_tx_task()
         }
 
         image_tx_active_ = true;
+        s_image_tx_session.store(req.session_id, std::memory_order_release);
         image_done_received_ = false;
         image_nack_received_ = false;
         suspended_ = true;
@@ -1514,6 +1536,7 @@ void RadioPing::image_tx_task()
         if (!r_ready) {
             // ESP_LOGW(TAG, "image TX: R not ready, aborting");
             image_tx_active_ = false;
+            s_image_tx_session.store(0, std::memory_order_release);
             suspended_ = false;
             ptt_active_ = was_ptt;
             if (g_low_power_enabled && !is_gateway_ && (cad_wakeup_ms_ != 0 || pir_push_wake_)) {
@@ -1618,6 +1641,7 @@ void RadioPing::image_tx_task()
         }
 
         image_tx_active_ = false;
+        s_image_tx_session.store(0, std::memory_order_release);
         suspended_ = false;
         ptt_active_ = was_ptt;
         // ESP_LOGI(TAG, "image TX finished: session=%u done=%d",
@@ -1914,9 +1938,11 @@ void RadioPing::handle_image_start(uint16_t len)
     // unsolicited/previous-session ImageStart from stopping the new ImageCmd
     // retry and hijacking the first frame.
     if (image_rx_pending_) {
-        uint16_t expected_session = image_xfer_.rx_active()
-                                        ? image_xfer_.rx_session_id()
-                                        : image_req_session_;
+        uint16_t expected_session = image_req_active_
+                                        ? image_req_session_
+                                        : (image_xfer_.rx_active()
+                                               ? image_xfer_.rx_session_id()
+                                               : image_req_session_);
         if (expected_session != 0 && session_id != expected_session) {
             ESP_LOGW(TAG, "ImageStart ignored: session=%u expected=%u",
                      session_id, expected_session);
@@ -2045,6 +2071,11 @@ void RadioPing::handle_image_data(uint16_t len)
 void RadioPing::handle_image_nack()
 {
     uint16_t session_id = get_u16_le(&rx_buf_[6]);
+    uint16_t active_session = s_image_tx_session.load(std::memory_order_acquire);
+    if (active_session == 0 || session_id != active_session) {
+        return;
+    }
+
     uint16_t missing_count = get_u16_le(&rx_buf_[8]);
 
     if (missing_count > APP_IMAGE_NACK_MAX_INDICES) {
@@ -2061,6 +2092,12 @@ void RadioPing::handle_image_nack()
     //          session_id, missing_count, total_received);
     image_nack_received_ = true;
     if (missing_count == 0) {
+        uint16_t next_session = get_u16_le(&rx_buf_[12]);
+        if (next_session != 0 && next_session != session_id) {
+            s_chained_capture_session.store(next_session, std::memory_order_release);
+            ESP_LOGD(TAG, "chained capture queued: current=%u next=%u",
+                     session_id, next_session);
+        }
         image_done_received_ = true;
     }
 }
@@ -2079,6 +2116,30 @@ void RadioPing::handle_image_eot()
 
     // ESP_LOGI(TAG, "RX ImageEOT: session=%u received=%u/%u",
     //          session_id, image_xfer_.rx_received_count(), total_frags);
+
+    // The final ACK may be lost after the gateway has already armed the chained
+    // next session. Re-ACK the completed session with the SAME next-session ID;
+    // otherwise the node would remain in its EOT retry loop while the gateway
+    // waits for the next ImageStart.
+    if (session_id == image_rx_done_session_ &&
+        (!image_rx_pending_ || !image_xfer_.rx_active() ||
+         session_id != image_xfer_.rx_session_id())) {
+        uint8_t pkt[kHeaderSize];
+        std::memcpy(pkt, kMagic, sizeof(kMagic));
+        pkt[4] = kPacketTypeImageNack;
+        pkt[5] = 3;
+        put_u16_le(&pkt[6], session_id);
+        put_u16_le(&pkt[8], 0);
+        put_u16_le(&pkt[10], 0);
+        uint16_t repeated_next =
+            s_image_stream_active.load(std::memory_order_acquire)
+                ? s_image_rx_done_next_session
+                : 0;
+        put_u16_le(&pkt[12], repeated_next);
+        send_single_packet(pkt, kHeaderSize);
+        schedule_rx();
+        return;
+    }
 
     if (!image_rx_pending_) {
         // Already completed — still send ACK so T stops retrying
@@ -2151,9 +2212,18 @@ void RadioPing::handle_image_eot()
         }
     }
 
+    uint16_t next_session = 0;
+    if (missing_count == 0 &&
+        s_image_stream_active.load(std::memory_order_acquire)) {
+        next_session = image_session_id_++;
+        if (image_session_id_ == 0) {
+            image_session_id_ = 1;
+        }
+    }
+
     put_u16_le(&pkt[8], missing_count);
     put_u16_le(&pkt[10], image_xfer_.rx_received_count());
-    pkt[12] = 0; pkt[13] = 0;
+    put_u16_le(&pkt[12], next_session);
 
     for (uint16_t i = 0; i < missing_count; i++) {
         put_u16_le(&pkt[kHeaderSize + i * 2], missing_indices[i]);
@@ -2172,6 +2242,7 @@ void RadioPing::handle_image_eot()
     if (missing_count == 0) {
         image_rx_pending_ = false;
         image_rx_done_session_ = session_id;
+        s_image_rx_done_next_session = next_session;
         uint32_t now_ms = smtc_modem_hal_get_time_in_ms();
         uint32_t transfer_ms = now_ms - image_rx_start_ms_;
         int32_t prepare_delta =
@@ -2187,6 +2258,23 @@ void RadioPing::handle_image_eot()
                  static_cast<unsigned long>(total_ms));
         if (image_rx_complete_cb_) {
             image_rx_complete_cb_(&image_xfer_);
+        }
+
+        // Arm the gateway for the piggybacked session without transmitting an
+        // ImageCmd. If no ImageStart arrives, the existing request retry sends
+        // the same session after one normal 30 ms interval.
+        if (next_session != 0 &&
+            s_image_stream_active.load(std::memory_order_acquire)) {
+            image_req_session_ = next_session;
+            image_req_active_ = true;
+            image_req_next_ms_ = now_ms + APP_IMAGE_REQ_RETRY_INTERVAL_MS;
+            image_req_round_end_ms_ = now_ms + APP_IMAGE_REQ_ROUND_MS;
+            image_cmd_sent_ms_ = now_ms;
+            image_rx_request_ms_ = now_ms;
+            image_rx_pending_ = true;
+            image_rx_last_frag_ms_ = now_ms;
+            ESP_LOGD(TAG, "stream chained: completed=%u next=%u",
+                     session_id, next_session);
         }
     } else {
         // On the RX/NACK hot path — this fires once per retransmit round mid

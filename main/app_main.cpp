@@ -65,15 +65,10 @@ int64_t g_ptt_press_time_us = 0;
 bool g_ptt_held_long = false;
 esp_timer_handle_t g_ptt_timer = nullptr;
 
-// Continuous video stream: one-shot timer that fires the next capture request a
-// short delay after a received JPEG leaves ImageTransfer ownership.
-esp_timer_handle_t g_stream_next_timer = nullptr;
-
 constexpr UBaseType_t kGatewayImageQueueLength = 2;
 constexpr uint32_t kGatewayImageTaskStackBytes = 16384U;
 constexpr UBaseType_t kGatewayImageTaskPriority = 3;
 constexpr BaseType_t kGatewayImageTaskCore = 1;
-constexpr uint32_t kStreamNextFrameDelayMs = 1U;
 
 struct GatewayImageFrame {
     uint8_t *jpeg = nullptr;
@@ -188,7 +183,6 @@ uint8_t load_config_u8(const char *key, uint8_t def)
 }
 
 bool on_image_capture_request(uint16_t session_id);
-void stream_next_frame_cb(void *arg);
 esp_err_t gateway_image_pipeline_init();
 
 void auto_capture_timer_cb(void *arg)
@@ -687,7 +681,8 @@ void image_capture_task(void *arg)
 
     if (!tx_done) {
         // The TX task still owns the JPEG and will finish radio cleanup.
-        // Skip post-TX work that could contend with the active transfer.        ESP_LOGW(TAG, "image tx still active after 30s; skipping post-tx cleanup (tx task finishes on its own)");
+        // Skip post-TX work that could contend with the active transfer.
+        ESP_LOGW(TAG, "image tx still active after 30s; skipping post-tx cleanup (tx task finishes on its own)");
         finish_image_capture_task();
         return;
     }
@@ -812,33 +807,6 @@ void play_audio_clip(const uint8_t *opus_packed, size_t total_len)
     }
     ESP_LOGI(TAG, "audio clip played: %lu frames", static_cast<unsigned long>(frames_played));
     bsp_audio_pa_enable(false);
-}
-
-void schedule_stream_next_frame()
-{
-    if (g_app_mode != AppMode::radio || !ui_gw_stream_active()) return;
-
-    if (!g_stream_next_timer) {
-        const esp_timer_create_args_t args = {
-            .callback = stream_next_frame_cb,
-            .arg = nullptr,
-            .dispatch_method = ESP_TIMER_TASK,
-            .name = "stream_next",
-            .skip_unhandled_events = true,
-        };
-        esp_err_t e = esp_timer_create(&args, &g_stream_next_timer);
-        if (e != ESP_OK) {
-            ESP_LOGE(TAG, "stream timer create failed: %s", esp_err_to_name(e));
-            return;
-        }
-    }
-
-    (void)esp_timer_stop(g_stream_next_timer);
-    esp_err_t e = esp_timer_start_once(
-        g_stream_next_timer, static_cast<uint64_t>(kStreamNextFrameDelayMs) * 1000U);
-    if (e != ESP_OK) {
-        ESP_LOGE(TAG, "stream timer start failed: %s", esp_err_to_name(e));
-    }
 }
 
 void gateway_image_frame_free(GatewayImageFrame *frame)
@@ -986,11 +954,10 @@ esp_err_t gateway_image_pipeline_init()
         g_gateway_image_queue = nullptr;
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "gateway image pipeline: queue=%u core=%d priority=%u next=%lums",
+    ESP_LOGI(TAG, "gateway image pipeline: queue=%u core=%d priority=%u",
              static_cast<unsigned>(kGatewayImageQueueLength),
              static_cast<int>(kGatewayImageTaskCore),
-             static_cast<unsigned>(kGatewayImageTaskPriority),
-             static_cast<unsigned long>(kStreamNextFrameDelayMs));
+             static_cast<unsigned>(kGatewayImageTaskPriority));
     return ESP_OK;
 }
 
@@ -1008,7 +975,6 @@ void on_image_rx_complete(ImageTransfer *xfer)
     if (e != ESP_OK || !frame.jpeg) {
         ESP_LOGE(TAG, "rx_reassemble failed: %d", e);
         xfer->rx_reset();
-        schedule_stream_next_frame();
         return;
     }
 
@@ -1016,8 +982,6 @@ void on_image_rx_complete(ImageTransfer *xfer)
     frame.reassemble_ms = static_cast<uint32_t>(esp_log_timestamp()) -
                           reassemble_start_ms;
     frame.queued_ms = static_cast<uint32_t>(esp_log_timestamp());
-
-    schedule_stream_next_frame();
 
     if (!gateway_image_queue_push(frame)) {
         ESP_LOGE(TAG, "gateway image queue unavailable: drop session=%u",
@@ -1178,18 +1142,6 @@ void on_image_rx_eot_nack(uint16_t missing_count, bool is_first_eot)
 }
 
 // Gateway UI capture callback — triggers remote photo via radio
-
-// Continuous video stream: request the next frame. Runs in the esp_timer task,
-// scheduled by on_image_rx_complete. Re-checks ui_gw_stream_active() so a stream
-// the user just stopped (left the image page) does not fire one extra request.
-void stream_next_frame_cb(void *arg)
-{
-    (void)arg;
-    if (g_app_mode != AppMode::radio) return;
-    if (!ui_gw_stream_active()) return;
-    ESP_LOGI(TAG, "stream: request next frame");
-    g_radio.trigger_image_capture();
-}
 
 bool on_gw_capture(void)
 {
