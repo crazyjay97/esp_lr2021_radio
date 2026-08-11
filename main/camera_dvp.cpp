@@ -524,6 +524,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
                                             uint32_t *out_height,
                                             uint32_t *out_pixelformat)
 {
+    const int64_t t_capture_start = esp_timer_get_time();
     ESP_RETURN_ON_FALSE(out_data && out_len && out_width && out_height && out_pixelformat,
                         ESP_ERR_INVALID_ARG, TAG, "invalid args");
     *out_data = nullptr;
@@ -544,7 +545,9 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
     xQueueReset(capture_sem_);
     s_dvp_ctx.capture_target = s_dvp_ctx.frame_count + 1;
 
+    const int64_t t_wait_start = esp_timer_get_time();
     bool got_frame = xSemaphoreTake(capture_sem_, pdMS_TO_TICKS(5000)) == pdTRUE;
+    const int64_t t_wait_done = esp_timer_get_time();
 
     if (got_frame && s_dvp_ctx.received >= kFrameBytes && s_dvp_ctx.captured_buffer) {
         ESP_LOGD(TAG, "captured frame: %u bytes (skipped %d)",
@@ -552,6 +555,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
 
         // Allocate the downsampled (320x240) output, not the full frame.
         constexpr size_t kOutBytes = APP_IMAGE_OUTPUT_BYTES;
+        const int64_t t_alloc_start = esp_timer_get_time();
         uint8_t *copy = static_cast<uint8_t *>(
             heap_caps_malloc(kOutBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (!copy) {
@@ -562,13 +566,17 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
             ESP_LOGE(TAG, "frame copy alloc failed");
             return ESP_ERR_NO_MEM;
         }
+        const int64_t t_alloc_done = esp_timer_get_time();
+
+        const int64_t t_cache_start = esp_timer_get_time();
         esp_cache_msync((void *)s_dvp_ctx.captured_buffer, kFrameBytes,
                         ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        const int64_t t_cache_done = esp_timer_get_time();
 
         // 2x decimate straight from the DMA buffer into the output buffer. This
         // replaces the old full-frame memcpy: it moves LESS memory than a plain
         // copy (reads half the source, writes a quarter) so it is not extra cost.
-        int64_t t_ds0 = esp_timer_get_time();
+        const int64_t t_downsample_start = esp_timer_get_time();
 #if APP_CAMERA_COLOR_ENABLE
         downsample_yuv422_2x((const uint8_t *)s_dvp_ctx.captured_buffer, copy,
                              APP_CAMERA_SENSOR_WIDTH, APP_CAMERA_SENSOR_HEIGHT);
@@ -576,11 +584,7 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
         downsample_gray_2x((const uint8_t *)s_dvp_ctx.captured_buffer, copy,
                            APP_CAMERA_SENSOR_WIDTH, APP_CAMERA_SENSOR_HEIGHT);
 #endif
-        int64_t t_ds1 = esp_timer_get_time();
-        ESP_LOGD(TAG, "[TIMING] downsample %ux%u -> %ux%u : %lld us",
-                 (unsigned)APP_CAMERA_SENSOR_WIDTH, (unsigned)APP_CAMERA_SENSOR_HEIGHT,
-                 (unsigned)APP_IMAGE_OUTPUT_WIDTH, (unsigned)APP_IMAGE_OUTPUT_HEIGHT,
-                 (long long)(t_ds1 - t_ds0));
+        const int64_t t_downsample_done = esp_timer_get_time();
 
         s_dvp_ctx.captured_buffer = nullptr;
 
@@ -589,6 +593,16 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
         *out_width = APP_IMAGE_OUTPUT_WIDTH;
         *out_height = APP_IMAGE_OUTPUT_HEIGHT;
         *out_pixelformat = kOutputPixelformat;
+        const int64_t t_capture_done = esp_timer_get_time();
+        ESP_LOGI(TAG,
+                 "[CAPTURE] setup=%lldus wait=%lldus alloc=%lldus cache=%lldus "
+                 "downsample=%lldus total=%lldus",
+                 (long long)(t_wait_start - t_capture_start),
+                 (long long)(t_wait_done - t_wait_start),
+                 (long long)(t_alloc_done - t_alloc_start),
+                 (long long)(t_cache_done - t_cache_start),
+                 (long long)(t_downsample_done - t_downsample_start),
+                 (long long)(t_capture_done - t_capture_start));
         return ESP_OK;
     }
 

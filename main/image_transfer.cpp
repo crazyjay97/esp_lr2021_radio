@@ -4,6 +4,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_jpeg_enc.h"
 #include "esp_jpeg_dec.h"
 #include "esp_jpeg_common.h"
@@ -40,12 +41,14 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
                  static_cast<unsigned>(yuv_len), static_cast<unsigned>(expected_len));
         return ESP_ERR_INVALID_SIZE;
     }
+    const int64_t t_encode_start = esp_timer_get_time();
 
     // Swizzle YUV422 to encoder's YCbYCr based on actual pixel format
     static constexpr uint32_t FOURCC_UYVY = 0x59565955;
     static constexpr uint32_t FOURCC_YUYV = 0x56595559;
     static constexpr uint32_t FOURCC_VYUY = 0x59555956;
 
+    const int64_t t_input_alloc_start = esp_timer_get_time();
     uint8_t *enc_input = static_cast<uint8_t *>(
         jpeg_calloc_align(expected_len, 16));
     if (!enc_input) {
@@ -53,7 +56,9 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
                  static_cast<unsigned>(expected_len));
         return ESP_ERR_NO_MEM;
     }
+    const int64_t t_input_alloc_done = esp_timer_get_time();
 
+    const int64_t t_swizzle_start = esp_timer_get_time();
     if (pixfmt == FOURCC_YUYV) {
         // YUYV [Y0, Cb, Y1, Cr] → YCbYCr — already correct order
         memcpy(enc_input, yuv422, expected_len);
@@ -74,6 +79,7 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
             enc_input[i + 3] = yuv422[i + 2]; // Cr
         }
     }
+    const int64_t t_swizzle_done = esp_timer_get_time();
 
     jpeg_enc_config_t enc_cfg = DEFAULT_JPEG_ENC_CONFIG();
     enc_cfg.width = static_cast<int>(width);
@@ -84,13 +90,16 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
     enc_cfg.task_enable = false;
 
     jpeg_enc_handle_t encoder = nullptr;
+    const int64_t t_open_start = esp_timer_get_time();
     jpeg_error_t jerr = jpeg_enc_open(&enc_cfg, &encoder);
+    const int64_t t_open_done = esp_timer_get_time();
     if (jerr != JPEG_ERR_OK || !encoder) {
         ESP_LOGE(TAG, "jpeg_enc_open failed: %d", jerr);
         jpeg_free_align(enc_input);
         return ESP_FAIL;
     }
 
+    const int64_t t_output_alloc_start = esp_timer_get_time();
     uint8_t *jpeg_buf = static_cast<uint8_t *>(
         heap_caps_malloc(APP_IMAGE_MAX_JPEG_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!jpeg_buf) {
@@ -99,19 +108,35 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
         jpeg_free_align(enc_input);
         return ESP_ERR_NO_MEM;
     }
+    const int64_t t_output_alloc_done = esp_timer_get_time();
 
     int out_size = 0;
+    const int64_t t_jpeg_start = esp_timer_get_time();
     jerr = jpeg_enc_process(encoder, enc_input, static_cast<int>(expected_len),
                             jpeg_buf, static_cast<int>(APP_IMAGE_MAX_JPEG_SIZE),
                             &out_size);
+    const int64_t t_jpeg_done = esp_timer_get_time();
+    const int64_t t_cleanup_start = esp_timer_get_time();
     jpeg_enc_close(encoder);
     jpeg_free_align(enc_input);
+    const int64_t t_cleanup_done = esp_timer_get_time();
 
     if (jerr != JPEG_ERR_OK || out_size <= 0) {
         ESP_LOGE(TAG, "jpeg_enc_process failed: %d out_size=%d", jerr, out_size);
         heap_caps_free(jpeg_buf);
         return ESP_FAIL;
     }
+
+    ESP_LOGI(TAG,
+             "[ENCODE] input_alloc=%lldus swizzle=%lldus open=%lldus "
+             "output_alloc=%lldus jpeg=%lldus cleanup=%lldus total=%lldus",
+             (long long)(t_input_alloc_done - t_input_alloc_start),
+             (long long)(t_swizzle_done - t_swizzle_start),
+             (long long)(t_open_done - t_open_start),
+             (long long)(t_output_alloc_done - t_output_alloc_start),
+             (long long)(t_jpeg_done - t_jpeg_start),
+             (long long)(t_cleanup_done - t_cleanup_start),
+             (long long)(t_cleanup_done - t_encode_start));
 
     // Per-frame encode on the capture hot path — DEBUG to keep the stream quiet.
     ESP_LOGD(TAG, "JPEG encoded: %lux%lu → %d bytes (Q=%d)",
