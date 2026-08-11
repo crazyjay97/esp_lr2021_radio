@@ -891,8 +891,8 @@ void gateway_image_task(void *arg)
         const uint32_t task_start_ms = static_cast<uint32_t>(esp_log_timestamp());
         const uint32_t queue_wait_ms = task_start_ms - frame.queued_ms;
         uint32_t decode_ms = 0;
-        uint32_t display_ms = 0;
-        bool displayed = false;
+        uint32_t compose_ms = 0;
+        bool submitted = false;
 
         jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
         dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
@@ -921,15 +921,15 @@ void gateway_image_task(void *arg)
                     jerr = jpeg_dec_process(decoder, &io);
                     decode_ms = static_cast<uint32_t>(esp_log_timestamp()) - task_start_ms;
                     if (jerr == JPEG_ERR_OK && ui_gw_stream_active()) {
-                        const uint32_t display_start_ms =
+                        const uint32_t compose_start_ms =
                             static_cast<uint32_t>(esp_log_timestamp());
                         ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565),
                                           header.width, header.height,
                                           static_cast<uint32_t>(frame.jpeg_len),
                                           frame.transfer_ms);
-                        display_ms = static_cast<uint32_t>(esp_log_timestamp()) -
-                                     display_start_ms;
-                        displayed = true;
+                        compose_ms = static_cast<uint32_t>(esp_log_timestamp()) -
+                                     compose_start_ms;
+                        submitted = true;
                     }
                 } else {
                     ESP_LOGE(TAG, "gateway RGB565 alloc failed: %d bytes", outbuf_len);
@@ -944,15 +944,15 @@ void gateway_image_task(void *arg)
         }
         gateway_image_frame_free(&frame);
 
-        if (displayed) {
+        if (submitted) {
             const uint32_t now_ms = static_cast<uint32_t>(esp_log_timestamp());
             const uint32_t period_ms = last_frame_ms ? now_ms - last_frame_ms : 0;
             last_frame_ms = now_ms;
-            const uint32_t consume_ms = frame.reassemble_ms + decode_ms + display_ms;
+            const uint32_t consume_ms = frame.reassemble_ms + decode_ms + compose_ms;
             if (period_ms > 0) {
                 ESP_LOGI(TAG,
                          "[FRAME] period=%lums (%lu.%lu fps) | transfer=%lums "
-                         "consume=%lums (queue=%lu reassemble=%lu decode=%lu display=%lu) "
+                         "consume=%lums (queue=%lu reassemble=%lu decode=%lu compose=%lu) "
                          "jpeg=%u frags=%u",
                          (unsigned long)period_ms,
                          (unsigned long)(1000U / period_ms),
@@ -962,7 +962,7 @@ void gateway_image_task(void *arg)
                          (unsigned long)queue_wait_ms,
                          (unsigned long)frame.reassemble_ms,
                          (unsigned long)decode_ms,
-                         (unsigned long)display_ms,
+                         (unsigned long)compose_ms,
                          static_cast<unsigned>(frame.jpeg_len), frame.fragments);
             }
         }

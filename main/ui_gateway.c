@@ -67,6 +67,8 @@ static uint8_t gw_nvs_load_u8(const char *key, uint8_t def)
 #define BOTTOM_H    28
 #define SCR_W       240
 #define SCR_H       320
+#define IMG_W       240
+#define IMG_H       320
 
 /* ─── State ─── */
 static ui_page_t s_page = UI_PAGE_IMAGE;
@@ -104,6 +106,20 @@ static lv_obj_t *s_bottom_lbl_r = NULL;
 /* PAGE_IMAGE objects */
 static lv_obj_t *s_img_canvas = NULL;
 static lv_color_t *s_img_canvas_buf = NULL;
+static lv_color_t *s_img_canvas_back_buf = NULL;
+static lv_color_t *s_img_canvas_pending_buf = NULL;
+static lv_timer_t *s_img_present_timer = NULL;
+static portMUX_TYPE s_img_canvas_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_img_canvas_writing = false;
+static bool s_img_buffers_initialized = false;
+
+typedef struct {
+    uint32_t jpeg_size;
+    uint32_t elapsed_ms;
+    int16_t rssi;
+} img_present_meta_t;
+
+static img_present_meta_t s_img_pending_meta = {0};
 static lv_obj_t *s_img_placeholder = NULL;
 static lv_obj_t *s_img_time_lbl = NULL;
 static lv_obj_t *s_img_info_lbl = NULL;
@@ -185,6 +201,30 @@ static void update_title(const char *text, const char *chip, lv_color_t chip_bg)
 static lv_color_t vbat_level_color(uint16_t mv);
 static void gw_vbat_refresh(void);
 static void gw_vbat_timer_cb(lv_timer_t *t);
+static void image_present_timer_cb(lv_timer_t *t);
+
+static lv_color_t *alloc_image_canvas_buffer(size_t pixels)
+{
+    lv_color_t *buf = heap_caps_malloc(pixels * sizeof(lv_color_t),
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = heap_caps_malloc(pixels * sizeof(lv_color_t), MALLOC_CAP_8BIT);
+    }
+    return buf;
+}
+
+static void rotate_rgb565_to_canvas(const uint16_t *src, lv_color_t *dst)
+{
+    for (int out_y = 0; out_y < IMG_H; out_y++) {
+        for (int out_x = 0; out_x < IMG_W; out_x++) {
+            uint16_t px = src[(239 - out_x) * 320 + out_y];
+            dst[out_y * IMG_W + out_x].full =
+                (uint16_t)(((px & 0x001FU) << 11) |
+                           (px & 0x07E0U) |
+                           ((px & 0xF800U) >> 11));
+        }
+    }
+}
 
 /* PLACEHOLDER_IMPL */
 
@@ -348,24 +388,20 @@ static lv_obj_t *create_kv_row(lv_obj_t *parent, const char *key, const char *va
 /* ─── PAGE: Image (Home) ─── */
 static void create_image_page(void)
 {
-    #undef IMG_W
-    #undef IMG_H
-    #define IMG_W 240
-    #define IMG_H 320
     const size_t canvas_pixels = IMG_W * IMG_H;
 
     if (!s_img_canvas_buf) {
-        s_img_canvas_buf = heap_caps_malloc(canvas_pixels * sizeof(lv_color_t),
-                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!s_img_canvas_buf) {
-            s_img_canvas_buf = heap_caps_malloc(canvas_pixels * sizeof(lv_color_t),
-                                                MALLOC_CAP_8BIT);
+        s_img_canvas_buf = alloc_image_canvas_buffer(canvas_pixels);
+    }
+    if (!s_img_canvas_back_buf) {
+        s_img_canvas_back_buf = alloc_image_canvas_buffer(canvas_pixels);
+    }
+    if (s_img_canvas_buf && !s_img_buffers_initialized) {
+        memset(s_img_canvas_buf, 0, canvas_pixels * sizeof(lv_color_t));
+        if (s_img_canvas_back_buf) {
+            memset(s_img_canvas_back_buf, 0, canvas_pixels * sizeof(lv_color_t));
         }
-        if (s_img_canvas_buf) {
-            for (size_t i = 0; i < canvas_pixels; i++) {
-                s_img_canvas_buf[i] = lv_color_hex(0x000000);
-            }
-        }
+        s_img_buffers_initialized = true;
     }
 
     if (s_has_image && s_img_canvas_buf) {
@@ -1061,6 +1097,9 @@ esp_err_t ui_gw_init(void)
     lv_obj_add_event_cb(s_scr, gesture_cb, LV_EVENT_GESTURE, NULL);
     lv_obj_clear_flag(s_scr, LV_OBJ_FLAG_GESTURE_BUBBLE);
     show_page(UI_PAGE_IMAGE);
+    if (!s_img_present_timer) {
+        s_img_present_timer = lv_timer_create(image_present_timer_cb, 1, NULL);
+    }
 
     /* Read our own supply voltage once at boot, then refresh every minute.
      * Force a fresh read here so the bar isn't blank until the 15 s background
@@ -1237,58 +1276,97 @@ void ui_gw_rx_progress(uint16_t received, uint16_t total, int16_t rssi)
 
 /* PLACEHOLDER_RX_COMPLETE */
 
+static void image_present_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+
+    lv_color_t *pending = NULL;
+    img_present_meta_t meta = {0};
+
+    portENTER_CRITICAL(&s_img_canvas_mux);
+    if (!s_img_canvas_writing && s_img_canvas_pending_buf) {
+        pending = s_img_canvas_pending_buf;
+        s_img_canvas_pending_buf = NULL;
+        meta = s_img_pending_meta;
+
+        lv_color_t *old_front = s_img_canvas_buf;
+        s_img_canvas_buf = pending;
+        s_img_canvas_back_buf = old_front;
+    }
+    portEXIT_CRITICAL(&s_img_canvas_mux);
+
+    if (!pending) return;
+
+    s_link_rssi = meta.rssi;
+    s_link_elapsed_ms = meta.elapsed_ms;
+    s_link_jpeg_size = meta.jpeg_size;
+    s_link_rate = meta.elapsed_ms > 0
+                      ? (uint32_t)((uint64_t)meta.jpeg_size * 8000 / meta.elapsed_ms)
+                      : 0;
+    s_has_image = true;
+
+    if (!s_stream_mode) return;
+
+    if (s_page == UI_PAGE_IMAGE && s_img_canvas) {
+        lv_canvas_set_buffer(s_img_canvas, s_img_canvas_buf, IMG_W, IMG_H,
+                             LV_IMG_CF_TRUE_COLOR);
+        lv_obj_invalidate(s_img_canvas);
+    } else {
+        show_page(UI_PAGE_IMAGE);
+    }
+    s_stream_first_shown = true;
+}
+
 void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
                        uint32_t jpeg_size, uint32_t elapsed_ms)
 {
-    if (!s_lock) return;
+    if (!s_lock || !rgb565 || w != 320 || h != 240 || !s_img_canvas_buf) return;
+
+    if (s_img_canvas_back_buf) {
+        lv_color_t *render_buf = NULL;
+
+        portENTER_CRITICAL(&s_img_canvas_mux);
+        if (!s_img_canvas_writing) {
+            render_buf = s_img_canvas_back_buf;
+            s_img_canvas_pending_buf = NULL;
+            s_img_canvas_writing = true;
+        }
+        portEXIT_CRITICAL(&s_img_canvas_mux);
+
+        if (!render_buf) return;
+
+        /* 后台缓冲完成旋转和换色，LVGL 刷新期间不再阻塞图像处理任务。 */
+        rotate_rgb565_to_canvas(rgb565, render_buf);
+
+        portENTER_CRITICAL(&s_img_canvas_mux);
+        s_img_pending_meta.jpeg_size = jpeg_size;
+        s_img_pending_meta.elapsed_ms = elapsed_ms;
+        s_img_pending_meta.rssi = s_rx_last_rssi;
+        s_img_canvas_pending_buf = render_buf;
+        s_img_canvas_writing = false;
+        portEXIT_CRITICAL(&s_img_canvas_mux);
+
+        return;
+    }
+
+    /* PSRAM 不足时保留单缓冲兼容路径，功能不丢失。 */
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+    rotate_rgb565_to_canvas(rgb565, s_img_canvas_buf);
 
     s_link_rssi = s_rx_last_rssi;
     s_link_elapsed_ms = elapsed_ms;
     s_link_jpeg_size = jpeg_size;
-    if (elapsed_ms > 0) {
-        s_link_rate = (uint32_t)((uint64_t)jpeg_size * 8000 / elapsed_ms);
-    } else {
-        s_link_rate = 0;
-    }
+    s_link_rate = elapsed_ms > 0
+                      ? (uint32_t)((uint64_t)jpeg_size * 8000 / elapsed_ms)
+                      : 0;
+    s_has_image = true;
 
-    /* Rotate decoded RGB565 90° CW into 240x320 canvas (+ R↔B swap for BGR panel).
-     * Node now sends 320x240, so no scaling needed — direct rotate from decode output. */
-    if (s_img_canvas_buf && rgb565 && w > 0 && h > 0) {
-        const uint16_t *src = rgb565;
-        // Expect 320x240 input; if dimension mismatch just skip to avoid out-of-bounds.
-        if (w == 320 && h == 240) {
-            for (int out_y = 0; out_y < IMG_H; out_y++) {
-                for (int out_x = 0; out_x < IMG_W; out_x++) {
-                    // Rotate 90° CW: output[out_y, out_x] = input[239 - out_x, out_y]
-                    uint16_t px = src[(239 - out_x) * 320 + out_y];
-                    uint16_t r = (px >> 11) & 0x1F;
-                    uint16_t g = (px >> 5) & 0x3F;
-                    uint16_t b = px & 0x1F;
-                    s_img_canvas_buf[out_y * IMG_W + out_x].full = (b << 11) | (g << 5) | r;
-                }
-            }
-        }
-        s_has_image = true;
-    }
-
-    // If already showing the image page with a live canvas (stream frames 2+),
-    // just repaint the canvas in place — rebuilding the whole page every frame
-    // flickers and is slow. Otherwise build the image page (first frame / after
-    // being on another page).
     if (s_page == UI_PAGE_IMAGE && s_img_canvas) {
         lv_obj_invalidate(s_img_canvas);
     } else {
         show_page(UI_PAGE_IMAGE);
     }
-    /* Only mark dirty; the LVGL task flushes to the panel asynchronously on core
-     * 1. In the gateway-driven pull model this is deliberate: the paint overlaps
-     * the next frame's ~210ms transfer and finishes long before it arrives, so
-     * the display never gates the frame rate. Forcing a synchronous lv_refr_now
-     * here would push the flush onto the per-frame critical path and slow the
-     * stream for no benefit. */
     s_stream_first_shown = true;
-
     xSemaphoreGiveRecursive(s_lock);
 }
 

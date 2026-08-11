@@ -157,6 +157,24 @@ static esp_err_t lcd_draw_rgb565_bitmap(uint32_t x0, uint32_t y0,
     return esp_lcd_panel_draw_bitmap(s_lcd_panel, x0, y0, x1, y1, pixels);
 }
 
+static bool lvgl_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
+                                esp_lcd_panel_io_event_data_t *edata,
+                                void *user_ctx)
+{
+    (void)panel_io;
+    (void)edata;
+    lv_disp_flush_ready((lv_disp_drv_t *)user_ctx);
+    return false;
+}
+
+static esp_err_t lvgl_register_flush_ready_cb(lv_disp_drv_t *drv)
+{
+    const esp_lcd_panel_io_callbacks_t callbacks = {
+        .on_color_trans_done = lvgl_flush_ready_cb,
+    };
+    return esp_lcd_panel_io_register_event_callbacks(s_lcd_io, &callbacks, drv);
+}
+
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
                           lv_color_t *color_map)
 {
@@ -177,7 +195,6 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
         lv_disp_flush_ready(drv);
         return;
     }
-    lv_disp_flush_ready(drv);
 }
 
 static esp_err_t touch_reset(void)
@@ -614,6 +631,8 @@ esp_err_t bsp_lcd_start_lvgl_demo(void)
     disp_drv.draw_buf = &draw_buf;
     s_lvgl_disp_drv = &disp_drv;
     lv_disp_drv_register(&disp_drv);
+    ESP_RETURN_ON_ERROR(lvgl_register_flush_ready_cb(&disp_drv), TAG,
+                        "register LVGL flush callback");
 
     esp_err_t touch_err = touch_attach();
     if (touch_err == ESP_OK) {
@@ -699,6 +718,8 @@ esp_err_t bsp_lcd_start_camera_ui(bsp_lcd_capture_cb_t cb, void *user)
     disp_drv.draw_buf = &draw_buf;
     s_lvgl_disp_drv = &disp_drv;
     lv_disp_drv_register(&disp_drv);
+    ESP_RETURN_ON_ERROR(lvgl_register_flush_ready_cb(&disp_drv), TAG,
+                        "register LVGL flush callback");
 
     esp_err_t touch_err = touch_attach();
     if (touch_err == ESP_OK) {
@@ -785,6 +806,8 @@ esp_err_t bsp_lcd_start_gateway_ui(void)
     disp_drv_gw.draw_buf = &draw_buf_gw;
     s_lvgl_disp_drv = &disp_drv_gw;
     lv_disp_drv_register(&disp_drv_gw);
+    ESP_RETURN_ON_ERROR(lvgl_register_flush_ready_cb(&disp_drv_gw), TAG,
+                        "register LVGL flush callback");
 
     esp_err_t touch_err = touch_attach();
     if (touch_err == ESP_OK) {
