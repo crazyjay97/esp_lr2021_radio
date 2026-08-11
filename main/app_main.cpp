@@ -470,18 +470,34 @@ static uint8_t *prepare_jpeg_blob(size_t *out_len)
     uint8_t *frame = nullptr;
     size_t len = 0;
     uint32_t width = 0, height = 0, pixfmt = 0;
+    const uint32_t prepare_start_ms = static_cast<uint32_t>(esp_log_timestamp());
     esp_err_t capture_e = g_camera_uart.capture_frame(&frame, &len, &width, &height, &pixfmt);
+    const uint32_t capture_done_ms = static_cast<uint32_t>(esp_log_timestamp());
     if (capture_e != ESP_OK || !frame) {
+        ESP_LOGW(TAG, "[PREFETCH] capture failed after %lums: %s",
+                 static_cast<unsigned long>(capture_done_ms - prepare_start_ms),
+                 esp_err_to_name(capture_e));
         return nullptr;
     }
     uint8_t *jpeg = nullptr;
     size_t jpeg_len = 0;
     esp_err_t e = g_radio.image_xfer().encode_frame(frame, len, width, height, pixfmt,
                                                     &jpeg, &jpeg_len);
+    const uint32_t encode_done_ms = static_cast<uint32_t>(esp_log_timestamp());
     heap_caps_free(frame);
     if (e != ESP_OK || !jpeg) {
+        ESP_LOGW(TAG, "[PREFETCH] encode failed: capture=%lums encode=%lums error=%s",
+                 static_cast<unsigned long>(capture_done_ms - prepare_start_ms),
+                 static_cast<unsigned long>(encode_done_ms - capture_done_ms),
+                 esp_err_to_name(e));
         return nullptr;
     }
+    ESP_LOGI(TAG,
+             "[PREFETCH] capture=%lums encode=%lums total=%lums raw=%u jpeg=%u",
+             static_cast<unsigned long>(capture_done_ms - prepare_start_ms),
+             static_cast<unsigned long>(encode_done_ms - capture_done_ms),
+             static_cast<unsigned long>(encode_done_ms - prepare_start_ms),
+             static_cast<unsigned>(len), static_cast<unsigned>(jpeg_len));
     *out_len = jpeg_len;
     return jpeg;
 }
@@ -735,7 +751,7 @@ bool on_image_capture_request(uint16_t session_id)
             // spawning another capture or clearing the active wake guard.
             return true;
         }
-        ESP_LOGW(TAG, "ImageCmd ignored: capture busy (session=%u active=%u)",
+        ESP_LOGD(TAG, "capture busy: queued session=%u active=%u",
                  session_id, active_session);
         return false;
     }
