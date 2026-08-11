@@ -15,6 +15,7 @@ idf_component_register(SRCS
                            "bsp_audio.c"
                            "bsp_button.c"
                            "bsp_vbat.c"
+                           "spi_psram_dma_wrap.c"
                        INCLUDE_DIRS "."
                        REQUIRES
                            lierda-iot__esp_lora_driver
@@ -36,3 +37,8 @@ idf_component_register(SRCS
                            wifi_provisioning
                            protocomm
                            esp_http_server)
+
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+                      "-Wl,--wrap=spi_device_queue_trans")
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+                      "-u __wrap_spi_device_queue_trans")

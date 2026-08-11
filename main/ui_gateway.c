@@ -205,10 +205,12 @@ static void image_present_timer_cb(lv_timer_t *t);
 
 static lv_color_t *alloc_image_canvas_buffer(size_t pixels)
 {
-    lv_color_t *buf = heap_caps_malloc(pixels * sizeof(lv_color_t),
-                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t bytes = pixels * sizeof(lv_color_t);
+    lv_color_t *buf = heap_caps_aligned_alloc(
+        64U, bytes,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     if (!buf) {
-        buf = heap_caps_malloc(pixels * sizeof(lv_color_t), MALLOC_CAP_8BIT);
+        buf = heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
     }
     return buf;
 }
@@ -415,6 +417,9 @@ static void create_image_page(void)
         lv_canvas_set_buffer(s_img_canvas, s_img_canvas_buf, IMG_W, IMG_H,
                              LV_IMG_CF_TRUE_COLOR);
         lv_obj_set_pos(s_img_canvas, 0, 0);
+        if (s_stream_mode) {
+            lv_obj_add_flag(s_img_canvas, LV_OBJ_FLAG_HIDDEN);
+        }
     } else {
         lv_obj_clear_flag(s_status_bar, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(s_title_bar, LV_OBJ_FLAG_HIDDEN);
@@ -1307,12 +1312,30 @@ static void image_present_timer_cb(lv_timer_t *t)
 
     if (!s_stream_mode) return;
 
-    if (s_page == UI_PAGE_IMAGE && s_img_canvas) {
-        lv_canvas_set_buffer(s_img_canvas, s_img_canvas_buf, IMG_W, IMG_H,
-                             LV_IMG_CF_TRUE_COLOR);
-        lv_obj_invalidate(s_img_canvas);
-    } else {
+    bool page_changed = false;
+    if (s_page != UI_PAGE_IMAGE || !s_img_canvas) {
         show_page(UI_PAGE_IMAGE);
+        page_changed = true;
+    }
+    if (s_img_canvas && !lv_obj_has_flag(s_img_canvas, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_add_flag(s_img_canvas, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_invalidate(s_body);
+        page_changed = true;
+    }
+    if (page_changed) {
+        lv_refr_now(NULL);
+    }
+
+    esp_err_t err = bsp_lcd_present_video_frame(
+        (const uint16_t *)s_img_canvas_buf, IMG_W, IMG_H);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "direct video present failed: %s", esp_err_to_name(err));
+        if (s_img_canvas) {
+            lv_canvas_set_buffer(s_img_canvas, s_img_canvas_buf, IMG_W, IMG_H,
+                                 LV_IMG_CF_TRUE_COLOR);
+            lv_obj_clear_flag(s_img_canvas, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_invalidate(s_img_canvas);
+        }
     }
     s_stream_first_shown = true;
 }

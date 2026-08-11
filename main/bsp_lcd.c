@@ -17,6 +17,7 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "esp_timer.h"
 #include "lvgl.h"
 
@@ -37,6 +38,8 @@ static i2c_master_dev_handle_t s_touch;
 static uint8_t s_touch_addr;
 static lv_disp_drv_t *s_lvgl_disp_drv;
 static SemaphoreHandle_t s_lvgl_lock;
+static SemaphoreHandle_t s_video_frame_done;
+static volatile bool s_video_frame_inflight;
 static lv_obj_t *s_camera_status_label;
 static lv_obj_t *s_camera_canvas;
 static lv_color_t *s_camera_canvas_buf;
@@ -196,6 +199,15 @@ static bool lvgl_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
 {
     (void)panel_io;
     (void)edata;
+    BaseType_t task_awoken = pdFALSE;
+    if (s_video_frame_inflight) {
+        s_video_frame_inflight = false;
+        if (s_video_frame_done) {
+            xSemaphoreGiveFromISR(s_video_frame_done, &task_awoken);
+        }
+        return task_awoken == pdTRUE;
+    }
+
     const int64_t done_us = esp_timer_get_time();
 
     portENTER_CRITICAL_ISR(&s_lcd_stats_mux);
@@ -265,10 +277,6 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
     s_lcd_refresh_pixel_count += pixel_count;
     portEXIT_CRITICAL(&s_lcd_stats_mux);
 
-    uint16_t *px = (uint16_t *)color_map;
-    for (uint32_t i = 0; i < pixel_count; i++) {
-        px[i] = (px[i] >> 8) | (px[i] << 8);
-    }
     const int64_t swap_done_us = esp_timer_get_time();
     const int64_t submit_start_us = swap_done_us;
 
@@ -609,6 +617,7 @@ esp_err_t bsp_lcd_init(void)
     esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = -1,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
+        .data_endian = LCD_RGB_DATA_ENDIAN_LITTLE,
         .bits_per_pixel = 16,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(s_lcd_io, &panel_cfg, &s_lcd_panel),
@@ -709,7 +718,7 @@ esp_err_t bsp_lcd_show_test_pattern(void)
     }
 
     static const uint16_t colors[] = {
-        0x00f8, 0xe007, 0x1f00, 0xe0ff, 0xff07, 0x1ff8, 0xffff, 0x0000,
+        0xf800, 0x07e0, 0x001f, 0xffe0, 0x07ff, 0xf81f, 0xffff, 0x0000,
     };
     for (uint32_t y = 0; y < APP_LCD_V_RES; y += rows) {
         uint32_t draw_rows = APP_LCD_V_RES - y;
@@ -996,6 +1005,52 @@ esp_err_t bsp_lcd_start_gateway_ui(void)
 SemaphoreHandle_t bsp_lcd_get_lvgl_lock(void)
 {
     return s_lvgl_lock;
+}
+
+esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
+                                      uint32_t width,
+                                      uint32_t height)
+{
+    ESP_RETURN_ON_FALSE(s_lcd_ready && rgb565, ESP_ERR_INVALID_STATE, TAG,
+                        "lcd not ready");
+    ESP_RETURN_ON_FALSE(width == APP_LCD_H_RES && height == APP_LCD_V_RES,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid video frame size");
+
+    const bool dma_capable = esp_ptr_external_ram(rgb565)
+                                 ? esp_ptr_dma_ext_capable(rgb565)
+                                 : esp_ptr_dma_capable(rgb565);
+    ESP_RETURN_ON_FALSE(dma_capable, ESP_ERR_INVALID_ARG, TAG,
+                        "video frame is not DMA capable");
+    if (!s_video_frame_done) {
+        s_video_frame_done = xSemaphoreCreateBinary();
+        ESP_RETURN_ON_FALSE(s_video_frame_done, ESP_ERR_NO_MEM, TAG,
+                            "video frame semaphore");
+    }
+    ESP_RETURN_ON_FALSE(!s_video_frame_inflight, ESP_ERR_INVALID_STATE, TAG,
+                        "video frame still in flight");
+
+    (void)xSemaphoreTake(s_video_frame_done, 0);
+    s_video_frame_inflight = true;
+    const int64_t start_us = esp_timer_get_time();
+    esp_err_t err = lcd_draw_rgb565_bitmap(0, 0, width, height, rgb565);
+    if (err != ESP_OK) {
+        s_video_frame_inflight = false;
+        return err;
+    }
+
+    if (xSemaphoreTake(s_video_frame_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE(TAG, "video frame transfer timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    const int64_t done_us = esp_timer_get_time();
+    static int64_t last_done_us;
+    ESP_LOGI(TAG, "[LCD] direct period=%lldus total=%lldus pixels=%lu",
+             last_done_us > 0 ? done_us - last_done_us : 0,
+             done_us - start_us,
+             (unsigned long)(width * height));
+    last_done_us = done_us;
+    return ESP_OK;
 }
 
 esp_err_t bsp_lcd_set_camera_status(const char *text)
