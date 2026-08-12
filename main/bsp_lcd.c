@@ -40,6 +40,9 @@ static lv_disp_drv_t *s_lvgl_disp_drv;
 static SemaphoreHandle_t s_lvgl_lock;
 static SemaphoreHandle_t s_video_frame_done;
 static volatile bool s_video_frame_inflight;
+static volatile uint32_t s_video_frame_sequence;
+static volatile uint32_t s_video_frame_done_sequence;
+static volatile int64_t s_video_frame_isr_done_us;
 static lv_obj_t *s_camera_status_label;
 static lv_obj_t *s_camera_canvas;
 static lv_color_t *s_camera_canvas_buf;
@@ -200,15 +203,9 @@ static bool lvgl_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
     (void)panel_io;
     (void)edata;
     BaseType_t task_awoken = pdFALSE;
-    if (s_video_frame_inflight) {
-        s_video_frame_inflight = false;
-        if (s_video_frame_done) {
-            xSemaphoreGiveFromISR(s_video_frame_done, &task_awoken);
-        }
-        return task_awoken == pdTRUE;
-    }
-
     const int64_t done_us = esp_timer_get_time();
+    bool lvgl_flush_done = false;
+    bool video_frame_done = false;
 
     portENTER_CRITICAL_ISR(&s_lcd_stats_mux);
     if (s_lcd_pending_count > 0) {
@@ -243,11 +240,22 @@ static bool lvgl_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
             s_lcd_refresh_submit_us = 0;
             s_lcd_refresh_xfer_us = 0;
         }
+        lvgl_flush_done = true;
+    } else if (s_video_frame_inflight) {
+        s_video_frame_isr_done_us = done_us;
+        s_video_frame_done_sequence = s_video_frame_sequence;
+        s_video_frame_inflight = false;
+        video_frame_done = true;
     }
     portEXIT_CRITICAL_ISR(&s_lcd_stats_mux);
 
-    lv_disp_flush_ready((lv_disp_drv_t *)user_ctx);
-    return false;
+    if (video_frame_done && s_video_frame_done) {
+        xSemaphoreGiveFromISR(s_video_frame_done, &task_awoken);
+    }
+    if (lvgl_flush_done) {
+        lv_disp_flush_ready((lv_disp_drv_t *)user_ctx);
+    }
+    return task_awoken == pdTRUE;
 }
 
 static esp_err_t lvgl_register_flush_ready_cb(lv_disp_drv_t *drv)
@@ -1030,9 +1038,13 @@ esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
                         "video frame still in flight");
 
     (void)xSemaphoreTake(s_video_frame_done, 0);
+    const uint32_t frame_sequence = ++s_video_frame_sequence;
+    s_video_frame_done_sequence = 0;
+    s_video_frame_isr_done_us = 0;
     s_video_frame_inflight = true;
     const int64_t start_us = esp_timer_get_time();
     esp_err_t err = lcd_draw_rgb565_bitmap(0, 0, width, height, rgb565);
+    const int64_t submit_done_us = esp_timer_get_time();
     if (err != ESP_OK) {
         s_video_frame_inflight = false;
         return err;
@@ -1043,13 +1055,39 @@ esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
         return ESP_ERR_TIMEOUT;
     }
 
-    const int64_t done_us = esp_timer_get_time();
-    static int64_t last_done_us;
-    ESP_LOGI(TAG, "[LCD] direct period=%lldus total=%lldus pixels=%lu",
-             last_done_us > 0 ? done_us - last_done_us : 0,
-             done_us - start_us,
+    const int64_t resume_us = esp_timer_get_time();
+    int64_t isr_done_us;
+    uint32_t done_sequence;
+    portENTER_CRITICAL(&s_lcd_stats_mux);
+    isr_done_us = s_video_frame_isr_done_us;
+    done_sequence = s_video_frame_done_sequence;
+    portEXIT_CRITICAL(&s_lcd_stats_mux);
+    if (done_sequence != frame_sequence || isr_done_us <= 0) {
+        ESP_LOGE(TAG, "video frame completion mismatch: seq=%lu done_seq=%lu isr=%lld",
+                 (unsigned long)frame_sequence, (unsigned long)done_sequence,
+                 isr_done_us);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const int64_t submit_us = submit_done_us - start_us;
+    const int64_t submit_to_isr_us = isr_done_us - start_us;
+    const int64_t physical_us = isr_done_us > submit_done_us
+                                    ? isr_done_us - submit_done_us
+                                    : 0;
+    const int64_t isr_to_resume_us = resume_us - isr_done_us;
+    const int64_t total_us = resume_us - start_us;
+    static int64_t last_isr_done_us;
+    static int64_t last_resume_us;
+    ESP_LOGI(TAG, "[LCD] direct seq=%lu submit=%lldus submit_to_isr=%lldus "
+                  "physical=%lldus isr_to_resume=%lldus total=%lldus "
+                  "isr_period=%lldus resume_period=%lldus pixels=%lu",
+             (unsigned long)frame_sequence, submit_us, submit_to_isr_us,
+             physical_us, isr_to_resume_us, total_us,
+             last_isr_done_us > 0 ? isr_done_us - last_isr_done_us : 0,
+             last_resume_us > 0 ? resume_us - last_resume_us : 0,
              (unsigned long)(width * height));
-    last_done_us = done_us;
+    last_isr_done_us = isr_done_us;
+    last_resume_us = resume_us;
     return ESP_OK;
 }
 
