@@ -49,6 +49,28 @@ void downsample_yuv422_2x(const uint8_t *src, uint8_t *dst,
     }
 }
 
+// Fuse 2x UYVY decimation with the encoder's YCbYCr byte ordering. This avoids
+// materializing an intermediate downsampled UYVY frame and traversing it again.
+void downsample_uyvy_to_ycbycr_2x(const uint8_t *src, uint8_t *dst,
+                                  uint32_t src_w, uint32_t src_h)
+{
+    const uint32_t src_stride = src_w * 2;
+    const uint32_t dst_w = src_w / 2;
+    const uint32_t dst_h = src_h / 2;
+    for (uint32_t dy = 0; dy < dst_h; dy++) {
+        const uint8_t *srow = src + (size_t)(dy * 2) * src_stride;
+        uint8_t *drow = dst + (size_t)dy * (dst_w * 2);
+        for (uint32_t dx = 0; dx < dst_w / 2; dx++) {
+            const uint8_t *s = srow + (size_t)(dx * 2) * 4;
+            uint8_t *d = drow + (size_t)dx * 4;
+            d[0] = s[1]; // Y0
+            d[1] = s[0]; // Cb
+            d[2] = s[3]; // Y1
+            d[3] = s[2]; // Cr
+        }
+    }
+}
+
 // 2x decimation of a GRAY8 frame (1 byte/pixel): keep even rows, even columns.
 void downsample_gray_2x(const uint8_t *src, uint8_t *dst,
                         uint32_t src_w, uint32_t src_h)
@@ -72,7 +94,9 @@ constexpr uint32_t kFourccUyvy = 0x59565955; // 'UYVY'
 constexpr uint32_t kFourccYuyv = 0x56595559; // 'YUYV'
 constexpr uint32_t kFourccVyuy = 0x59555956; // 'VYUY'
 constexpr uint32_t kFrameBytes = APP_CAMERA_FRAME_BYTES;
-constexpr size_t kCaptureDmaBufferCount = 4;
+constexpr size_t kParkingBufferCount = 3;
+constexpr size_t kSnapshotBufferCount = 2;
+constexpr TickType_t kSnapshotMaxAgeTicks = pdMS_TO_TICKS(800);
 
 #if APP_CAMERA_COLOR_ENABLE
 constexpr uint32_t kDvpCaptureWidth = APP_CAMERA_SENSOR_WIDTH;
@@ -84,38 +108,213 @@ constexpr cam_ctlr_color_t kDvpInputColor = CAM_CTLR_COLOR_GRAY8;
 constexpr uint32_t kOutputPixelformat = kFourccGrey;
 #endif
 
+enum class snapshot_state : uint8_t {
+    free,
+    dma,
+    ready,
+    processing,
+};
+
+struct snapshot_slot {
+    uint8_t *buffer;
+    snapshot_state state;
+    size_t received;
+    TickType_t ready_tick;
+};
+
 struct dvp_cb_ctx {
-    uint8_t *buffers[kCaptureDmaBufferCount];
-    uint8_t *safe_buffer;
+    uint8_t *parking_buffers[kParkingBufferCount];
+    snapshot_slot snapshots[kSnapshotBufferCount];
     size_t buflen;
-    volatile size_t received;
-    volatile int frame_count;
-    size_t next_buffer;
+    size_t next_parking;
+    size_t next_snapshot;
+    int frame_count;
     volatile size_t last_received;
     SemaphoreHandle_t done_sem;
-    volatile int capture_target;
-    volatile uint8_t *captured_buffer;
+    bool snapshot_requested;
+    bool continuous_prefetch;
 };
 
 static dvp_cb_ctx s_dvp_ctx;
+static portMUX_TYPE s_dvp_lock = portMUX_INITIALIZER_UNLOCKED;
+
+struct snapshot_lease {
+    uint8_t *buffer = nullptr;
+    size_t received = 0;
+    int slot = -1;
+    uint32_t age_ms = 0;
+};
+
+static bool has_snapshot_dma_locked(const dvp_cb_ctx *ctx)
+{
+    for (size_t i = 0; i < kSnapshotBufferCount; ++i) {
+        if (ctx->snapshots[i].state == snapshot_state::dma) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool has_ready_snapshot_locked(const dvp_cb_ctx *ctx)
+{
+    for (size_t i = 0; i < kSnapshotBufferCount; ++i) {
+        if (ctx->snapshots[i].state == snapshot_state::ready) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool take_ready_snapshot(snapshot_lease *lease, TickType_t now)
+{
+    int newest = -1;
+    TickType_t newest_age = portMAX_DELAY;
+
+    portENTER_CRITICAL(&s_dvp_lock);
+    for (size_t i = 0; i < kSnapshotBufferCount; ++i) {
+        snapshot_slot &slot = s_dvp_ctx.snapshots[i];
+        if (slot.state != snapshot_state::ready) {
+            continue;
+        }
+        const TickType_t age = now - slot.ready_tick;
+        if (age > kSnapshotMaxAgeTicks) {
+            slot.state = snapshot_state::free;
+            slot.received = 0;
+            continue;
+        }
+        if (newest < 0 || age < newest_age) {
+            newest = static_cast<int>(i);
+            newest_age = age;
+        }
+    }
+
+    if (newest >= 0) {
+        for (size_t i = 0; i < kSnapshotBufferCount; ++i) {
+            snapshot_slot &slot = s_dvp_ctx.snapshots[i];
+            if (slot.state == snapshot_state::ready &&
+                static_cast<int>(i) != newest) {
+                slot.state = snapshot_state::free;
+                slot.received = 0;
+            }
+        }
+        snapshot_slot &slot = s_dvp_ctx.snapshots[newest];
+        slot.state = snapshot_state::processing;
+        lease->buffer = slot.buffer;
+        lease->received = slot.received;
+        lease->slot = newest;
+        lease->age_ms = static_cast<uint32_t>(newest_age) * portTICK_PERIOD_MS;
+    }
+    portEXIT_CRITICAL(&s_dvp_lock);
+    return newest >= 0;
+}
+
+static void release_snapshot(const snapshot_lease &lease)
+{
+    if (lease.slot < 0) {
+        return;
+    }
+    portENTER_CRITICAL(&s_dvp_lock);
+    snapshot_slot &slot = s_dvp_ctx.snapshots[lease.slot];
+    if (slot.state == snapshot_state::processing) {
+        slot.state = snapshot_state::free;
+        slot.received = 0;
+    }
+    portEXIT_CRITICAL(&s_dvp_lock);
+}
+
+static void reset_snapshot_pipeline()
+{
+    portENTER_CRITICAL(&s_dvp_lock);
+    s_dvp_ctx.snapshot_requested = false;
+    s_dvp_ctx.continuous_prefetch = false;
+    for (size_t i = 0; i < kSnapshotBufferCount; ++i) {
+        s_dvp_ctx.snapshots[i].state = snapshot_state::free;
+        s_dvp_ctx.snapshots[i].received = 0;
+        s_dvp_ctx.snapshots[i].ready_tick = 0;
+    }
+    portEXIT_CRITICAL(&s_dvp_lock);
+    if (s_dvp_ctx.done_sem) {
+        xQueueReset(s_dvp_ctx.done_sem);
+    }
+}
+
+static void clear_dvp_buffer_refs()
+{
+    portENTER_CRITICAL(&s_dvp_lock);
+    for (size_t i = 0; i < kParkingBufferCount; ++i) {
+        s_dvp_ctx.parking_buffers[i] = nullptr;
+    }
+    for (size_t i = 0; i < kSnapshotBufferCount; ++i) {
+        s_dvp_ctx.snapshots[i].buffer = nullptr;
+        s_dvp_ctx.snapshots[i].state = snapshot_state::free;
+        s_dvp_ctx.snapshots[i].received = 0;
+        s_dvp_ctx.snapshots[i].ready_tick = 0;
+    }
+    s_dvp_ctx.buflen = 0;
+    s_dvp_ctx.snapshot_requested = false;
+    s_dvp_ctx.continuous_prefetch = false;
+    portEXIT_CRITICAL(&s_dvp_lock);
+}
+
+static void cancel_snapshot_requests()
+{
+    portENTER_CRITICAL(&s_dvp_lock);
+    s_dvp_ctx.snapshot_requested = false;
+    s_dvp_ctx.continuous_prefetch = false;
+    portEXIT_CRITICAL(&s_dvp_lock);
+}
+
+static bool snapshot_prearm_active()
+{
+    portENTER_CRITICAL(&s_dvp_lock);
+    const bool active = s_dvp_ctx.continuous_prefetch ||
+                        s_dvp_ctx.snapshot_requested ||
+                        has_snapshot_dma_locked(&s_dvp_ctx) ||
+                        has_ready_snapshot_locked(&s_dvp_ctx);
+    portEXIT_CRITICAL(&s_dvp_lock);
+    return active;
+}
+
+static void configure_snapshot_request(bool continuous)
+{
+    portENTER_CRITICAL(&s_dvp_lock);
+    s_dvp_ctx.continuous_prefetch = continuous;
+    if (!has_ready_snapshot_locked(&s_dvp_ctx) &&
+        !has_snapshot_dma_locked(&s_dvp_ctx)) {
+        s_dvp_ctx.snapshot_requested = true;
+    }
+    portEXIT_CRITICAL(&s_dvp_lock);
+}
 
 static bool IRAM_ATTR on_get_new_trans(esp_cam_ctlr_handle_t handle,
                                        esp_cam_ctlr_trans_t *trans, void *user_data)
 {
     dvp_cb_ctx *ctx = static_cast<dvp_cb_ctx *>(user_data);
-    if (ctx->capture_target > 0 && ctx->frame_count + 1 >= ctx->capture_target) {
-        trans->buffer = ctx->safe_buffer;
-        trans->buflen = ctx->buflen;
-        return true;
+    uint8_t *buffer = nullptr;
+
+    portENTER_CRITICAL_ISR(&s_dvp_lock);
+    if (ctx->snapshot_requested || ctx->continuous_prefetch) {
+        for (size_t offset = 0; offset < kSnapshotBufferCount; ++offset) {
+            const size_t index = (ctx->next_snapshot + offset) % kSnapshotBufferCount;
+            snapshot_slot &slot = ctx->snapshots[index];
+            if (slot.state == snapshot_state::free) {
+                slot.state = snapshot_state::dma;
+                slot.received = 0;
+                buffer = slot.buffer;
+                ctx->next_snapshot = (index + 1) % kSnapshotBufferCount;
+                ctx->snapshot_requested = false;
+                break;
+            }
+        }
     }
-    if (ctx->captured_buffer != nullptr && ctx->capture_target == 0) {
-        trans->buffer = ctx->safe_buffer;
-        trans->buflen = ctx->buflen;
-        return true;
+    if (!buffer) {
+        buffer = ctx->parking_buffers[ctx->next_parking];
+        ctx->next_parking = (ctx->next_parking + 1) % kParkingBufferCount;
     }
-    trans->buffer = ctx->buffers[ctx->next_buffer];
+    portEXIT_CRITICAL_ISR(&s_dvp_lock);
+
+    trans->buffer = buffer;
     trans->buflen = ctx->buflen;
-    ctx->next_buffer = (ctx->next_buffer + 1) % kCaptureDmaBufferCount;
     return trans->buffer != nullptr;
 }
 
@@ -123,12 +322,24 @@ static bool IRAM_ATTR on_trans_finished(esp_cam_ctlr_handle_t handle,
                                         esp_cam_ctlr_trans_t *trans, void *user_data)
 {
     dvp_cb_ctx *ctx = static_cast<dvp_cb_ctx *>(user_data);
-    ctx->frame_count = ctx->frame_count + 1;
+    bool snapshot_done = false;
+
+    portENTER_CRITICAL_ISR(&s_dvp_lock);
+    ctx->frame_count++;
     ctx->last_received = trans->received_size;
-    if (ctx->capture_target > 0 && ctx->frame_count >= ctx->capture_target) {
-        ctx->received = trans->received_size;
-        ctx->captured_buffer = static_cast<uint8_t *>(trans->buffer);
-        ctx->capture_target = 0;
+    for (size_t i = 0; i < kSnapshotBufferCount; ++i) {
+        snapshot_slot &slot = ctx->snapshots[i];
+        if (slot.buffer == trans->buffer && slot.state == snapshot_state::dma) {
+            slot.received = trans->received_size;
+            slot.ready_tick = xTaskGetTickCountFromISR();
+            slot.state = snapshot_state::ready;
+            snapshot_done = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL_ISR(&s_dvp_lock);
+
+    if (snapshot_done) {
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         xSemaphoreGiveFromISR(ctx->done_sem, &xHigherPriorityTaskWoken);
         return xHigherPriorityTaskWoken == pdTRUE;
@@ -300,7 +511,7 @@ esp_err_t CameraUartStreamer::init()
     }
 
     // Sensor configured — now start DVP permanently
-    s_dvp_ctx.capture_target = 0;
+    reset_snapshot_pipeline();
     ret = esp_cam_ctlr_start(cam_handle_);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_cam_ctlr_start failed: %s", esp_err_to_name(ret));
@@ -373,15 +584,26 @@ esp_err_t CameraUartStreamer::power_down()
         // "failed to claim io signals".
         esp_err_t se = esp_cam_ctlr_stop(cam_handle_);
         if (se != ESP_OK) ESP_LOGW(TAG, "cam stop: %s", esp_err_to_name(se));
+        reset_snapshot_pipeline();
         se = esp_cam_ctlr_disable(cam_handle_);
         if (se != ESP_OK) ESP_LOGW(TAG, "cam disable: %s", esp_err_to_name(se));
         se = esp_cam_ctlr_del(cam_handle_);
         if (se != ESP_OK) ESP_LOGW(TAG, "cam del: %s", esp_err_to_name(se));
         cam_handle_ = nullptr;
-        for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
-            if (frame_bufs_[i]) { heap_caps_free(frame_bufs_[i]); frame_bufs_[i] = nullptr; }
+        for (size_t i = 0; i < kParkingBufferCount; ++i) {
+            if (parking_bufs_[i]) {
+                heap_caps_free(parking_bufs_[i]);
+                parking_bufs_[i] = nullptr;
+                s_dvp_ctx.parking_buffers[i] = nullptr;
+            }
         }
-        if (safe_buf_) { heap_caps_free(safe_buf_); safe_buf_ = nullptr; }
+        for (size_t i = 0; i < kSnapshotBufferCount; ++i) {
+            if (snapshot_bufs_[i]) {
+                heap_caps_free(snapshot_bufs_[i]);
+                snapshot_bufs_[i] = nullptr;
+            }
+        }
+        clear_dvp_buffer_refs();
         dvp_ready_ = false;
     }
     set_pwdn(true);
@@ -444,48 +666,88 @@ esp_err_t CameraUartStreamer::ensure_dvp_ready()
         return ret;
     }
 
-    for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
-        frame_bufs_[i] = static_cast<uint8_t *>(
+    for (size_t i = 0; i < kParkingBufferCount; ++i) {
+        parking_bufs_[i] = static_cast<uint8_t *>(
             esp_cam_ctlr_alloc_buffer(cam_handle_, kFrameBytes,
                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA));
-        if (!frame_bufs_[i]) {
-            ESP_LOGE(TAG, "frame buffer alloc failed");
-            for (size_t j = 0; j < kCaptureDmaBufferCount; ++j) {
-                if (frame_bufs_[j]) { heap_caps_free(frame_bufs_[j]); frame_bufs_[j] = nullptr; }
+        if (!parking_bufs_[i]) {
+            ESP_LOGE(TAG, "parking buffer alloc failed");
+            for (size_t j = 0; j < kParkingBufferCount; ++j) {
+                if (parking_bufs_[j]) {
+                    heap_caps_free(parking_bufs_[j]);
+                    parking_bufs_[j] = nullptr;
+                }
             }
+            clear_dvp_buffer_refs();
             esp_cam_ctlr_del(cam_handle_);
             cam_handle_ = nullptr;
             return ESP_ERR_NO_MEM;
         }
     }
 
-    // Set up persistent context
-    for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
-        s_dvp_ctx.buffers[i] = frame_bufs_[i];
-    }
-    s_dvp_ctx.buflen = kFrameBytes;
-
-    // Parking buffer used after a capture so the saved frame buffer is not reused.
-    if (!safe_buf_) {
-        safe_buf_ = static_cast<uint8_t *>(
+    for (size_t i = 0; i < kSnapshotBufferCount; ++i) {
+        snapshot_bufs_[i] = static_cast<uint8_t *>(
             esp_cam_ctlr_alloc_buffer(cam_handle_, kFrameBytes,
                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA));
-        if (!safe_buf_) {
-            ESP_LOGE(TAG, "safe buffer alloc failed");
-            for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
-                if (frame_bufs_[i]) { heap_caps_free(frame_bufs_[i]); frame_bufs_[i] = nullptr; }
+        if (!snapshot_bufs_[i]) {
+            ESP_LOGE(TAG, "snapshot buffer alloc failed");
+            for (size_t j = 0; j < kParkingBufferCount; ++j) {
+                if (parking_bufs_[j]) {
+                    heap_caps_free(parking_bufs_[j]);
+                    parking_bufs_[j] = nullptr;
+                }
             }
+            for (size_t j = 0; j < kSnapshotBufferCount; ++j) {
+                if (snapshot_bufs_[j]) {
+                    heap_caps_free(snapshot_bufs_[j]);
+                    snapshot_bufs_[j] = nullptr;
+                }
+            }
+            clear_dvp_buffer_refs();
             esp_cam_ctlr_del(cam_handle_);
             cam_handle_ = nullptr;
             return ESP_ERR_NO_MEM;
         }
     }
-    s_dvp_ctx.safe_buffer = safe_buf_;
-
     if (!capture_sem_) {
         capture_sem_ = xSemaphoreCreateBinary();
     }
+    if (!capture_sem_) {
+        ESP_LOGE(TAG, "capture semaphore alloc failed");
+        for (size_t i = 0; i < kParkingBufferCount; ++i) {
+            heap_caps_free(parking_bufs_[i]);
+            parking_bufs_[i] = nullptr;
+        }
+        for (size_t i = 0; i < kSnapshotBufferCount; ++i) {
+            heap_caps_free(snapshot_bufs_[i]);
+            snapshot_bufs_[i] = nullptr;
+        }
+        clear_dvp_buffer_refs();
+        esp_cam_ctlr_del(cam_handle_);
+        cam_handle_ = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
+
+    portENTER_CRITICAL(&s_dvp_lock);
+    for (size_t i = 0; i < kParkingBufferCount; ++i) {
+        s_dvp_ctx.parking_buffers[i] = parking_bufs_[i];
+    }
+    for (size_t i = 0; i < kSnapshotBufferCount; ++i) {
+        s_dvp_ctx.snapshots[i].buffer = snapshot_bufs_[i];
+        s_dvp_ctx.snapshots[i].state = snapshot_state::free;
+        s_dvp_ctx.snapshots[i].received = 0;
+        s_dvp_ctx.snapshots[i].ready_tick = 0;
+    }
+    s_dvp_ctx.buflen = kFrameBytes;
+    s_dvp_ctx.next_parking = 0;
+    s_dvp_ctx.next_snapshot = 0;
+    s_dvp_ctx.frame_count = 0;
+    s_dvp_ctx.last_received = 0;
+    s_dvp_ctx.snapshot_requested = false;
+    s_dvp_ctx.continuous_prefetch = false;
     s_dvp_ctx.done_sem = capture_sem_;
+    portEXIT_CRITICAL(&s_dvp_lock);
+    xQueueReset(capture_sem_);
 
     // Register callbacks once (before enable)
     esp_cam_ctlr_evt_cbs_t cbs = {};
@@ -494,9 +756,15 @@ esp_err_t CameraUartStreamer::ensure_dvp_ready()
     ret = esp_cam_ctlr_register_event_callbacks(cam_handle_, &cbs, &s_dvp_ctx);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "register cbs failed: %s", esp_err_to_name(ret));
-        for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
-            if (frame_bufs_[i]) { heap_caps_free(frame_bufs_[i]); frame_bufs_[i] = nullptr; }
+        for (size_t i = 0; i < kParkingBufferCount; ++i) {
+            heap_caps_free(parking_bufs_[i]);
+            parking_bufs_[i] = nullptr;
         }
+        for (size_t i = 0; i < kSnapshotBufferCount; ++i) {
+            heap_caps_free(snapshot_bufs_[i]);
+            snapshot_bufs_[i] = nullptr;
+        }
+        clear_dvp_buffer_refs();
         esp_cam_ctlr_del(cam_handle_);
         cam_handle_ = nullptr;
         return ret;
@@ -505,9 +773,15 @@ esp_err_t CameraUartStreamer::ensure_dvp_ready()
     ret = esp_cam_ctlr_enable(cam_handle_);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_cam_ctlr_enable failed: %s", esp_err_to_name(ret));
-        for (size_t i = 0; i < kCaptureDmaBufferCount; ++i) {
-            if (frame_bufs_[i]) { heap_caps_free(frame_bufs_[i]); frame_bufs_[i] = nullptr; }
+        for (size_t i = 0; i < kParkingBufferCount; ++i) {
+            heap_caps_free(parking_bufs_[i]);
+            parking_bufs_[i] = nullptr;
         }
+        for (size_t i = 0; i < kSnapshotBufferCount; ++i) {
+            heap_caps_free(snapshot_bufs_[i]);
+            snapshot_bufs_[i] = nullptr;
+        }
+        clear_dvp_buffer_refs();
         esp_cam_ctlr_del(cam_handle_);
         cam_handle_ = nullptr;
         return ret;
@@ -524,6 +798,27 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
                                             uint32_t *out_height,
                                             uint32_t *out_pixelformat)
 {
+    return capture_frame_impl(out_data, out_len, out_width, out_height,
+                              out_pixelformat, false);
+}
+
+esp_err_t CameraUartStreamer::capture_jpeg_input(uint8_t **out_data,
+                                                 size_t *out_len,
+                                                 uint32_t *out_width,
+                                                 uint32_t *out_height,
+                                                 uint32_t *out_pixelformat)
+{
+    return capture_frame_impl(out_data, out_len, out_width, out_height,
+                              out_pixelformat, true);
+}
+
+esp_err_t CameraUartStreamer::capture_frame_impl(uint8_t **out_data,
+                                                 size_t *out_len,
+                                                 uint32_t *out_width,
+                                                 uint32_t *out_height,
+                                                 uint32_t *out_pixelformat,
+                                                 bool jpeg_input)
+{
     const int64_t t_capture_start = esp_timer_get_time();
     ESP_RETURN_ON_FALSE(out_data && out_len && out_width && out_height && out_pixelformat,
                         ESP_ERR_INVALID_ARG, TAG, "invalid args");
@@ -539,37 +834,65 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Arm capture: skip a few frames for stable AE/AWB
-    s_dvp_ctx.received = 0;
-    s_dvp_ctx.captured_buffer = nullptr;
+    snapshot_lease lease;
+    bool prefetched = take_ready_snapshot(&lease, xTaskGetTickCount());
+
+    // The semaphore is only a wake hint. Slot state is authoritative because
+    // two snapshot completions may coalesce into one binary semaphore token.
     xQueueReset(capture_sem_);
-    s_dvp_ctx.capture_target = s_dvp_ctx.frame_count + 1;
+    configure_snapshot_request(jpeg_input);
+    if (!prefetched) {
+        prefetched = take_ready_snapshot(&lease, xTaskGetTickCount());
+    }
 
     const int64_t t_wait_start = esp_timer_get_time();
-    bool got_frame = xSemaphoreTake(capture_sem_, pdMS_TO_TICKS(5000)) == pdTRUE;
+    bool got_frame = prefetched;
+    if (!got_frame) {
+        const TickType_t wait_start_tick = xTaskGetTickCount();
+        const TickType_t wait_limit = pdMS_TO_TICKS(5000);
+        while (!got_frame) {
+            const TickType_t elapsed = xTaskGetTickCount() - wait_start_tick;
+            if (elapsed >= wait_limit) {
+                break;
+            }
+            const TickType_t remaining = wait_limit - elapsed;
+            if (xSemaphoreTake(capture_sem_, remaining) != pdTRUE) {
+                break;
+            }
+            got_frame = take_ready_snapshot(&lease, xTaskGetTickCount());
+        }
+    }
     const int64_t t_wait_done = esp_timer_get_time();
 
-    if (got_frame && s_dvp_ctx.received >= kFrameBytes && s_dvp_ctx.captured_buffer) {
-        ESP_LOGD(TAG, "captured frame: %u bytes (skipped %d)",
-                 (unsigned)s_dvp_ctx.received, s_dvp_ctx.frame_count - 1);
+    if (got_frame && lease.received >= kFrameBytes && lease.buffer) {
+        ESP_LOGD(TAG, "captured frame: %u bytes slot=%d age=%lums",
+                 static_cast<unsigned>(lease.received), lease.slot,
+                 static_cast<unsigned long>(lease.age_ms));
 
         // Allocate the downsampled (320x240) output, not the full frame.
         constexpr size_t kOutBytes = APP_IMAGE_OUTPUT_BYTES;
         const int64_t t_alloc_start = esp_timer_get_time();
-        uint8_t *copy = static_cast<uint8_t *>(
-            heap_caps_malloc(kOutBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        uint8_t *copy = jpeg_input
+            ? static_cast<uint8_t *>(heap_caps_aligned_alloc(
+                  16, kOutBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT))
+            : static_cast<uint8_t *>(heap_caps_malloc(
+                  kOutBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (!copy) {
-            copy = static_cast<uint8_t *>(
-                heap_caps_malloc(kOutBytes, MALLOC_CAP_8BIT));
+            copy = jpeg_input
+                ? static_cast<uint8_t *>(heap_caps_aligned_alloc(
+                      16, kOutBytes, MALLOC_CAP_8BIT))
+                : static_cast<uint8_t *>(heap_caps_malloc(
+                      kOutBytes, MALLOC_CAP_8BIT));
         }
         if (!copy) {
             ESP_LOGE(TAG, "frame copy alloc failed");
+            release_snapshot(lease);
             return ESP_ERR_NO_MEM;
         }
         const int64_t t_alloc_done = esp_timer_get_time();
 
         const int64_t t_cache_start = esp_timer_get_time();
-        esp_cache_msync((void *)s_dvp_ctx.captured_buffer, kFrameBytes,
+        esp_cache_msync(lease.buffer, kFrameBytes,
                         ESP_CACHE_MSYNC_FLAG_DIR_M2C);
         const int64_t t_cache_done = esp_timer_get_time();
 
@@ -578,36 +901,82 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
         // copy (reads half the source, writes a quarter) so it is not extra cost.
         const int64_t t_downsample_start = esp_timer_get_time();
 #if APP_CAMERA_COLOR_ENABLE
-        downsample_yuv422_2x((const uint8_t *)s_dvp_ctx.captured_buffer, copy,
-                             APP_CAMERA_SENSOR_WIDTH, APP_CAMERA_SENSOR_HEIGHT);
+        if (jpeg_input) {
+            downsample_uyvy_to_ycbycr_2x(
+                lease.buffer, copy,
+                APP_CAMERA_SENSOR_WIDTH, APP_CAMERA_SENSOR_HEIGHT);
+        } else {
+            downsample_yuv422_2x(lease.buffer, copy,
+                                 APP_CAMERA_SENSOR_WIDTH, APP_CAMERA_SENSOR_HEIGHT);
+        }
 #else
-        downsample_gray_2x((const uint8_t *)s_dvp_ctx.captured_buffer, copy,
+        downsample_gray_2x(lease.buffer, copy,
                            APP_CAMERA_SENSOR_WIDTH, APP_CAMERA_SENSOR_HEIGHT);
 #endif
         const int64_t t_downsample_done = esp_timer_get_time();
 
-        s_dvp_ctx.captured_buffer = nullptr;
+        release_snapshot(lease);
 
         *out_data = copy;
         *out_len = kOutBytes;
         *out_width = APP_IMAGE_OUTPUT_WIDTH;
         *out_height = APP_IMAGE_OUTPUT_HEIGHT;
-        *out_pixelformat = kOutputPixelformat;
+        *out_pixelformat = jpeg_input && APP_CAMERA_COLOR_ENABLE
+            ? kFourccYuyv
+            : kOutputPixelformat;
         const int64_t t_capture_done = esp_timer_get_time();
-        ESP_LOGI(TAG,
-                 "[CAPTURE] setup=%lldus wait=%lldus alloc=%lldus cache=%lldus "
-                 "downsample=%lldus total=%lldus",
-                 (long long)(t_wait_start - t_capture_start),
-                 (long long)(t_wait_done - t_wait_start),
-                 (long long)(t_alloc_done - t_alloc_start),
-                 (long long)(t_cache_done - t_cache_start),
-                 (long long)(t_downsample_done - t_downsample_start),
-                 (long long)(t_capture_done - t_capture_start));
+        if (jpeg_input) {
+            ESP_LOGI(TAG,
+                     "[CAPTURE-JPEG] prefetched=%d slot=%d raw_age=%lums "
+                     "prearm=%d setup=%lldus wait=%lldus alloc=%lldus "
+                     "cache=%lldus fused=%lldus total=%lldus",
+                     prefetched ? 1 : 0, lease.slot,
+                     static_cast<unsigned long>(lease.age_ms),
+                     snapshot_prearm_active() ? 1 : 0,
+                     (long long)(t_wait_start - t_capture_start),
+                     (long long)(t_wait_done - t_wait_start),
+                     (long long)(t_alloc_done - t_alloc_start),
+                     (long long)(t_cache_done - t_cache_start),
+                     (long long)(t_downsample_done - t_downsample_start),
+                     (long long)(t_capture_done - t_capture_start));
+        } else {
+            ESP_LOGI(TAG,
+                     "[CAPTURE] setup=%lldus wait=%lldus alloc=%lldus cache=%lldus "
+                     "downsample=%lldus total=%lldus",
+                     (long long)(t_wait_start - t_capture_start),
+                     (long long)(t_wait_done - t_wait_start),
+                     (long long)(t_alloc_done - t_alloc_start),
+                     (long long)(t_cache_done - t_cache_start),
+                     (long long)(t_downsample_done - t_downsample_start),
+                     (long long)(t_capture_done - t_capture_start));
+        }
         return ESP_OK;
     }
 
+    cancel_snapshot_requests();
+    release_snapshot(lease);
+    if (!got_frame && cam_handle_) {
+        const esp_err_t stop_err = esp_cam_ctlr_stop(cam_handle_);
+        if (stop_err == ESP_OK) {
+            reset_snapshot_pipeline();
+            const esp_err_t restart_err = esp_cam_ctlr_start(cam_handle_);
+            if (restart_err != ESP_OK) {
+                ESP_LOGE(TAG, "DVP restart after capture timeout failed: %s",
+                         esp_err_to_name(restart_err));
+            }
+        } else {
+            ESP_LOGE(TAG, "DVP stop after capture timeout failed: %s",
+                     esp_err_to_name(stop_err));
+        }
+    }
+    int frame_count = 0;
+    size_t last_received = 0;
+    portENTER_CRITICAL(&s_dvp_lock);
+    frame_count = s_dvp_ctx.frame_count;
+    last_received = s_dvp_ctx.last_received;
+    portEXIT_CRITICAL(&s_dvp_lock);
     ESP_LOGE(TAG, "capture failed: got=%d frames=%d last=%u received=%u expected=%u",
-             got_frame ? 1 : 0, s_dvp_ctx.frame_count, (unsigned)s_dvp_ctx.last_received,
-             (unsigned)s_dvp_ctx.received, (unsigned)kFrameBytes);
+             got_frame ? 1 : 0, frame_count, static_cast<unsigned>(last_received),
+             static_cast<unsigned>(lease.received), static_cast<unsigned>(kFrameBytes));
     return got_frame ? ESP_ERR_INVALID_SIZE : ESP_ERR_TIMEOUT;
 }

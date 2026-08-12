@@ -148,6 +148,99 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
     return ESP_OK;
 }
 
+esp_err_t ImageTransfer::encode_prepared_frame(const uint8_t *input, size_t input_len,
+                                               uint32_t width, uint32_t height,
+                                               uint32_t pixfmt,
+                                               uint8_t **out_jpeg,
+                                               size_t *out_jpeg_len)
+{
+    if (!input || !out_jpeg || !out_jpeg_len) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_jpeg = nullptr;
+    *out_jpeg_len = 0;
+
+    static constexpr uint32_t FOURCC_GREY = 0x59455247;
+    static constexpr uint32_t FOURCC_YUYV = 0x56595559;
+    const bool gray = pixfmt == FOURCC_GREY;
+    if (!gray && pixfmt != FOURCC_YUYV) {
+        ESP_LOGE(TAG, "prepared input format unsupported: 0x%08lx",
+                 static_cast<unsigned long>(pixfmt));
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    const size_t expected_len = width * height * (gray ? 1U : 2U);
+    if (input_len < expected_len ||
+        (reinterpret_cast<uintptr_t>(input) & 0x0fU) != 0) {
+        ESP_LOGE(TAG, "prepared input invalid: len=%u expected=%u aligned=%d",
+                 static_cast<unsigned>(input_len),
+                 static_cast<unsigned>(expected_len),
+                 (reinterpret_cast<uintptr_t>(input) & 0x0fU) == 0 ? 1 : 0);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const int64_t t_encode_start = esp_timer_get_time();
+    jpeg_enc_config_t enc_cfg = DEFAULT_JPEG_ENC_CONFIG();
+    enc_cfg.width = static_cast<int>(width);
+    enc_cfg.height = static_cast<int>(height);
+    enc_cfg.src_type = gray ? JPEG_PIXEL_FORMAT_GRAY : JPEG_PIXEL_FORMAT_YCbYCr;
+    enc_cfg.subsampling = gray ? JPEG_SUBSAMPLE_GRAY : JPEG_SUBSAMPLE_420;
+    enc_cfg.quality = APP_IMAGE_JPEG_QUALITY;
+    enc_cfg.task_enable = false;
+
+    jpeg_enc_handle_t encoder = nullptr;
+    const int64_t t_open_start = esp_timer_get_time();
+    jpeg_error_t jerr = jpeg_enc_open(&enc_cfg, &encoder);
+    const int64_t t_open_done = esp_timer_get_time();
+    if (jerr != JPEG_ERR_OK || !encoder) {
+        ESP_LOGE(TAG, "jpeg_enc_open failed: %d", jerr);
+        return ESP_FAIL;
+    }
+
+    const int64_t t_output_alloc_start = esp_timer_get_time();
+    uint8_t *jpeg_buf = static_cast<uint8_t *>(
+        heap_caps_malloc(APP_IMAGE_MAX_JPEG_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!jpeg_buf) {
+        ESP_LOGE(TAG, "jpeg output buffer alloc failed");
+        jpeg_enc_close(encoder);
+        return ESP_ERR_NO_MEM;
+    }
+    const int64_t t_output_alloc_done = esp_timer_get_time();
+
+    int out_size = 0;
+    const int64_t t_jpeg_start = esp_timer_get_time();
+    jerr = jpeg_enc_process(encoder, input, static_cast<int>(expected_len),
+                            jpeg_buf, static_cast<int>(APP_IMAGE_MAX_JPEG_SIZE),
+                            &out_size);
+    const int64_t t_jpeg_done = esp_timer_get_time();
+    const int64_t t_cleanup_start = esp_timer_get_time();
+    jpeg_enc_close(encoder);
+    const int64_t t_cleanup_done = esp_timer_get_time();
+
+    if (jerr != JPEG_ERR_OK || out_size <= 0) {
+        ESP_LOGE(TAG, "jpeg_enc_process failed: %d out_size=%d", jerr, out_size);
+        heap_caps_free(jpeg_buf);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG,
+             "[ENCODE-PREPARED] open=%lldus output_alloc=%lldus jpeg=%lldus "
+             "cleanup=%lldus total=%lldus",
+             (long long)(t_open_done - t_open_start),
+             (long long)(t_output_alloc_done - t_output_alloc_start),
+             (long long)(t_jpeg_done - t_jpeg_start),
+             (long long)(t_cleanup_done - t_cleanup_start),
+             (long long)(t_cleanup_done - t_encode_start));
+    ESP_LOGD(TAG, "JPEG encoded: %lux%lu → %d bytes (Q=%d)",
+             static_cast<unsigned long>(width),
+             static_cast<unsigned long>(height),
+             out_size, APP_IMAGE_JPEG_QUALITY);
+
+    *out_jpeg = jpeg_buf;
+    *out_jpeg_len = static_cast<size_t>(out_size);
+    return ESP_OK;
+}
+
 void ImageTransfer::rx_begin(uint16_t session_id, uint16_t total_fragments)
 {
     rx_reset();

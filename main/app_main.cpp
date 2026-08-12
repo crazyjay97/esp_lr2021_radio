@@ -471,7 +471,8 @@ static uint8_t *prepare_jpeg_blob(size_t *out_len)
     size_t len = 0;
     uint32_t width = 0, height = 0, pixfmt = 0;
     const uint32_t prepare_start_ms = static_cast<uint32_t>(esp_log_timestamp());
-    esp_err_t capture_e = g_camera_uart.capture_frame(&frame, &len, &width, &height, &pixfmt);
+    esp_err_t capture_e = g_camera_uart.capture_jpeg_input(
+        &frame, &len, &width, &height, &pixfmt);
     const uint32_t capture_done_ms = static_cast<uint32_t>(esp_log_timestamp());
     if (capture_e != ESP_OK || !frame) {
         ESP_LOGW(TAG, "[PREFETCH] capture failed after %lums: %s",
@@ -481,8 +482,8 @@ static uint8_t *prepare_jpeg_blob(size_t *out_len)
     }
     uint8_t *jpeg = nullptr;
     size_t jpeg_len = 0;
-    esp_err_t e = g_radio.image_xfer().encode_frame(frame, len, width, height, pixfmt,
-                                                    &jpeg, &jpeg_len);
+    esp_err_t e = g_radio.image_xfer().encode_prepared_frame(
+        frame, len, width, height, pixfmt, &jpeg, &jpeg_len);
     const uint32_t encode_done_ms = static_cast<uint32_t>(esp_log_timestamp());
     heap_caps_free(frame);
     if (e != ESP_OK || !jpeg) {
@@ -612,7 +613,8 @@ void image_capture_task(void *arg)
         uint32_t t_cam_start = static_cast<uint32_t>(esp_log_timestamp());
         ESP_LOGD(TAG, "[TIMING] camera init start +%lums", static_cast<unsigned long>(t_cam_start - t_cmd));
 
-        esp_err_t capture_e = g_camera_uart.capture_frame(&frame, &len, &width, &height, &pixfmt);
+        esp_err_t capture_e = g_camera_uart.capture_jpeg_input(
+            &frame, &len, &width, &height, &pixfmt);
 
         uint32_t t_cam_done = static_cast<uint32_t>(esp_log_timestamp());
         ESP_LOGD(TAG, "[TIMING] capture done +%lums (camera=%lums) %lux%lu %u bytes",
@@ -634,7 +636,8 @@ void image_capture_task(void *arg)
 
         // JPEG encode
         uint32_t t_jpeg_start = static_cast<uint32_t>(esp_log_timestamp());
-        e = g_radio.image_xfer().encode_frame(frame, len, width, height, pixfmt, &jpeg, &jpeg_len);
+        e = g_radio.image_xfer().encode_prepared_frame(
+            frame, len, width, height, pixfmt, &jpeg, &jpeg_len);
         heap_caps_free(frame);
         t_jpeg_done = static_cast<uint32_t>(esp_log_timestamp());
         ESP_LOGD(TAG, "[TIMING] JPEG done +%lums (jpeg=%lums) %u bytes",

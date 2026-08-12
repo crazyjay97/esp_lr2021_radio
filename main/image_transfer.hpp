@@ -13,6 +13,12 @@ public:
                            uint32_t width, uint32_t height, uint32_t pixfmt,
                            uint8_t **out_jpeg, size_t *out_jpeg_len);
 
+    // TX hot path: encode an aligned YCbYCr/GRAY buffer prepared by the camera.
+    // The caller retains ownership of input and frees it with heap_caps_free().
+    esp_err_t encode_prepared_frame(const uint8_t *input, size_t input_len,
+                                    uint32_t width, uint32_t height, uint32_t pixfmt,
+                                    uint8_t **out_jpeg, size_t *out_jpeg_len);
+
     // RX side: start new reassembly session
     void rx_begin(uint16_t session_id, uint16_t total_fragments);
 
