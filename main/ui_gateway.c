@@ -103,15 +103,18 @@ static lv_obj_t *s_bottom_lbl_l = NULL;
 static lv_obj_t *s_bottom_lbl_m = NULL;
 static lv_obj_t *s_bottom_lbl_r = NULL;
 
-/* PAGE_IMAGE objects */
+/* PAGE_IMAGE objects. The front buffer may be owned by LCD DMA, pending stays
+ * ready for the next present, and back/spare are the free-buffer pool. */
 static lv_obj_t *s_img_canvas = NULL;
 static lv_color_t *s_img_canvas_buf = NULL;
 static lv_color_t *s_img_canvas_back_buf = NULL;
+static lv_color_t *s_img_canvas_spare_buf = NULL;
 static lv_color_t *s_img_canvas_pending_buf = NULL;
 static lv_timer_t *s_img_present_timer = NULL;
 static portMUX_TYPE s_img_canvas_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_img_canvas_writing = false;
 static bool s_img_buffers_initialized = false;
+static uint8_t s_img_canvas_buffer_count = 0;
 
 typedef struct {
     uint32_t jpeg_size;
@@ -213,6 +216,17 @@ static lv_color_t *alloc_image_canvas_buffer(size_t pixels)
         buf = heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
     }
     return buf;
+}
+
+/* 调用方必须持有 s_img_canvas_mux。 */
+static void release_image_canvas_buffer(lv_color_t *buf)
+{
+    if (!buf) return;
+    if (!s_img_canvas_back_buf) {
+        s_img_canvas_back_buf = buf;
+    } else if (!s_img_canvas_spare_buf) {
+        s_img_canvas_spare_buf = buf;
+    }
 }
 
 static void rotate_rgb565_to_canvas(const uint16_t *src, lv_color_t *dst)
@@ -392,18 +406,35 @@ static void create_image_page(void)
 {
     const size_t canvas_pixels = IMG_W * IMG_H;
 
-    if (!s_img_canvas_buf) {
+    if (!s_img_buffers_initialized) {
         s_img_canvas_buf = alloc_image_canvas_buffer(canvas_pixels);
-    }
-    if (!s_img_canvas_back_buf) {
-        s_img_canvas_back_buf = alloc_image_canvas_buffer(canvas_pixels);
-    }
-    if (s_img_canvas_buf && !s_img_buffers_initialized) {
-        memset(s_img_canvas_buf, 0, canvas_pixels * sizeof(lv_color_t));
-        if (s_img_canvas_back_buf) {
-            memset(s_img_canvas_back_buf, 0, canvas_pixels * sizeof(lv_color_t));
+        if (s_img_canvas_buf) {
+            s_img_canvas_buffer_count = 1;
+            s_img_canvas_back_buf = alloc_image_canvas_buffer(canvas_pixels);
+            if (s_img_canvas_back_buf) {
+                s_img_canvas_buffer_count++;
+                s_img_canvas_spare_buf = alloc_image_canvas_buffer(canvas_pixels);
+                if (s_img_canvas_spare_buf) {
+                    s_img_canvas_buffer_count++;
+                }
+            }
+
+            memset(s_img_canvas_buf, 0, canvas_pixels * sizeof(lv_color_t));
+            if (s_img_canvas_back_buf) {
+                memset(s_img_canvas_back_buf, 0,
+                       canvas_pixels * sizeof(lv_color_t));
+            }
+            if (s_img_canvas_spare_buf) {
+                memset(s_img_canvas_spare_buf, 0,
+                       canvas_pixels * sizeof(lv_color_t));
+            }
         }
-        s_img_buffers_initialized = true;
+        s_img_buffers_initialized = s_img_canvas_buf != NULL;
+        if (s_img_buffers_initialized) {
+            ESP_LOGI(TAG, "image canvas buffers=%u bytes_each=%u",
+                     s_img_canvas_buffer_count,
+                     (unsigned)(canvas_pixels * sizeof(lv_color_t)));
+        }
     }
 
     if (s_has_image && s_img_canvas_buf) {
@@ -1289,14 +1320,14 @@ static void image_present_timer_cb(lv_timer_t *t)
     img_present_meta_t meta = {0};
 
     portENTER_CRITICAL(&s_img_canvas_mux);
-    if (!s_img_canvas_writing && s_img_canvas_pending_buf) {
+    if (s_img_canvas_pending_buf) {
         pending = s_img_canvas_pending_buf;
         s_img_canvas_pending_buf = NULL;
         meta = s_img_pending_meta;
 
         lv_color_t *old_front = s_img_canvas_buf;
         s_img_canvas_buf = pending;
-        s_img_canvas_back_buf = old_front;
+        release_image_canvas_buffer(old_front);
     }
     portEXIT_CRITICAL(&s_img_canvas_mux);
 
@@ -1345,27 +1376,30 @@ void ui_gw_rx_complete(const uint16_t *rgb565, uint32_t w, uint32_t h,
 {
     if (!s_lock || !rgb565 || w != 320 || h != 240 || !s_img_canvas_buf) return;
 
-    if (s_img_canvas_back_buf) {
+    if (s_img_canvas_buffer_count >= 2) {
         lv_color_t *render_buf = NULL;
 
         portENTER_CRITICAL(&s_img_canvas_mux);
-        if (!s_img_canvas_writing) {
+        if (!s_img_canvas_writing && s_img_canvas_back_buf) {
             render_buf = s_img_canvas_back_buf;
-            s_img_canvas_pending_buf = NULL;
+            s_img_canvas_back_buf = s_img_canvas_spare_buf;
+            s_img_canvas_spare_buf = NULL;
             s_img_canvas_writing = true;
         }
         portEXIT_CRITICAL(&s_img_canvas_mux);
 
         if (!render_buf) return;
 
-        /* 后台缓冲完成旋转和换色，LVGL 刷新期间不再阻塞图像处理任务。 */
+        /* 后台缓冲完成旋转和换色，已就绪帧在此期间保持可提交。 */
         rotate_rgb565_to_canvas(rgb565, render_buf);
 
         portENTER_CRITICAL(&s_img_canvas_mux);
+        lv_color_t *replaced_pending = s_img_canvas_pending_buf;
         s_img_pending_meta.jpeg_size = jpeg_size;
         s_img_pending_meta.elapsed_ms = elapsed_ms;
         s_img_pending_meta.rssi = s_rx_last_rssi;
         s_img_canvas_pending_buf = render_buf;
+        release_image_canvas_buffer(replaced_pending);
         s_img_canvas_writing = false;
         portEXIT_CRITICAL(&s_img_canvas_mux);
 
