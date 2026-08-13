@@ -19,6 +19,9 @@
 #include "esp_log.h"
 #include "esp_memory_utils.h"
 #include "esp_timer.h"
+#include "hal/gpio_ll.h"
+#include "soc/gpio_struct.h"
+#include "soc/soc.h"
 #include "lvgl.h"
 
 #include "app_config.h"
@@ -29,6 +32,7 @@ static const char *TAG = "bsp_lcd";
 #define BSP_LCD_SPI_HOST SPI3_HOST
 
 static esp_lcd_panel_io_handle_t s_lcd_io;
+static spi_device_handle_t s_lcd_pixel_spi;
 static esp_lcd_panel_handle_t s_lcd_panel;
 static bool s_lcd_bus_ready;
 static bool s_lcd_ready;
@@ -38,11 +42,28 @@ static i2c_master_dev_handle_t s_touch;
 static uint8_t s_touch_addr;
 static lv_disp_drv_t *s_lvgl_disp_drv;
 static SemaphoreHandle_t s_lvgl_lock;
+static SemaphoreHandle_t s_lcd_color_idle;
 static SemaphoreHandle_t s_video_frame_done;
+
+typedef enum {
+    LCD_TRANSFER_OWNER_NONE = 0,
+    LCD_TRANSFER_OWNER_LVGL,
+    LCD_TRANSFER_OWNER_VIDEO,
+    LCD_TRANSFER_OWNER_OTHER,
+} lcd_transfer_owner_t;
+
+static volatile lcd_transfer_owner_t s_lcd_transfer_owner;
+static volatile uint32_t s_lcd_transfer_owner_sequence;
+static volatile uint32_t s_lcd_owner_mismatch_count;
 static volatile bool s_video_frame_inflight;
 static volatile uint32_t s_video_frame_sequence;
 static volatile uint32_t s_video_frame_done_sequence;
 static volatile int64_t s_video_frame_isr_done_us;
+static bool s_video_path_logged;
+static bool s_split_draw_logged;
+static size_t s_lcd_pixel_max_transfer_bytes;
+static size_t s_lcd_pixel_inflight;
+static spi_transaction_t s_lcd_pixel_transactions[APP_LCD_SPI_QUEUE_DEPTH];
 static lv_obj_t *s_camera_status_label;
 static lv_obj_t *s_camera_canvas;
 static lv_color_t *s_camera_canvas_buf;
@@ -66,6 +87,35 @@ typedef struct {
 } lcd_flush_pending_t;
 
 #define LCD_STATS_PENDING_MAX 16U
+
+static uint32_t lcd_spi_actual_clock_hz(uint32_t requested_hz,
+                                         uint32_t duty_cycle_pos)
+{
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    const int actual_hz = spi_get_actual_clock(
+        APB_CLK_FREQ, requested_hz, duty_cycle_pos);
+#pragma GCC diagnostic pop
+    return actual_hz > 0 ? (uint32_t)actual_hz : 0U;
+}
+
+static int lcd_gpio_drive_capability(gpio_num_t gpio)
+{
+    gpio_drive_cap_t capability;
+    return gpio_get_drive_capability(gpio, &capability) == ESP_OK
+               ? (int)capability
+               : -1;
+}
+
+static inline void lcd_cs_select(void)
+{
+    gpio_set_level(BSP_LCD_SPI_CS_GPIO, 0);
+}
+
+static inline void lcd_cs_deselect(void)
+{
+    gpio_set_level(BSP_LCD_SPI_CS_GPIO, 1);
+}
 
 static portMUX_TYPE s_lcd_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 static int64_t s_lcd_refresh_start_us;
@@ -92,11 +142,34 @@ typedef struct {
 static esp_err_t lcd_tx_cmd(uint8_t cmd, const uint8_t *data, size_t len)
 {
     ESP_RETURN_ON_FALSE(s_lcd_io, ESP_ERR_INVALID_STATE, TAG, "lcd io not ready");
+    lcd_cs_select();
     esp_err_t ret = esp_lcd_panel_io_tx_param(s_lcd_io, cmd, data, len);
+    lcd_cs_deselect();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "lcd_tx_cmd(0x%02X) FAILED: %s", cmd, esp_err_to_name(ret));
     }
     return ret;
+}
+
+static esp_err_t lcd_panel_init_low_speed(void)
+{
+    static const uint8_t madctl = LCD_CMD_BGR_BIT;
+    static const uint8_t colmod = 0x55;
+    static const uint8_t ramctrl[] = {0x00, 0xf8};
+
+    ESP_RETURN_ON_ERROR(lcd_tx_cmd(LCD_CMD_SWRESET, NULL, 0),
+                        TAG, "low-speed SWRESET");
+    vTaskDelay(pdMS_TO_TICKS(20));
+    ESP_RETURN_ON_ERROR(lcd_tx_cmd(LCD_CMD_SLPOUT, NULL, 0),
+                        TAG, "low-speed SLPOUT");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_RETURN_ON_ERROR(lcd_tx_cmd(LCD_CMD_MADCTL, &madctl, 1),
+                        TAG, "low-speed MADCTL");
+    ESP_RETURN_ON_ERROR(lcd_tx_cmd(LCD_CMD_COLMOD, &colmod, 1),
+                        TAG, "low-speed COLMOD");
+    ESP_RETURN_ON_ERROR(lcd_tx_cmd(0xb0, ramctrl, sizeof(ramctrl)),
+                        TAG, "low-speed RAMCTRL");
+    return ESP_OK;
 }
 
 static esp_err_t touch_read_reg(uint8_t reg, uint8_t *data, size_t len)
@@ -183,17 +256,167 @@ static void lvgl_tick_cb(void *arg)
     lv_tick_inc(APP_LCD_LVGL_TICK_MS);
 }
 
+static esp_err_t lcd_pixel_recycle_completed(void)
+{
+    while (s_lcd_pixel_inflight > 0) {
+        spi_transaction_t *completed = NULL;
+        esp_err_t ret = spi_device_get_trans_result(
+            s_lcd_pixel_spi, &completed, portMAX_DELAY);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        s_lcd_pixel_inflight--;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t lcd_pixel_tx_color(const void *color, size_t color_size)
+{
+    ESP_RETURN_ON_FALSE(s_lcd_pixel_spi && color && color_size > 0,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid pixel transfer");
+    ESP_RETURN_ON_FALSE(s_lcd_pixel_max_transfer_bytes > 0,
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "pixel max transfer size unavailable");
+
+    const size_t chunk_count =
+        (color_size + s_lcd_pixel_max_transfer_bytes - 1U) /
+        s_lcd_pixel_max_transfer_bytes;
+    ESP_RETURN_ON_FALSE(chunk_count <= APP_LCD_SPI_QUEUE_DEPTH,
+                        ESP_ERR_INVALID_SIZE, TAG,
+                        "pixel transfer needs %u chunks, queue depth is %u",
+                        (unsigned)chunk_count,
+                        (unsigned)APP_LCD_SPI_QUEUE_DEPTH);
+
+    ESP_RETURN_ON_ERROR(
+        spi_device_acquire_bus(s_lcd_pixel_spi, portMAX_DELAY),
+        TAG, "acquire pixel SPI device");
+
+    esp_err_t ret = lcd_pixel_recycle_completed();
+    if (ret == ESP_OK) {
+        gpio_ll_set_level(&GPIO, BSP_LCD_SPI_DC_GPIO, 1);
+        gpio_ll_output_enable(&GPIO, BSP_LCD_SPI_DC_GPIO);
+
+        const uint8_t *chunk = color;
+        size_t remaining = color_size;
+        for (size_t i = 0; i < chunk_count; ++i) {
+            const size_t chunk_size =
+                remaining > s_lcd_pixel_max_transfer_bytes
+                    ? s_lcd_pixel_max_transfer_bytes
+                    : remaining;
+            spi_transaction_t *trans = &s_lcd_pixel_transactions[i];
+            memset(trans, 0, sizeof(*trans));
+            trans->length = chunk_size * 8U;
+            trans->tx_buffer = chunk;
+            trans->user = (i + 1U == chunk_count) ? (void *)1 : NULL;
+
+            ret = spi_device_queue_trans(
+                s_lcd_pixel_spi, trans, portMAX_DELAY);
+            if (ret != ESP_OK) {
+                break;
+            }
+            s_lcd_pixel_inflight++;
+            chunk += chunk_size;
+            remaining -= chunk_size;
+        }
+    }
+
+    spi_device_release_bus(s_lcd_pixel_spi);
+    if (ret != ESP_OK && s_lcd_pixel_inflight > 0) {
+        esp_err_t drain_ret = lcd_pixel_recycle_completed();
+        if (drain_ret != ESP_OK) {
+            ESP_LOGE(TAG, "drain failed pixel transfer: %s",
+                     esp_err_to_name(drain_ret));
+        }
+    }
+    return ret;
+}
+
 static esp_err_t lcd_draw_rgb565_bitmap(uint32_t x0, uint32_t y0,
                                         uint32_t x1, uint32_t y1,
-                                        const uint16_t *pixels)
+                                        const uint16_t *pixels,
+                                        lcd_transfer_owner_t owner,
+                                        uint32_t owner_sequence)
 {
-    ESP_RETURN_ON_FALSE(s_lcd_ready && pixels, ESP_ERR_INVALID_STATE, TAG,
-                        "lcd not ready");
+    ESP_RETURN_ON_FALSE(s_lcd_ready && s_lcd_io && s_lcd_pixel_spi && pixels,
+                        ESP_ERR_INVALID_STATE, TAG, "lcd not ready");
     ESP_RETURN_ON_FALSE(x1 > x0 && y1 > y0 &&
                         x1 <= APP_LCD_H_RES && y1 <= APP_LCD_V_RES,
                         ESP_ERR_INVALID_ARG, TAG, "invalid draw area");
+    ESP_RETURN_ON_FALSE(s_lcd_color_idle, ESP_ERR_INVALID_STATE, TAG,
+                        "lcd color semaphore not ready");
 
-    return esp_lcd_panel_draw_bitmap(s_lcd_panel, x0, y0, x1, y1, pixels);
+    if (xSemaphoreTake(s_lcd_color_idle, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE(TAG, "previous LCD pixel transfer did not finish");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    lcd_transfer_owner_t stale_owner;
+    uint32_t stale_sequence;
+    portENTER_CRITICAL(&s_lcd_stats_mux);
+    stale_owner = s_lcd_transfer_owner;
+    stale_sequence = s_lcd_transfer_owner_sequence;
+    s_lcd_transfer_owner = owner;
+    s_lcd_transfer_owner_sequence = owner_sequence;
+    portEXIT_CRITICAL(&s_lcd_stats_mux);
+    if (stale_owner != LCD_TRANSFER_OWNER_NONE) {
+        ESP_LOGW(TAG,
+                 "[LCD-OWNER] stale owner=%d seq=%lu replaced_by=%d seq=%lu",
+                 (int)stale_owner, (unsigned long)stale_sequence,
+                 (int)owner, (unsigned long)owner_sequence);
+    }
+
+    const uint32_t x_start = x0 + APP_LCD_X_GAP;
+    const uint32_t x_end = x1 + APP_LCD_X_GAP;
+    const uint32_t y_start = y0 + APP_LCD_Y_GAP;
+    const uint32_t y_end = y1 + APP_LCD_Y_GAP;
+    const uint8_t caset[] = {
+        (uint8_t)(x_start >> 8), (uint8_t)x_start,
+        (uint8_t)((x_end - 1U) >> 8), (uint8_t)(x_end - 1U),
+    };
+    const uint8_t raset[] = {
+        (uint8_t)(y_start >> 8), (uint8_t)y_start,
+        (uint8_t)((y_end - 1U) >> 8), (uint8_t)(y_end - 1U),
+    };
+    const size_t color_bytes =
+        (size_t)(x1 - x0) * (size_t)(y1 - y0) * sizeof(uint16_t);
+
+    if (!s_split_draw_logged) {
+        ESP_LOGI(TAG,
+                 "[LCD-SPI] first split draw: window=%lux%lu bytes=%u "
+                 "commands=%uHz pixels=%uHz pixel_duty=%u/256",
+                 (unsigned long)(x1 - x0), (unsigned long)(y1 - y0),
+                 (unsigned)color_bytes, (unsigned)APP_LCD_SPI_CMD_PCLK_HZ,
+                 (unsigned)APP_LCD_SPI_PCLK_HZ,
+                 (unsigned)APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS);
+        s_split_draw_logged = true;
+    }
+
+    lcd_cs_select();
+    esp_err_t ret = esp_lcd_panel_io_tx_param(s_lcd_io, LCD_CMD_CASET,
+                                               caset, sizeof(caset));
+    if (ret == ESP_OK) {
+        ret = esp_lcd_panel_io_tx_param(s_lcd_io, LCD_CMD_RASET,
+                                        raset, sizeof(raset));
+    }
+    if (ret == ESP_OK) {
+        ret = esp_lcd_panel_io_tx_param(s_lcd_io, LCD_CMD_RAMWR, NULL, 0);
+    }
+    if (ret == ESP_OK) {
+        ret = lcd_pixel_tx_color(pixels, color_bytes);
+    }
+    if (ret != ESP_OK) {
+        portENTER_CRITICAL(&s_lcd_stats_mux);
+        if (s_lcd_transfer_owner == owner &&
+            s_lcd_transfer_owner_sequence == owner_sequence) {
+            s_lcd_transfer_owner = LCD_TRANSFER_OWNER_NONE;
+            s_lcd_transfer_owner_sequence = 0;
+        }
+        portEXIT_CRITICAL(&s_lcd_stats_mux);
+        lcd_cs_deselect();
+        xSemaphoreGive(s_lcd_color_idle);
+        ESP_LOGE(TAG, "split-speed LCD draw failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 static bool lvgl_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
@@ -202,48 +425,73 @@ static bool lvgl_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
 {
     (void)panel_io;
     (void)edata;
+    (void)user_ctx;
     BaseType_t task_awoken = pdFALSE;
+
+    /* The pixel transaction owns CS until its ISR completion. */
+    gpio_ll_set_level(&GPIO, BSP_LCD_SPI_CS_GPIO, 1);
+
     const int64_t done_us = esp_timer_get_time();
     bool lvgl_flush_done = false;
     bool video_frame_done = false;
+    lcd_transfer_owner_t owner;
+    uint32_t owner_sequence;
 
+    /* Consume the owner before waking a task on the other core. Otherwise the
+     * next submitter can overwrite the global state while this ISR still uses
+     * it to decide which completion object to signal. */
     portENTER_CRITICAL_ISR(&s_lcd_stats_mux);
-    if (s_lcd_pending_count > 0) {
-        const lcd_flush_pending_t pending = s_lcd_pending[s_lcd_pending_head];
-        s_lcd_pending_head = (s_lcd_pending_head + 1U) % LCD_STATS_PENDING_MAX;
-        s_lcd_pending_count--;
+    owner = s_lcd_transfer_owner;
+    owner_sequence = s_lcd_transfer_owner_sequence;
+    s_lcd_transfer_owner = LCD_TRANSFER_OWNER_NONE;
+    s_lcd_transfer_owner_sequence = 0;
 
-        int64_t xfer_start_us = pending.submit_start_us;
-        if (s_lcd_last_xfer_done_us > xfer_start_us) {
-            xfer_start_us = s_lcd_last_xfer_done_us;
-        }
-        if (done_us >= xfer_start_us) {
-            s_lcd_refresh_xfer_us += (uint32_t)(done_us - xfer_start_us);
-        }
-        s_lcd_last_xfer_done_us = done_us;
+    if (owner == LCD_TRANSFER_OWNER_LVGL) {
+        if (s_lcd_pending_count > 0) {
+            const lcd_flush_pending_t pending = s_lcd_pending[s_lcd_pending_head];
+            s_lcd_pending_head = (s_lcd_pending_head + 1U) % LCD_STATS_PENDING_MAX;
+            s_lcd_pending_count--;
 
-        if (pending.is_last && s_lcd_refresh_flush_count > 0) {
-            s_lcd_refresh_ready.sequence++;
-            s_lcd_refresh_ready.period_us = s_lcd_last_refresh_done_us > 0
-                                                ? (uint32_t)(done_us - s_lcd_last_refresh_done_us)
-                                                : 0;
-            s_lcd_refresh_ready.total_us = (uint32_t)(done_us - s_lcd_refresh_start_us);
-            s_lcd_refresh_ready.flush_count = s_lcd_refresh_flush_count;
-            s_lcd_refresh_ready.pixel_count = s_lcd_refresh_pixel_count;
-            s_lcd_refresh_ready.swap_us = s_lcd_refresh_swap_us;
-            s_lcd_refresh_ready.submit_us = s_lcd_refresh_submit_us;
-            s_lcd_refresh_ready.xfer_us = s_lcd_refresh_xfer_us;
-            s_lcd_last_refresh_done_us = done_us;
-            s_lcd_refresh_flush_count = 0;
-            s_lcd_refresh_pixel_count = 0;
-            s_lcd_refresh_swap_us = 0;
-            s_lcd_refresh_submit_us = 0;
-            s_lcd_refresh_xfer_us = 0;
+            int64_t xfer_start_us = pending.submit_start_us;
+            if (s_lcd_last_xfer_done_us > xfer_start_us) {
+                xfer_start_us = s_lcd_last_xfer_done_us;
+            }
+            if (done_us >= xfer_start_us) {
+                s_lcd_refresh_xfer_us += (uint32_t)(done_us - xfer_start_us);
+            }
+            s_lcd_last_xfer_done_us = done_us;
+
+            if (pending.is_last && s_lcd_refresh_flush_count > 0) {
+                s_lcd_refresh_ready.sequence++;
+                s_lcd_refresh_ready.period_us = s_lcd_last_refresh_done_us > 0
+                                                    ? (uint32_t)(done_us - s_lcd_last_refresh_done_us)
+                                                    : 0;
+                s_lcd_refresh_ready.total_us = (uint32_t)(done_us - s_lcd_refresh_start_us);
+                s_lcd_refresh_ready.flush_count = s_lcd_refresh_flush_count;
+                s_lcd_refresh_ready.pixel_count = s_lcd_refresh_pixel_count;
+                s_lcd_refresh_ready.swap_us = s_lcd_refresh_swap_us;
+                s_lcd_refresh_ready.submit_us = s_lcd_refresh_submit_us;
+                s_lcd_refresh_ready.xfer_us = s_lcd_refresh_xfer_us;
+                s_lcd_last_refresh_done_us = done_us;
+                s_lcd_refresh_flush_count = 0;
+                s_lcd_refresh_pixel_count = 0;
+                s_lcd_refresh_swap_us = 0;
+                s_lcd_refresh_submit_us = 0;
+                s_lcd_refresh_xfer_us = 0;
+            }
+        } else {
+            s_lcd_owner_mismatch_count++;
         }
+        /* Owner is authoritative even if optional statistics bookkeeping was
+         * inconsistent; never leave LVGL waiting forever for flush_ready. */
         lvgl_flush_done = true;
-    } else if (s_video_frame_inflight) {
+    } else if (owner == LCD_TRANSFER_OWNER_VIDEO) {
+        if (!s_video_frame_inflight ||
+            owner_sequence != s_video_frame_sequence) {
+            s_lcd_owner_mismatch_count++;
+        }
         s_video_frame_isr_done_us = done_us;
-        s_video_frame_done_sequence = s_video_frame_sequence;
+        s_video_frame_done_sequence = owner_sequence;
         s_video_frame_inflight = false;
         video_frame_done = true;
     }
@@ -252,18 +500,30 @@ static bool lvgl_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
     if (video_frame_done && s_video_frame_done) {
         xSemaphoreGiveFromISR(s_video_frame_done, &task_awoken);
     }
-    if (lvgl_flush_done) {
-        lv_disp_flush_ready((lv_disp_drv_t *)user_ctx);
+    if (lvgl_flush_done && s_lvgl_disp_drv) {
+        lv_disp_flush_ready(s_lvgl_disp_drv);
+    }
+    /* Release the next submitter only after this ISR has consumed and cleared
+     * the explicit owner. This makes the cross-core handoff deterministic. */
+    if (s_lcd_color_idle) {
+        xSemaphoreGiveFromISR(s_lcd_color_idle, &task_awoken);
     }
     return task_awoken == pdTRUE;
 }
 
+static void lcd_pixel_post_trans_cb(spi_transaction_t *trans)
+{
+    if (trans && trans->user == (void *)1) {
+        (void)lvgl_flush_ready_cb(NULL, NULL, NULL);
+    }
+}
+
 static esp_err_t lvgl_register_flush_ready_cb(lv_disp_drv_t *drv)
 {
-    const esp_lcd_panel_io_callbacks_t callbacks = {
-        .on_color_trans_done = lvgl_flush_ready_cb,
-    };
-    return esp_lcd_panel_io_register_event_callbacks(s_lcd_io, &callbacks, drv);
+    ESP_RETURN_ON_FALSE(s_lcd_pixel_spi, ESP_ERR_INVALID_STATE, TAG,
+                        "lcd pixel SPI device not ready");
+    s_lvgl_disp_drv = drv;
+    return ESP_OK;
 }
 
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
@@ -298,7 +558,8 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
 
     esp_err_t err = lcd_draw_rgb565_bitmap(area->x1, area->y1,
                                            area->x2 + 1, area->y2 + 1,
-                                           (const uint16_t *)color_map);
+                                           (const uint16_t *)color_map,
+                                           LCD_TRANSFER_OWNER_LVGL, 0);
     const int64_t submit_done_us = esp_timer_get_time();
 
     portENTER_CRITICAL(&s_lcd_stats_mux);
@@ -609,18 +870,112 @@ esp_err_t bsp_lcd_init(void)
                  BSP_LCD_SPI_SCLK_GPIO, BSP_LCD_SPI_MOSI_GPIO);
     }
 
-    esp_lcd_panel_io_spi_config_t io_cfg = {
-        .cs_gpio_num = BSP_LCD_SPI_CS_GPIO,
+    gpio_config_t cs_cfg = {
+        .pin_bit_mask = 1ULL << BSP_LCD_SPI_CS_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&cs_cfg), TAG, "lcd manual cs gpio");
+    lcd_cs_deselect();
+
+    if (!s_lcd_color_idle) {
+        s_lcd_color_idle = xSemaphoreCreateBinary();
+        ESP_RETURN_ON_FALSE(s_lcd_color_idle, ESP_ERR_NO_MEM, TAG,
+                            "lcd color semaphore");
+    }
+    (void)xSemaphoreTake(s_lcd_color_idle, 0);
+    xSemaphoreGive(s_lcd_color_idle);
+
+    const esp_lcd_panel_io_spi_config_t cmd_io_cfg = {
+        .cs_gpio_num = -1,
         .dc_gpio_num = BSP_LCD_SPI_DC_GPIO,
         .spi_mode = 0,
-        .pclk_hz = APP_LCD_SPI_PCLK_HZ,
-        .trans_queue_depth = APP_LCD_SPI_QUEUE_DEPTH,
+        .pclk_hz = APP_LCD_SPI_CMD_PCLK_HZ,
+        .trans_queue_depth = 1,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
     };
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)BSP_LCD_SPI_HOST,
-                                                 &io_cfg, &s_lcd_io),
-                        TAG, "panel io");
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi(
+                            (esp_lcd_spi_bus_handle_t)BSP_LCD_SPI_HOST,
+                            &cmd_io_cfg, &s_lcd_io),
+                        TAG, "low-speed command panel io");
+
+    const spi_device_interface_config_t pixel_dev_cfg = {
+        .mode = 0,
+        .duty_cycle_pos = APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS,
+        .clock_speed_hz = APP_LCD_SPI_PCLK_HZ,
+        .spics_io_num = -1,
+        .flags = SPI_DEVICE_HALFDUPLEX,
+        .queue_size = APP_LCD_SPI_QUEUE_DEPTH,
+        .post_cb = lcd_pixel_post_trans_cb,
+    };
+    ESP_RETURN_ON_ERROR(
+        spi_bus_add_device(BSP_LCD_SPI_HOST, &pixel_dev_cfg,
+                           &s_lcd_pixel_spi),
+        TAG, "20 MHz 25-percent-duty pixel SPI device");
+    ESP_RETURN_ON_ERROR(
+        spi_bus_get_max_transaction_len(
+            BSP_LCD_SPI_HOST, &s_lcd_pixel_max_transfer_bytes),
+        TAG, "pixel max transaction length");
+    s_lcd_pixel_inflight = 0;
+
+    ESP_RETURN_ON_ERROR(
+        gpio_set_drive_capability(BSP_LCD_SPI_SCLK_GPIO,
+                                  (gpio_drive_cap_t)APP_LCD_SPI_SCLK_DRIVE_CAP),
+        TAG, "lcd sclk drive capability");
+    ESP_RETURN_ON_ERROR(
+        gpio_set_drive_capability(BSP_LCD_SPI_MOSI_GPIO,
+                                  (gpio_drive_cap_t)APP_LCD_SPI_MOSI_DRIVE_CAP),
+        TAG, "lcd mosi drive capability");
+    ESP_RETURN_ON_ERROR(
+        gpio_set_drive_capability(BSP_LCD_SPI_CS_GPIO,
+                                  (gpio_drive_cap_t)APP_LCD_SPI_CS_DRIVE_CAP),
+        TAG, "lcd cs drive capability");
+    ESP_RETURN_ON_ERROR(
+        gpio_set_drive_capability(BSP_LCD_SPI_DC_GPIO,
+                                  (gpio_drive_cap_t)APP_LCD_SPI_DC_DRIVE_CAP),
+        TAG, "lcd dc drive capability");
+
+    const size_t max_transfer_bytes =
+        APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS * sizeof(uint16_t);
+    const size_t full_frame_bytes =
+        APP_LCD_H_RES * APP_LCD_V_RES * sizeof(uint16_t);
+    const size_t full_frame_chunks =
+        (full_frame_bytes + max_transfer_bytes - 1U) / max_transfer_bytes;
+    ESP_LOGI(TAG,
+             "[LCD-SPI] split host=SPI3 mode=0 command_request=%uHz "
+             "command_actual=%uHz pixel_request=%uHz pixel_actual=%uHz "
+             "pixel_duty=%u/256 apb=%uHz queue=%u "
+             "max_transfer=%uB frame=%uB chunks=%u",
+             (unsigned)APP_LCD_SPI_CMD_PCLK_HZ,
+             (unsigned)lcd_spi_actual_clock_hz(
+                 APP_LCD_SPI_CMD_PCLK_HZ, 128U),
+             (unsigned)APP_LCD_SPI_PCLK_HZ,
+             (unsigned)lcd_spi_actual_clock_hz(
+                 APP_LCD_SPI_PCLK_HZ,
+                 APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS),
+             (unsigned)APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS,
+             (unsigned)APB_CLK_FREQ,
+             (unsigned)APP_LCD_SPI_QUEUE_DEPTH,
+             (unsigned)max_transfer_bytes, (unsigned)full_frame_bytes,
+             (unsigned)full_frame_chunks);
+    ESP_LOGI(TAG,
+             "[LCD-SPI] split path: init/CASET/RASET/RAMWR=%uHz, "
+             "RGB565-DMA=%uHz duty=%u/256, "
+             "CS=GPIO%d manual hold until pixel ISR",
+             (unsigned)APP_LCD_SPI_CMD_PCLK_HZ,
+             (unsigned)APP_LCD_SPI_PCLK_HZ,
+             (unsigned)APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS,
+             BSP_LCD_SPI_CS_GPIO);
+    ESP_LOGI(TAG,
+             "[LCD-SPI] drive_cap SCLK=%d MOSI=%d CS=%d DC=%d "
+             "(0=weakest,3=strongest,-1=read_failed)",
+             lcd_gpio_drive_capability(BSP_LCD_SPI_SCLK_GPIO),
+             lcd_gpio_drive_capability(BSP_LCD_SPI_MOSI_GPIO),
+             lcd_gpio_drive_capability(BSP_LCD_SPI_CS_GPIO),
+             lcd_gpio_drive_capability(BSP_LCD_SPI_DC_GPIO));
 
     esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = -1,
@@ -636,13 +991,10 @@ esp_err_t bsp_lcd_init(void)
     ESP_LOGI(TAG, "lcd_reset_gpio: %s", esp_err_to_name(ret));
     ESP_RETURN_ON_ERROR(ret, TAG, "lcd hw reset");
 
-    ret = esp_lcd_panel_reset(s_lcd_panel);
-    ESP_LOGI(TAG, "esp_lcd_panel_reset: %s", esp_err_to_name(ret));
-    ESP_RETURN_ON_ERROR(ret, TAG, "lcd sw reset");
-
-    ret = esp_lcd_panel_init(s_lcd_panel);
-    ESP_LOGI(TAG, "esp_lcd_panel_init: %s", esp_err_to_name(ret));
-    ESP_RETURN_ON_ERROR(ret, TAG, "lcd init");
+    ret = lcd_panel_init_low_speed();
+    ESP_LOGI(TAG, "lcd_panel_init_low_speed (%u Hz): %s",
+             (unsigned)APP_LCD_SPI_CMD_PCLK_HZ, esp_err_to_name(ret));
+    ESP_RETURN_ON_ERROR(ret, TAG, "lcd low-speed init");
 
     vTaskDelay(pdMS_TO_TICKS(120));
 
@@ -650,12 +1002,16 @@ esp_err_t bsp_lcd_init(void)
     ESP_LOGI(TAG, "esp_lcd_panel_set_gap: %s", esp_err_to_name(ret));
     ESP_RETURN_ON_ERROR(ret, TAG, "lcd gap");
 
+    lcd_cs_select();
     ret = esp_lcd_panel_invert_color(s_lcd_panel, true);
-    ESP_LOGI(TAG, "esp_lcd_panel_invert_color: %s", esp_err_to_name(ret));
+    lcd_cs_deselect();
+    ESP_LOGI(TAG, "esp_lcd_panel_invert_color (command clock): %s", esp_err_to_name(ret));
     ESP_RETURN_ON_ERROR(ret, TAG, "lcd invert");
 
+    lcd_cs_select();
     ret = esp_lcd_panel_disp_on_off(s_lcd_panel, true);
-    ESP_LOGI(TAG, "esp_lcd_panel_disp_on_off: %s", esp_err_to_name(ret));
+    lcd_cs_deselect();
+    ESP_LOGI(TAG, "esp_lcd_panel_disp_on_off (command clock): %s", esp_err_to_name(ret));
     ESP_RETURN_ON_ERROR(ret, TAG, "lcd on");
     bl_err = bsp_ioexp_set_pin(BSP_IO_EXP_LCD_BL_PIN, true);
     if (bl_err != ESP_OK) {
@@ -676,10 +1032,36 @@ esp_err_t bsp_lcd_release_for_camera(void)
     s_lcd_suspended = true;
     vTaskDelay(pdMS_TO_TICKS(40));
 
+    if (s_lcd_color_idle) {
+        ESP_RETURN_ON_FALSE(
+            xSemaphoreTake(s_lcd_color_idle, pdMS_TO_TICKS(1000)) == pdTRUE,
+            ESP_ERR_TIMEOUT, TAG, "LCD pixel transfer still active during release");
+        xSemaphoreGive(s_lcd_color_idle);
+    }
+
     if (s_lcd_panel) {
+        lcd_cs_select();
         esp_lcd_panel_disp_on_off(s_lcd_panel, false);
+        lcd_cs_deselect();
         esp_lcd_panel_del(s_lcd_panel);
         s_lcd_panel = NULL;
+        s_lcd_ready = false;
+    }
+    if (s_lcd_pixel_spi) {
+        esp_err_t err = lcd_pixel_recycle_completed();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "pixel transaction recycle failed: %s",
+                     esp_err_to_name(err));
+        }
+        err = spi_bus_remove_device(s_lcd_pixel_spi);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "pixel SPI device removal failed: %s",
+                     esp_err_to_name(err));
+        } else {
+            s_lcd_pixel_spi = NULL;
+            s_lcd_pixel_max_transfer_bytes = 0;
+            s_lcd_pixel_inflight = 0;
+        }
         s_lcd_ready = false;
     }
     if (s_lcd_io) {
@@ -687,6 +1069,7 @@ esp_err_t bsp_lcd_release_for_camera(void)
         s_lcd_io = NULL;
         s_lcd_ready = false;
     }
+    lcd_cs_deselect();
     if (s_lcd_bus_ready) {
         esp_err_t err = spi_bus_free(BSP_LCD_SPI_HOST);
         if (err != ESP_OK) {
@@ -696,6 +1079,8 @@ esp_err_t bsp_lcd_release_for_camera(void)
         }
     }
     bsp_ioexp_set_pin(BSP_IO_EXP_LCD_BL_PIN, false);
+    s_video_path_logged = false;
+    s_split_draw_logged = false;
     return ESP_OK;
 }
 
@@ -740,7 +1125,8 @@ esp_err_t bsp_lcd_show_test_pattern(void)
             }
         }
         esp_err_t err = lcd_draw_rgb565_bitmap(0, y, APP_LCD_H_RES,
-                                               y + draw_rows, line);
+                                               y + draw_rows, line,
+                                               LCD_TRANSFER_OWNER_OTHER, 0);
         if (y == 0) {
             ESP_LOGI(TAG, "first draw_bitmap (y=0..%lu): %s", (unsigned long)draw_rows, esp_err_to_name(err));
         }
@@ -750,8 +1136,14 @@ esp_err_t bsp_lcd_show_test_pattern(void)
         }
     }
 
+    if (xSemaphoreTake(s_lcd_color_idle, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE(TAG, "LCD test pattern final transfer timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+    xSemaphoreGive(s_lcd_color_idle);
+
     heap_caps_free(line);
-    ESP_LOGI(TAG, "LCD test pattern drawn");
+    ESP_LOGI(TAG, "LCD test pattern drawn with split-speed SPI");
     return ESP_OK;
 }
 
@@ -1029,29 +1421,113 @@ esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
                                  : esp_ptr_dma_capable(rgb565);
     ESP_RETURN_ON_FALSE(dma_capable, ESP_ERR_INVALID_ARG, TAG,
                         "video frame is not DMA capable");
+    if (!s_video_path_logged) {
+        const bool external = esp_ptr_external_ram(rgb565);
+        const size_t frame_bytes = width * height * sizeof(uint16_t);
+        const size_t chunk_bytes =
+            APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS * sizeof(uint16_t);
+        const size_t chunks =
+            (frame_bytes + chunk_bytes - 1U) / chunk_bytes;
+        ESP_LOGI(TAG,
+                 "[LCD-SPI] video_buffer=%s dma=%s addr=%p aligned64=%d "
+                 "bytes=%u chunk_bytes=%u chunks=%u",
+                 external ? "PSRAM" : "internal",
+                 external ? "PSRAM-direct" : "internal-direct",
+                 (const void *)rgb565,
+                 (((uintptr_t)rgb565 & 63U) == 0U) ? 1 : 0,
+                 (unsigned)frame_bytes, (unsigned)chunk_bytes,
+                 (unsigned)chunks);
+        s_video_path_logged = true;
+    }
     if (!s_video_frame_done) {
         s_video_frame_done = xSemaphoreCreateBinary();
         ESP_RETURN_ON_FALSE(s_video_frame_done, ESP_ERR_NO_MEM, TAG,
                             "video frame semaphore");
     }
-    ESP_RETURN_ON_FALSE(!s_video_frame_inflight, ESP_ERR_INVALID_STATE, TAG,
-                        "video frame still in flight");
+    bool already_inflight;
+    lcd_transfer_owner_t active_owner;
+    uint32_t active_sequence;
+    portENTER_CRITICAL(&s_lcd_stats_mux);
+    already_inflight = s_video_frame_inflight;
+    active_owner = s_lcd_transfer_owner;
+    active_sequence = s_lcd_transfer_owner_sequence;
+    portEXIT_CRITICAL(&s_lcd_stats_mux);
+    if (already_inflight) {
+        ESP_LOGE(TAG,
+                 "[LCD-TRANSITION] reject video: inflight=1 owner=%d owner_seq=%lu",
+                 (int)active_owner, (unsigned long)active_sequence);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     (void)xSemaphoreTake(s_video_frame_done, 0);
-    const uint32_t frame_sequence = ++s_video_frame_sequence;
+    uint32_t frame_sequence;
+    uint32_t pending_before_submit;
+    uint32_t mismatch_before_submit;
+    portENTER_CRITICAL(&s_lcd_stats_mux);
+    frame_sequence = ++s_video_frame_sequence;
     s_video_frame_done_sequence = 0;
     s_video_frame_isr_done_us = 0;
     s_video_frame_inflight = true;
+    pending_before_submit = s_lcd_pending_count;
+    mismatch_before_submit = s_lcd_owner_mismatch_count;
+    portEXIT_CRITICAL(&s_lcd_stats_mux);
+    if (frame_sequence <= 3U) {
+        ESP_LOGW(TAG,
+                 "[LCD-TRANSITION] submit video seq=%lu lvgl_pending=%lu owner_mismatch=%lu",
+                 (unsigned long)frame_sequence,
+                 (unsigned long)pending_before_submit,
+                 (unsigned long)mismatch_before_submit);
+    }
+
     const int64_t start_us = esp_timer_get_time();
-    esp_err_t err = lcd_draw_rgb565_bitmap(0, 0, width, height, rgb565);
+    esp_err_t err = lcd_draw_rgb565_bitmap(
+        0, 0, width, height, rgb565,
+        LCD_TRANSFER_OWNER_VIDEO, frame_sequence);
     const int64_t submit_done_us = esp_timer_get_time();
     if (err != ESP_OK) {
-        s_video_frame_inflight = false;
+        portENTER_CRITICAL(&s_lcd_stats_mux);
+        if (s_video_frame_sequence == frame_sequence) {
+            s_video_frame_inflight = false;
+        }
+        portEXIT_CRITICAL(&s_lcd_stats_mux);
+        ESP_LOGE(TAG, "[LCD-TRANSITION] video submit failed seq=%lu: %s",
+                 (unsigned long)frame_sequence, esp_err_to_name(err));
         return err;
     }
 
     if (xSemaphoreTake(s_video_frame_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        ESP_LOGE(TAG, "video frame transfer timeout");
+        const bool pixel_idle =
+            xSemaphoreTake(s_lcd_color_idle, 0) == pdTRUE;
+        if (pixel_idle) {
+            xSemaphoreGive(s_lcd_color_idle);
+        }
+
+        bool recovered = false;
+        uint32_t pending_on_timeout;
+        uint32_t mismatch_on_timeout;
+        portENTER_CRITICAL(&s_lcd_stats_mux);
+        active_owner = s_lcd_transfer_owner;
+        active_sequence = s_lcd_transfer_owner_sequence;
+        pending_on_timeout = s_lcd_pending_count;
+        mismatch_on_timeout = s_lcd_owner_mismatch_count;
+        if (pixel_idle && s_video_frame_sequence == frame_sequence) {
+            s_video_frame_inflight = false;
+            if (s_lcd_transfer_owner == LCD_TRANSFER_OWNER_VIDEO &&
+                s_lcd_transfer_owner_sequence == frame_sequence) {
+                s_lcd_transfer_owner = LCD_TRANSFER_OWNER_NONE;
+                s_lcd_transfer_owner_sequence = 0;
+            }
+            recovered = true;
+        }
+        portEXIT_CRITICAL(&s_lcd_stats_mux);
+
+        ESP_LOGE(TAG,
+                 "[LCD-TRANSITION] video timeout seq=%lu pixel_idle=%d "
+                 "owner=%d owner_seq=%lu lvgl_pending=%lu owner_mismatch=%lu recovered=%d",
+                 (unsigned long)frame_sequence, pixel_idle ? 1 : 0,
+                 (int)active_owner, (unsigned long)active_sequence,
+                 (unsigned long)pending_on_timeout,
+                 (unsigned long)mismatch_on_timeout, recovered ? 1 : 0);
         return ESP_ERR_TIMEOUT;
     }
 

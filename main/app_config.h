@@ -360,8 +360,15 @@
 #define APP_LCD_V_RES                   320U
 #define APP_LCD_X_GAP                   0
 #define APP_LCD_Y_GAP                   0
-#define APP_LCD_SPI_PCLK_HZ             (12U * 1000U * 1000U)
+/* Commands use the conservative clock; APP_LCD_SPI_PCLK_HZ is pixel DMA only. */
+#define APP_LCD_SPI_CMD_PCLK_HZ         10000000U
+#define APP_LCD_SPI_PCLK_HZ             20000000U
+#define APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS 64U
 #define APP_LCD_SPI_QUEUE_DEPTH         10U
+#define APP_LCD_SPI_SCLK_DRIVE_CAP      3U
+#define APP_LCD_SPI_MOSI_DRIVE_CAP      3U
+#define APP_LCD_SPI_CS_DRIVE_CAP        3U
+#define APP_LCD_SPI_DC_DRIVE_CAP        3U
 #define APP_LCD_TEST_PATTERN_ROWS       20U
 #define APP_LCD_LVGL_BUFFER_ROWS        40U
 #define APP_LCD_LVGL_TICK_MS            2U
