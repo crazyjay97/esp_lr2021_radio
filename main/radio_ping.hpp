@@ -38,6 +38,8 @@ typedef void (*image_rx_progress_cb_t)(uint16_t session_id, uint16_t received,
 typedef void (*image_rx_error_cb_t)(ImageRxError error);
 typedef void (*image_rx_eot_cb_t)(uint16_t missing_count, bool is_first_eot);
 typedef void (*config_received_cb_t)(uint8_t key, uint32_t value);
+typedef void (*frequency_committed_cb_t)(uint32_t frequency_hz);
+typedef void (*frequency_change_result_cb_t)(bool success, uint32_t frequency_hz);
 // Called on the gateway when a node's battery voltage arrives (via ImageStart
 // or a periodic Vbat broadcast), so the app can push it to the UI.
 typedef void (*vbat_received_cb_t)(uint16_t vbat_mv);
@@ -63,6 +65,10 @@ public:
     // the node, while an image TX is running). Callers use this to avoid firing
     // a second transfer request on top of an active one.
     bool image_busy() const { return image_tx_active_ || image_rx_pending_ || image_req_active_; }
+    bool frequency_change_busy() const {
+        return frequency_change_request_pending_ || frequency_change_active_ ||
+               frequency_rollback_active_;
+    }
     // Gateway: abort the in-progress image RX (and any pending ImageCmd retry).
     // Called from the UI thread when the user leaves the transfer page; only
     // sets a request flag so the actual radio-state teardown happens in the
@@ -81,10 +87,15 @@ public:
     void set_vbat_received_cb(vbat_received_cb_t cb) { vbat_received_cb_ = cb; }
     void set_image_rx_eot_cb(image_rx_eot_cb_t cb) { image_rx_eot_cb_ = cb; }
     void set_config_received_cb(config_received_cb_t cb) { config_received_cb_ = cb; }
+    void set_frequency_committed_cb(frequency_committed_cb_t cb) { frequency_committed_cb_ = cb; }
+    void set_frequency_change_result_cb(frequency_change_result_cb_t cb) { frequency_change_result_cb_ = cb; }
     void set_low_power_standby_cb(low_power_standby_cb_t cb) { low_power_standby_cb_ = cb; }
     void set_inter_packet_us(uint32_t us) { image_tx_inter_packet_us_ = us; }
 
     bool send_config(uint8_t key, uint32_t value);
+    bool request_frequency_change(uint32_t frequency_hz);
+    bool set_initial_frequency(uint32_t frequency_hz);
+    uint32_t current_frequency_hz() const { return current_frequency_hz_; }
 
     ImageTransfer &image_xfer() { return image_xfer_; }
     uint32_t last_transfer_ms() const { return image_rx_transfer_ms_; }
@@ -152,6 +163,9 @@ private:
     void schedule_rx();
     void schedule_tx();
     bool configure_flrc();
+    bool apply_frequency(uint32_t frequency_hz);
+    bool is_frequency_preset(uint32_t frequency_hz) const;
+    bool change_frequency(uint32_t frequency_hz);
     bool build_voice_packet(uint16_t *tx_size);
     void capture_voice_packet();
     void handle_rx_packet();
@@ -208,7 +222,10 @@ private:
     bool wait_for_tx_done(uint32_t timeout_ms);
     void check_image_rx_timeout();
     void check_image_rx_abort();
-    void send_config_ack(uint8_t key, uint32_t value);
+    bool send_config_ack(uint8_t key, uint32_t value, uint16_t transaction_id = 0);
+    void handle_frequency_config(uint16_t transaction_id, uint32_t frequency_hz);
+    void handle_frequency_confirm(uint16_t transaction_id, uint32_t frequency_hz);
+    void check_frequency_rollback();
     bool configure_lora_cad();
     void enter_low_power_cad();
     // Light-sleep the ESP32 for up to `ms`, waking on the timer or (if PIR is
@@ -290,6 +307,8 @@ private:
     vbat_received_cb_t vbat_received_cb_ = nullptr;
     image_rx_eot_cb_t image_rx_eot_cb_ = nullptr;
     config_received_cb_t config_received_cb_ = nullptr;
+    frequency_committed_cb_t frequency_committed_cb_ = nullptr;
+    frequency_change_result_cb_t frequency_change_result_cb_ = nullptr;
     low_power_standby_cb_t low_power_standby_cb_ = nullptr;
     uint16_t image_session_id_ = 1;
     volatile bool image_tx_active_ = false;
@@ -331,6 +350,20 @@ private:
 
     // Config ACK state
     volatile bool config_ack_received_ = false;
+    uint8_t config_ack_key_ = 0;
+    uint32_t config_ack_value_ = 0;
+    uint16_t config_ack_transaction_id_ = 0;
+
+    // Two-stage frequency change state.
+    volatile bool frequency_change_active_ = false;
+    volatile bool frequency_change_request_pending_ = false;
+    uint32_t frequency_change_request_hz_ = APP_FLRC_FREQUENCY_HZ;
+    bool frequency_rollback_active_ = false;
+    uint32_t current_frequency_hz_ = APP_FLRC_FREQUENCY_HZ;
+    uint32_t frequency_previous_hz_ = APP_FLRC_FREQUENCY_HZ;
+    uint32_t frequency_pending_hz_ = APP_FLRC_FREQUENCY_HZ;
+    uint32_t frequency_rollback_deadline_ms_ = 0;
+    uint16_t frequency_transaction_id_ = 0;
 
     // Low power CAD state
     bool low_power_cad_active_ = false;

@@ -25,6 +25,7 @@ typedef bool (*ui_gw_sound_trigger_cb_t)(uint32_t level);
 typedef bool (*ui_gw_pir_trigger_cb_t)(uint32_t enable);
 typedef bool (*ui_gw_voice_alarm_cb_t)(uint32_t enable);
 typedef bool (*ui_gw_low_power_cb_t)(uint32_t enable);
+typedef bool (*ui_gw_frequency_cb_t)(uint32_t frequency_hz);
 typedef void (*ui_gw_wifi_prov_cb_t)(void);
 typedef void (*ui_gw_wifi_disconnect_cb_t)(void);
 // Called when the user leaves the transfer (RX) page: abort the current RX.
@@ -63,6 +64,7 @@ void ui_gw_set_sound_trigger_cb(ui_gw_sound_trigger_cb_t cb);
 void ui_gw_set_pir_trigger_cb(ui_gw_pir_trigger_cb_t cb);
 void ui_gw_set_voice_alarm_cb(ui_gw_voice_alarm_cb_t cb);
 void ui_gw_set_low_power_cb(ui_gw_low_power_cb_t cb);
+void ui_gw_set_frequency_cb(ui_gw_frequency_cb_t cb);
 void ui_gw_set_wifi_prov_cb(ui_gw_wifi_prov_cb_t cb);
 void ui_gw_set_wifi_disconnect_cb(ui_gw_wifi_disconnect_cb_t cb);
 void ui_gw_set_rx_abort_cb(ui_gw_rx_abort_cb_t cb);
@@ -76,6 +78,8 @@ void ui_gw_hide_qr(void);
 /* Non-blocking update of the node battery voltage display (mV).
  * Call with 0 to hide. */
 void ui_gw_update_vbat(uint16_t vbat_mv);
+void ui_gw_set_current_frequency(uint32_t frequency_hz);
+void ui_gw_frequency_result(bool success, uint32_t frequency_hz);
 
 #ifdef __cplusplus
 }

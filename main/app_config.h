@@ -61,8 +61,17 @@
 
 /* ----- FLRC radio link ------------------------------------------------------- */
 
-/* Center frequency. Confirm the exact channel is legal for the deployment area. */
-#define APP_FLRC_FREQUENCY_HZ           915120000UL
+/* Default center frequency and ten fixed pseudo-random channel presets. */
+#define APP_FLRC_FREQUENCY_HZ           921470000UL
+#define APP_FLRC_FREQUENCY_PRESET_COUNT 10U
+#define APP_FLRC_FREQUENCY_PRESETS_HZ   { \
+    921470000UL, 922430000UL, 923480000UL, 924390000UL, 925490000UL, \
+    926470000UL, 927500000UL, 928440000UL, 929420000UL, 930500000UL  \
+}
+#define APP_FREQUENCY_CONFIRM_TIMEOUT_MS 500U
+#define APP_FREQUENCY_CONFIRM_RETRIES   3U
+#define APP_FREQUENCY_ACK_SETTLE_MS     200U
+#define APP_FREQUENCY_ROLLBACK_MS       2000U
 
 /* LR2021 FLRC high-rate mode requested for this project.
  * Informational only (used in logs): the upgraded driver selects the rate via
@@ -222,6 +231,7 @@
 #define APP_CFG_KEY_PIR_TRIGGER         0x05
 #define APP_CFG_KEY_VOICE_ALARM         0x06
 #define APP_CFG_KEY_LOW_POWER           0x07
+#define APP_CFG_KEY_FREQUENCY           0x08
 #define APP_AUDIO_CLIP_DEFAULT_ENABLE   0
 
 

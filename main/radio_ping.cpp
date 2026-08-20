@@ -45,7 +45,10 @@ constexpr uint8_t kPacketTypeConfig = 9;
 constexpr uint8_t kPacketTypeConfigAck = 10;
 constexpr uint8_t kPacketTypeImageCmdAck = 11;
 constexpr uint8_t kPacketTypeVbat = 12;
+constexpr uint8_t kPacketTypeFrequencyConfirm = 13;
 constexpr uint16_t kHeaderSize = 14;
+constexpr uint32_t kFrequencyPresetsHz[APP_FLRC_FREQUENCY_PRESET_COUNT] =
+    APP_FLRC_FREQUENCY_PRESETS_HZ;
 
 /* Low-power node battery voltage maintenance cadence and broadcast interval. */
 constexpr uint32_t kVbatLowPowerSampleIntervalMs = 60000;     /* 60 s */
@@ -118,6 +121,15 @@ uint32_t crc32_ieee(const uint8_t *data, size_t len)
 
 RadioPing *RadioPing::instance_ = nullptr;
 
+bool RadioPing::set_initial_frequency(uint32_t frequency_hz)
+{
+    if (!is_frequency_preset(frequency_hz)) return false;
+    current_frequency_hz_ = frequency_hz;
+    frequency_previous_hz_ = frequency_hz;
+    frequency_pending_hz_ = frequency_hz;
+    return true;
+}
+
 esp_err_t RadioPing::init()
 {
     instance_ = this;
@@ -177,7 +189,7 @@ esp_err_t RadioPing::init()
     }
 
     ESP_LOGI(TAG, "LR2021 direct RAL initialized: FLRC rf=%lu Hz br=%lu bps bw=%lu Hz",
-             APP_FLRC_FREQUENCY_HZ, APP_FLRC_BITRATE_BPS, APP_FLRC_BANDWIDTH_HZ);
+             current_frequency_hz_, APP_FLRC_BITRATE_BPS, APP_FLRC_BANDWIDTH_HZ);
 #if APP_RADIO_AUTO_RX_ENABLE
     schedule_rx();
 #else
@@ -227,7 +239,7 @@ esp_err_t RadioPing::init_gateway()
     }
 
     ESP_LOGI(TAG, "LR2021 gateway mode (RX-only): FLRC rf=%lu Hz br=%lu bps bw=%lu Hz",
-             APP_FLRC_FREQUENCY_HZ, APP_FLRC_BITRATE_BPS, APP_FLRC_BANDWIDTH_HZ);
+             current_frequency_hz_, APP_FLRC_BITRATE_BPS, APP_FLRC_BANDWIDTH_HZ);
 #if APP_RADIO_AUTO_RX_ENABLE
     schedule_rx();
 #endif
@@ -384,15 +396,48 @@ void RadioPing::play_task_trampoline(void *arg)
 void RadioPing::task()
 {
     while (true) {
+        if (frequency_change_request_pending_) {
+            uint32_t requested_hz = frequency_change_request_hz_;
+            bool ok = change_frequency(requested_hz);
+            frequency_change_request_pending_ = false;
+            if (frequency_change_result_cb_) {
+                frequency_change_result_cb_(ok, current_frequency_hz_);
+            }
+        }
         if (!suspended_) {
             poll_once();
             update_playback_timeout();
             check_image_rx_timeout();
             check_image_req_retry();
             check_image_rx_abort();
+            check_frequency_rollback();
         }
         ulTaskNotifyTake(pdTRUE, ms_to_ticks_min_1(APP_RADIO_TASK_POLL_MS));
     }
+}
+
+bool RadioPing::request_frequency_change(uint32_t frequency_hz)
+{
+    if (!is_gateway_ || task_handle_ == nullptr ||
+        frequency_change_request_pending_ || frequency_change_active_ ||
+        image_busy() || !is_frequency_preset(frequency_hz) ||
+        frequency_hz == current_frequency_hz_) {
+        ESP_LOGE(TAG,
+                 "frequency request rejected: gateway=%d task=%d pending=%d busy=%d current=%lu requested=%lu",
+                 is_gateway_, task_handle_ != nullptr,
+                 frequency_change_request_pending_,
+                 frequency_change_active_ || image_busy(),
+                 static_cast<unsigned long>(current_frequency_hz_),
+                 static_cast<unsigned long>(frequency_hz));
+        return false;
+    }
+
+    frequency_change_request_hz_ = frequency_hz;
+    frequency_change_request_pending_ = true;
+    xTaskNotifyGive(task_handle_);
+    ESP_LOGW(TAG, "frequency request queued: %lu Hz",
+             static_cast<unsigned long>(frequency_hz));
+    return true;
 }
 
 void RadioPing::tx_task()
@@ -570,7 +615,9 @@ void RadioPing::poll_once()
     }
 
     if (mode_ == Mode::idle) {
-        if (g_low_power_enabled && !is_gateway_) {
+        if (frequency_rollback_active_ && !is_gateway_) {
+            schedule_rx();
+        } else if (g_low_power_enabled && !is_gateway_) {
             // Low-power CAD sleep is a NODE-only behavior. The gateway never
             // sleeps: it must stay in continuous FLRC RX so it can receive a
             // node's self-initiated (PIR-triggered) image push, which arrives
@@ -786,7 +833,7 @@ void RadioPing::schedule_tx()
 bool RadioPing::configure_flrc()
 {
     ralf_params_flrc_t params = {};
-    params.rf_freq_in_hz = APP_FLRC_FREQUENCY_HZ;
+    params.rf_freq_in_hz = current_frequency_hz_;
     params.output_pwr_in_dbm = APP_FLRC_TX_POWER_DBM;
     params.mod_params.raw_bit_rate = APP_FLRC_RAW_BIT_RATE;
     params.mod_params.cr = APP_FLRC_CODING_RATE;
@@ -830,6 +877,42 @@ bool RadioPing::configure_flrc()
         ESP_LOGE(TAG, "configure_flrc: 1024 RX FIFO failed");
         return false;
     }
+    return true;
+}
+
+bool RadioPing::is_frequency_preset(uint32_t frequency_hz) const
+{
+    for (uint32_t preset : kFrequencyPresetsHz) {
+        if (preset == frequency_hz) return true;
+    }
+    return false;
+}
+
+bool RadioPing::apply_frequency(uint32_t frequency_hz)
+{
+    if (!is_frequency_preset(frequency_hz)) {
+        ESP_LOGW(TAG, "reject unsupported frequency: %lu Hz",
+                 static_cast<unsigned long>(frequency_hz));
+        return false;
+    }
+
+    smtc_modem_hal_protect_api_call();
+    if (mode_ != Mode::idle) {
+        (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+        (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+        mode_ = Mode::idle;
+    }
+    current_frequency_hz_ = frequency_hz;
+    bool ok = configure_flrc();
+    smtc_modem_hal_unprotect_api_call();
+
+    if (!ok) {
+        ESP_LOGE(TAG, "frequency apply failed: %lu Hz",
+                 static_cast<unsigned long>(frequency_hz));
+        return false;
+    }
+    ESP_LOGI(TAG, "frequency applied: %lu Hz",
+             static_cast<unsigned long>(frequency_hz));
     return true;
 }
 
@@ -1024,13 +1107,24 @@ void RadioPing::dispatch_rx_packet(uint16_t len, int16_t rssi)
     } else if (rx_buf_[4] == kPacketTypeImageCmdAck) {
         handle_image_cmd_ack();
     } else if (rx_buf_[4] == kPacketTypeConfig) {
+        uint16_t transaction_id = get_u16_le(&rx_buf_[6]);
         uint8_t key = rx_buf_[8];
         uint32_t value = get_u32_le(&rx_buf_[9]);
-        ESP_LOGI(TAG, "RX Config: key=%u value=%lu", key, static_cast<unsigned long>(value));
-        if (config_received_cb_) {
-            config_received_cb_(key, value);
+        if (key == APP_CFG_KEY_FREQUENCY) {
+            ESP_LOGW(TAG, "RX frequency Config: tx=%u hz=%lu", transaction_id,
+                     static_cast<unsigned long>(value));
+        } else {
+            ESP_LOGI(TAG, "RX Config: key=%u value=%lu", key,
+                     static_cast<unsigned long>(value));
         }
-        send_config_ack(key, value);
+        if (key == APP_CFG_KEY_FREQUENCY) {
+            handle_frequency_config(transaction_id, value);
+        } else {
+            if (config_received_cb_) {
+                config_received_cb_(key, value);
+            }
+            (void)send_config_ack(key, value, transaction_id);
+        }
         // Low power: config applied + ACK sent, work done. End the wake window
         // so the main loop returns to CAD sleep on the next idle pass.
         if (g_low_power_enabled && !is_gateway_ && cad_wakeup_ms_ != 0) {
@@ -1038,8 +1132,15 @@ void RadioPing::dispatch_rx_packet(uint16_t len, int16_t rssi)
             ESP_LOGI(TAG, "config ACK sent, ending wake window -> CAD sleep");
         }
     } else if (rx_buf_[4] == kPacketTypeConfigAck) {
-        ESP_LOGI(TAG, "RX ConfigAck");
+        config_ack_transaction_id_ = get_u16_le(&rx_buf_[6]);
+        config_ack_key_ = rx_buf_[8];
+        config_ack_value_ = get_u32_le(&rx_buf_[9]);
+        ESP_LOGI(TAG, "RX ConfigAck: tx=%u key=%u value=%lu",
+                 config_ack_transaction_id_, config_ack_key_,
+                 static_cast<unsigned long>(config_ack_value_));
         config_ack_received_ = true;
+    } else if (rx_buf_[4] == kPacketTypeFrequencyConfirm) {
+        handle_frequency_confirm(get_u16_le(&rx_buf_[6]), get_u32_le(&rx_buf_[9]));
     } else if (rx_buf_[4] == kPacketTypeVbat) {
         // Battery voltage broadcast: [14..15] vbat_mv, [16..19] CRC32 over [0..15].
         if (len >= kHeaderSize + 6) {
@@ -2302,7 +2403,8 @@ bool RadioPing::send_config(uint8_t key, uint32_t value)
     std::memcpy(pkt, kMagic, sizeof(kMagic));
     pkt[4] = kPacketTypeConfig;
     pkt[5] = 1;
-    put_u16_le(&pkt[6], 0);
+    const uint16_t transaction_id = 0;
+    put_u16_le(&pkt[6], transaction_id);
     pkt[8] = key;
     put_u32_le(&pkt[9], value);
     pkt[13] = 0;
@@ -2333,9 +2435,11 @@ bool RadioPing::send_config(uint8_t key, uint32_t value)
         }
         smtc_modem_hal_unprotect_api_call();
 
-        send_single_packet(pkt, kHeaderSize);
-
         config_ack_received_ = false;
+        config_ack_key_ = 0;
+        config_ack_value_ = 0;
+        config_ack_transaction_id_ = 0;
+        send_single_packet(pkt, kHeaderSize);
         schedule_rx();
 
         uint32_t wait_start = smtc_modem_hal_get_time_in_ms();
@@ -2356,7 +2460,9 @@ bool RadioPing::send_config(uint8_t key, uint32_t value)
             taskYIELD();
         }
 
-        if (config_ack_received_) {
+        if (config_ack_received_ &&
+            config_ack_key_ == key && config_ack_value_ == value &&
+            config_ack_transaction_id_ == transaction_id) {
             ESP_LOGI(TAG, "send_config: ACK received on attempt %d", attempt + 1);
             suspended_ = false;
             if (!ptt_active_) schedule_rx();
@@ -2371,13 +2477,151 @@ bool RadioPing::send_config(uint8_t key, uint32_t value)
     return false;
 }
 
-void RadioPing::send_config_ack(uint8_t key, uint32_t value)
+bool RadioPing::change_frequency(uint32_t frequency_hz)
+{
+    if (!is_gateway_ || frequency_change_active_ || image_busy() ||
+        !is_frequency_preset(frequency_hz) || frequency_hz == current_frequency_hz_) {
+        ESP_LOGW(TAG, "frequency change rejected: gateway=%d busy=%d current=%lu requested=%lu",
+                 is_gateway_, frequency_change_active_ || image_busy(),
+                 static_cast<unsigned long>(current_frequency_hz_),
+                 static_cast<unsigned long>(frequency_hz));
+        return false;
+    }
+
+    frequency_change_active_ = true;
+    suspended_ = true;
+    const uint32_t previous_hz = current_frequency_hz_;
+    uint16_t transaction_id = ++frequency_transaction_id_;
+    if (transaction_id == 0) {
+        frequency_transaction_id_ = 1;
+        transaction_id = 1;
+    }
+
+    uint8_t config_pkt[kHeaderSize] = {};
+    std::memcpy(config_pkt, kMagic, sizeof(kMagic));
+    config_pkt[4] = kPacketTypeConfig;
+    config_pkt[5] = 1;
+    put_u16_le(&config_pkt[6], transaction_id);
+    config_pkt[8] = APP_CFG_KEY_FREQUENCY;
+    put_u32_le(&config_pkt[9], frequency_hz);
+
+    if (g_low_power_enabled) {
+        if (!send_lora_wakeup()) {
+            suspended_ = false;
+            frequency_change_active_ = false;
+            if (!ptt_active_) schedule_rx();
+            return false;
+        }
+        (void)configure_flrc();
+    }
+
+    bool config_ok = false;
+    for (uint32_t attempt = 0; attempt < APP_FREQUENCY_CONFIRM_RETRIES; ++attempt) {
+        ESP_LOGW(TAG, "TX frequency Config: tx=%u attempt=%lu hz=%lu",
+                 transaction_id, static_cast<unsigned long>(attempt + 1U),
+                 static_cast<unsigned long>(frequency_hz));
+        smtc_modem_hal_protect_api_call();
+        if (mode_ == Mode::rx_pending) {
+            (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+            (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+            mode_ = Mode::idle;
+        }
+        smtc_modem_hal_unprotect_api_call();
+
+        config_ack_received_ = false;
+        config_ack_key_ = 0;
+        config_ack_value_ = 0;
+        config_ack_transaction_id_ = 0;
+        (void)send_single_packet(config_pkt, kHeaderSize);
+        schedule_rx();
+
+        uint32_t wait_start = smtc_modem_hal_get_time_in_ms();
+        while (!config_ack_received_ &&
+               smtc_modem_hal_get_time_in_ms() - wait_start <=
+                   APP_FREQUENCY_CONFIRM_TIMEOUT_MS) {
+            if (irq_pending_) {
+                irq_pending_ = false;
+                ral_irq_t irq = RAL_IRQ_NONE;
+                smtc_modem_hal_protect_api_call();
+                ral_status_t status = ral_get_and_clear_irq_status(&radio_.ral, &irq);
+                smtc_modem_hal_unprotect_api_call();
+                if (status == RAL_STATUS_OK && irq != RAL_IRQ_NONE) handle_irq(irq);
+            }
+            taskYIELD();
+        }
+        if (config_ack_received_ && config_ack_key_ == APP_CFG_KEY_FREQUENCY &&
+            config_ack_value_ == frequency_hz &&
+            config_ack_transaction_id_ == transaction_id) {
+            ESP_LOGW(TAG, "RX frequency ConfigAck matched: tx=%u hz=%lu",
+                     transaction_id, static_cast<unsigned long>(frequency_hz));
+            config_ok = true;
+            break;
+        }
+        ESP_LOGW(TAG, "frequency ConfigAck timeout/mismatch: tx=%u attempt=%lu",
+                 transaction_id, static_cast<unsigned long>(attempt + 1U));
+    }
+
+    if (config_ok) {
+        // The node sends several ACK copies on the old channel before applying
+        // the new channel. Keep listening briefly so it can finish that sequence
+        // before the gateway transmits confirmations on the new channel.
+        vTaskDelay(ms_to_ticks_min_1(APP_FREQUENCY_ACK_SETTLE_MS));
+    }
+
+    if (!config_ok || !apply_frequency(frequency_hz)) {
+        (void)apply_frequency(previous_hz);
+        suspended_ = false;
+        frequency_change_active_ = false;
+        if (!ptt_active_) schedule_rx();
+        ESP_LOGW(TAG, "frequency change failed: tx=%u", transaction_id);
+        return false;
+    }
+
+    uint8_t confirm_pkt[kHeaderSize] = {};
+    std::memcpy(confirm_pkt, kMagic, sizeof(kMagic));
+    confirm_pkt[4] = kPacketTypeFrequencyConfirm;
+    confirm_pkt[5] = 1;
+    put_u16_le(&confirm_pkt[6], transaction_id);
+    confirm_pkt[8] = APP_CFG_KEY_FREQUENCY;
+    put_u32_le(&confirm_pkt[9], frequency_hz);
+
+    bool confirm_sent = false;
+    for (uint32_t attempt = 0; attempt < APP_FREQUENCY_CONFIRM_RETRIES; ++attempt) {
+        ESP_LOGW(TAG, "TX frequency Confirm: tx=%u attempt=%lu hz=%lu",
+                 transaction_id, static_cast<unsigned long>(attempt + 1U),
+                 static_cast<unsigned long>(frequency_hz));
+        smtc_modem_hal_protect_api_call();
+        if (mode_ == Mode::rx_pending) {
+            (void)ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+            (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+            mode_ = Mode::idle;
+        }
+        smtc_modem_hal_unprotect_api_call();
+        confirm_sent = send_single_packet(confirm_pkt, kHeaderSize) || confirm_sent;
+        schedule_rx();
+        vTaskDelay(ms_to_ticks_min_1(20));
+    }
+
+    if (!confirm_sent) {
+        (void)apply_frequency(previous_hz);
+    }
+    suspended_ = false;
+    frequency_change_active_ = false;
+    if (!ptt_active_) schedule_rx();
+    ESP_LOGI(TAG, "frequency change %s: tx=%u old=%lu new=%lu",
+             confirm_sent ? "complete" : "failed", transaction_id,
+             static_cast<unsigned long>(previous_hz),
+             static_cast<unsigned long>(frequency_hz));
+    return confirm_sent;
+}
+
+bool RadioPing::send_config_ack(uint8_t key, uint32_t value, uint16_t transaction_id)
 {
     uint8_t pkt[kHeaderSize];
     std::memcpy(pkt, kMagic, sizeof(kMagic));
     pkt[4] = kPacketTypeConfigAck;
     pkt[5] = 1;
-    put_u16_le(&pkt[6], 0);
+    put_u16_le(&pkt[6], transaction_id);
     pkt[8] = key;
     put_u32_le(&pkt[9], value);
     pkt[13] = 0;
@@ -2390,11 +2634,86 @@ void RadioPing::send_config_ack(uint8_t key, uint32_t value)
     }
     smtc_modem_hal_unprotect_api_call();
 
-    send_single_packet(pkt, kHeaderSize);
+    bool sent = send_single_packet(pkt, kHeaderSize);
 
     if (!ptt_active_) {
         schedule_rx();
     }
+    return sent;
+}
+
+void RadioPing::handle_frequency_config(uint16_t transaction_id, uint32_t frequency_hz)
+{
+    if (is_gateway_ || !is_frequency_preset(frequency_hz) ||
+        image_busy() || ptt_active_) {
+        ESP_LOGW(TAG, "frequency config rejected: tx=%u hz=%lu busy=%d",
+                 transaction_id, static_cast<unsigned long>(frequency_hz), image_busy());
+        return;
+    }
+
+    if (frequency_rollback_active_ &&
+        transaction_id == frequency_transaction_id_ &&
+        frequency_hz == frequency_pending_hz_) {
+        ESP_LOGI(TAG, "frequency config duplicate on pending channel: tx=%u", transaction_id);
+        return;
+    }
+
+    bool ack_sent = false;
+    for (uint32_t attempt = 0; attempt < APP_FREQUENCY_CONFIRM_RETRIES; ++attempt) {
+        ack_sent = send_config_ack(APP_CFG_KEY_FREQUENCY, frequency_hz, transaction_id) || ack_sent;
+    }
+    if (!ack_sent) return;
+
+    frequency_previous_hz_ = current_frequency_hz_;
+    frequency_pending_hz_ = frequency_hz;
+    frequency_transaction_id_ = transaction_id;
+    if (!apply_frequency(frequency_hz)) {
+        current_frequency_hz_ = frequency_previous_hz_;
+        (void)apply_frequency(frequency_previous_hz_);
+        return;
+    }
+
+    frequency_rollback_deadline_ms_ =
+        smtc_modem_hal_get_time_in_ms() + APP_FREQUENCY_ROLLBACK_MS;
+    frequency_rollback_active_ = true;
+    cad_wakeup_ms_ = smtc_modem_hal_get_time_in_ms();
+    schedule_rx();
+    ESP_LOGW(TAG, "frequency pending confirm: tx=%u old=%lu new=%lu",
+             transaction_id, static_cast<unsigned long>(frequency_previous_hz_),
+             static_cast<unsigned long>(frequency_pending_hz_));
+}
+
+void RadioPing::handle_frequency_confirm(uint16_t transaction_id, uint32_t frequency_hz)
+{
+    if (is_gateway_ || !frequency_rollback_active_ ||
+        transaction_id != frequency_transaction_id_ ||
+        frequency_hz != frequency_pending_hz_) {
+        ESP_LOGW(TAG, "ignore unmatched frequency confirm: tx=%u hz=%lu",
+                 transaction_id, static_cast<unsigned long>(frequency_hz));
+        return;
+    }
+
+    frequency_rollback_active_ = false;
+    frequency_rollback_deadline_ms_ = 0;
+    frequency_previous_hz_ = frequency_hz;
+    if (frequency_committed_cb_) frequency_committed_cb_(frequency_hz);
+    ESP_LOGW(TAG, "frequency confirmed: tx=%u hz=%lu",
+             transaction_id, static_cast<unsigned long>(frequency_hz));
+}
+
+void RadioPing::check_frequency_rollback()
+{
+    if (!frequency_rollback_active_ || is_gateway_) return;
+    uint32_t now = smtc_modem_hal_get_time_in_ms();
+    if (static_cast<int32_t>(now - frequency_rollback_deadline_ms_) < 0) return;
+
+    uint32_t rollback_hz = frequency_previous_hz_;
+    frequency_rollback_active_ = false;
+    frequency_rollback_deadline_ms_ = 0;
+    ESP_LOGW(TAG, "frequency confirm timeout, rolling back to %lu Hz",
+             static_cast<unsigned long>(rollback_hz));
+    (void)apply_frequency(rollback_hz);
+    schedule_rx();
 }
 
 size_t RadioPing::snapshot_audio(int16_t *out, size_t max_samples)
@@ -2412,7 +2731,7 @@ bool RadioPing::configure_lora_cad()
     const void *ctx = radio_.ral.context;
 
     lr20xx_radio_common_set_pkt_type(ctx, LR20XX_RADIO_COMMON_PKT_TYPE_LORA);
-    lr20xx_radio_common_set_rf_freq(ctx, APP_FLRC_FREQUENCY_HZ);
+    lr20xx_radio_common_set_rf_freq(ctx, current_frequency_hz_);
 
     lr20xx_radio_lora_mod_params_t mod = {};
     mod.sf = LR20XX_RADIO_LORA_SF7;
@@ -2611,7 +2930,7 @@ bool RadioPing::send_lora_wakeup()
     smtc_modem_hal_set_ant_switch(true);
 
     lr20xx_radio_common_set_pkt_type(ctx, LR20XX_RADIO_COMMON_PKT_TYPE_LORA);
-    lr20xx_radio_common_set_rf_freq(ctx, APP_FLRC_FREQUENCY_HZ);
+    lr20xx_radio_common_set_rf_freq(ctx, current_frequency_hz_);
 
     lr20xx_radio_lora_mod_params_t mod = {};
     mod.sf = LR20XX_RADIO_LORA_SF7;
@@ -2694,4 +3013,3 @@ void RadioPing::vbat_maintenance_tick()
         vbat_last_broadcast_ms_ = now;
     }
 }
-

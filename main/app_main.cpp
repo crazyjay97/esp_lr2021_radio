@@ -38,6 +38,9 @@ namespace {
 constexpr const char *TAG = "app";
 constexpr const char *kNvsNs = "app";
 constexpr const char *kModeKey = "mode";
+constexpr const char *kFrequencyIndexKey = "freq_idx";
+constexpr uint32_t kFrequencyPresetsHz[APP_FLRC_FREQUENCY_PRESET_COUNT] =
+    APP_FLRC_FREQUENCY_PRESETS_HZ;
 
 uint32_t s_last_gw_capture_ms = 0;
 
@@ -177,6 +180,47 @@ uint8_t load_config_u8(const char *key, uint8_t def)
         nvs_close(nvs);
     }
     return val;
+}
+
+uint8_t frequency_index_from_hz(uint32_t frequency_hz)
+{
+    for (uint8_t i = 0; i < APP_FLRC_FREQUENCY_PRESET_COUNT; ++i) {
+        if (kFrequencyPresetsHz[i] == frequency_hz) return i;
+    }
+    return 0;
+}
+
+uint8_t load_frequency_index()
+{
+    uint8_t index = load_config_u8(kFrequencyIndexKey, 0);
+    return index < APP_FLRC_FREQUENCY_PRESET_COUNT ? index : 0;
+}
+
+bool save_frequency_index(uint8_t index)
+{
+    if (index >= APP_FLRC_FREQUENCY_PRESET_COUNT) return false;
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(kNvsNs, NVS_READWRITE, &nvs);
+    bool opened = (err == ESP_OK);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, kFrequencyIndexKey, index);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    if (opened) nvs_close(nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save frequency preset to NVS failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
+void on_frequency_committed(uint32_t frequency_hz)
+{
+    uint8_t index = frequency_index_from_hz(frequency_hz);
+    if (save_frequency_index(index)) {
+        ESP_LOGI(TAG, "frequency preset committed to NVS: index=%u hz=%lu",
+                 index, static_cast<unsigned long>(frequency_hz));
+    }
 }
 
 ImageCmdAckStatus on_image_capture_request(uint16_t session_id);
@@ -1230,7 +1274,7 @@ void on_gw_rx_abort(void)
 bool on_gw_query_busy(void)
 {
     return g_radio.image_busy() || g_image_rx_processing ||
-           g_image_ui_pending;
+           g_image_ui_pending || g_radio.frequency_change_busy();
 }
 
 // Gateway UI interval change callback — sends config to camera node
@@ -1292,6 +1336,32 @@ bool on_gw_low_power_change(uint32_t enable)
         }
     }
     return ok;
+}
+
+void on_frequency_change_result(bool success, uint32_t frequency_hz)
+{
+    if (success) {
+        (void)save_frequency_index(frequency_index_from_hz(frequency_hz));
+    }
+    ui_gw_frequency_result(success, frequency_hz);
+    ESP_LOGW(TAG, "frequency change finished: %s hz=%lu",
+             success ? "OK" : "FAIL", static_cast<unsigned long>(frequency_hz));
+}
+
+bool on_gw_frequency_change(uint32_t frequency_hz)
+{
+    ESP_LOGW(TAG, "frequency button request: hz=%lu",
+             static_cast<unsigned long>(frequency_hz));
+    uint32_t current_hz = g_radio.current_frequency_hz();
+    if (frequency_hz == current_hz) {
+        uint8_t current_index = frequency_index_from_hz(current_hz);
+        uint8_t next_index =
+            static_cast<uint8_t>((current_index + 1U) % APP_FLRC_FREQUENCY_PRESET_COUNT);
+        frequency_hz = kFrequencyPresetsHz[next_index];
+        ESP_LOGW(TAG, "frequency UI was stale, using next radio preset: index=%u hz=%lu",
+                 next_index, static_cast<unsigned long>(frequency_hz));
+    }
+    return g_radio.request_frequency_change(frequency_hz);
 }
 
 void on_wifi_prov_request(void)
@@ -1535,6 +1605,14 @@ extern "C" void app_main(void)
         }
 
         bool radio_ok = true;
+        uint8_t frequency_index = load_frequency_index();
+        if (!g_radio.set_initial_frequency(kFrequencyPresetsHz[frequency_index])) {
+            ESP_LOGW(TAG, "invalid saved frequency preset, using default");
+            frequency_index = 0;
+            (void)g_radio.set_initial_frequency(kFrequencyPresetsHz[0]);
+        }
+        ESP_LOGI(TAG, "NVS frequency preset: index=%u hz=%lu", frequency_index,
+                 static_cast<unsigned long>(kFrequencyPresetsHz[frequency_index]));
         if (g_app_mode == AppMode::radio) {
             if ((e = g_radio.init_gateway()) != ESP_OK) {
                 ESP_LOGE(TAG, "radio init (gateway): %s", esp_err_to_name(e));
@@ -1555,6 +1633,8 @@ extern "C" void app_main(void)
             g_radio.set_vbat_received_cb(on_vbat_received);
             g_radio.set_image_rx_eot_cb(on_image_rx_eot_nack);
             g_radio.set_config_received_cb(on_config_received);
+            g_radio.set_frequency_committed_cb(on_frequency_committed);
+            g_radio.set_frequency_change_result_cb(on_frequency_change_result);
             g_radio.set_low_power_standby_cb(on_low_power_standby);
         }
         if (g_app_mode == AppMode::radio && radio_ok) {
@@ -1651,6 +1731,8 @@ extern "C" void app_main(void)
                 ui_gw_set_pir_trigger_cb(on_gw_pir_trigger_change);
                 ui_gw_set_voice_alarm_cb(on_gw_voice_alarm_change);
                 ui_gw_set_low_power_cb(on_gw_low_power_change);
+                ui_gw_set_frequency_cb(on_gw_frequency_change);
+                ui_gw_set_current_frequency(g_radio.current_frequency_hz());
                 ui_gw_set_wifi_prov_cb(on_wifi_prov_request);
                 ui_gw_set_wifi_disconnect_cb(on_wifi_disconnect_request);
                 ui_gw_set_rx_abort_cb(on_gw_rx_abort);
@@ -1715,7 +1797,7 @@ extern "C" void app_main(void)
 #if APP_RADIO_TASKS_ENABLE
     ESP_LOGI(TAG, "voice config: Opus %u Hz, %u ms, %d bps CBR; FLRC %lu Hz, %lu bps",
              APP_AUDIO_SAMPLE_RATE_HZ, APP_AUDIO_FRAME_MS, APP_OPUS_BITRATE_BPS,
-             APP_FLRC_FREQUENCY_HZ, APP_FLRC_BITRATE_BPS);
+             g_radio.current_frequency_hz(), APP_FLRC_BITRATE_BPS);
 #else
     ESP_LOGW(TAG, "FLRC radio init only; RX/TX tasks disabled in this build");
 #endif

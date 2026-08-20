@@ -83,6 +83,7 @@ typedef enum {
     UI_EVENT_RX_FAILED,
     UI_EVENT_RX_EOT_STATS,
     UI_EVENT_VBAT,
+    UI_EVENT_FREQUENCY_RESULT,
 } ui_event_type_t;
 
 typedef struct {
@@ -97,6 +98,8 @@ typedef struct {
     uint32_t image_height;
     uint32_t jpeg_size;
     uint32_t elapsed_ms;
+    uint32_t frequency_hz;
+    bool success;
     char title[32];
 } ui_event_t;
 
@@ -104,6 +107,7 @@ typedef struct {
 static ui_page_t s_page = UI_PAGE_IMAGE;
 static ui_gw_capture_cb_t s_capture_cb = NULL;
 static ui_gw_interval_cb_t s_interval_cb = NULL;
+static ui_gw_frequency_cb_t s_frequency_cb = NULL;
 static SemaphoreHandle_t s_lock = NULL; // points to bsp_lcd's LVGL lock
 static QueueHandle_t s_ui_event_queue = NULL;
 static lv_timer_t *s_ui_event_timer = NULL;
@@ -113,6 +117,9 @@ static const uint32_t s_interval_presets[] = {0, 10, 30, 60, 300, 600, 900, 1200
 static const char *s_interval_labels[] = {"Off", "10s", "30s", "1min", "5min", "10min", "15min", "20min", "30min", "1h"};
 #define INTERVAL_PRESET_COUNT 10
 static int s_cfg_interval_idx = 4; /* default = 5 min */
+static const uint32_t s_frequency_presets[] = APP_FLRC_FREQUENCY_PRESETS_HZ;
+static int s_cfg_frequency_idx = 0;
+static bool s_frequency_change_busy = false;
 
 /* Latest node (camera) battery voltage in mV, 0 = unknown. Shown in status bar right. */
 static uint16_t s_node_vbat_mv = 0;
@@ -174,8 +181,8 @@ static uint16_t s_stats_total_retransmitted = 0;
 static bool s_stats_first_eot_seen = false;
 
 /* PAGE_CONFIG objects */
-static lv_obj_t *s_cfg_touch_btns[8] = {NULL};
-static lv_obj_t *s_cfg_touch_lbls[8] = {NULL};
+static lv_obj_t *s_cfg_touch_btns[9] = {NULL};
+static lv_obj_t *s_cfg_touch_lbls[9] = {NULL};
 static int s_volume_level = 13; /* 0~15, default 13 → 130% */
 static ui_gw_audio_clip_cb_t s_audio_clip_cb = NULL;
 static bool s_audio_clip_on = false;
@@ -572,6 +579,14 @@ static void cfg_wifi_btn_clicked_cb(lv_event_t *e)
 }
 
 static void cfg_style_value(int idx, const char *text);
+static void cfg_set_ctrl_enabled(int idx, bool enabled);
+
+static void cfg_format_frequency(char *buf, size_t size, uint32_t frequency_hz)
+{
+    snprintf(buf, size, "%lu.%02luM",
+             (unsigned long)(frequency_hz / 1000000U),
+             (unsigned long)((frequency_hz % 1000000U) / 10000U));
+}
 
 static bool image_present_guard_active(void)
 {
@@ -641,6 +656,22 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
                 cfg_style_value(4, s_trigger_labels[0]);
             }
             gw_nvs_save_u8("snd", (uint8_t)s_sound_trigger_idx);
+        }
+        break;
+    }
+    case 8: /* Frequency preset cycle */ {
+        ESP_LOGW(TAG, "frequency control clicked: busy=%d callback=%d",
+                 s_frequency_change_busy, s_frequency_cb != NULL);
+        if (s_frequency_change_busy || !s_frequency_cb) break;
+        int new_idx = (s_cfg_frequency_idx + 1) % APP_FLRC_FREQUENCY_PRESET_COUNT;
+        uint32_t frequency_hz = s_frequency_presets[new_idx];
+        s_frequency_change_busy = true;
+        cfg_set_ctrl_enabled(8, false);
+        update_title("Settings", "LOADING", COL_AMBER);
+        if (!s_frequency_cb(frequency_hz)) {
+            s_frequency_change_busy = false;
+            cfg_set_ctrl_enabled(8, true);
+            update_title("Settings", "FAIL", COL_VBAT_RED);
         }
         break;
     }
@@ -951,6 +982,15 @@ static void create_config_page(void)
     /* ── SYSTEM section ── */
     lv_obj_t *sec_sys = cfg_create_section(cont, "SYSTEM");
 
+    char frequency_buf[16];
+    cfg_format_frequency(frequency_buf, sizeof(frequency_buf),
+                         s_frequency_presets[s_cfg_frequency_idx]);
+    cfg_create_row(sec_sys, "Frequency", "Node RF channel", 8, NULL);
+    cfg_style_value(8, frequency_buf);
+    if (s_frequency_change_busy) {
+        cfg_set_ctrl_enabled(8, false);
+    }
+
     cfg_create_toggle_row(sec_sys, "Low Power", "CAD sleep standby", 7, s_low_power_on);
 
     /* If low power is already on, gray out Audio Clip + Sound trigger to match
@@ -1196,6 +1236,11 @@ void ui_gw_set_voice_alarm_cb(ui_gw_voice_alarm_cb_t cb)
 void ui_gw_set_low_power_cb(ui_gw_low_power_cb_t cb)
 {
     s_low_power_cb = cb;
+}
+
+void ui_gw_set_frequency_cb(ui_gw_frequency_cb_t cb)
+{
+    s_frequency_cb = cb;
 }
 
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
@@ -1513,6 +1558,27 @@ static void ui_event_timer_cb(lv_timer_t *t)
             s_stats_total_retransmitted += event.received;
         } else if (event.type == UI_EVENT_VBAT) {
             apply_vbat(event.vbat_mv);
+        } else if (event.type == UI_EVENT_FREQUENCY_RESULT) {
+            s_frequency_change_busy = false;
+            cfg_set_ctrl_enabled(8, true);
+            if (event.success) {
+                for (int i = 0; i < APP_FLRC_FREQUENCY_PRESET_COUNT; ++i) {
+                    if (s_frequency_presets[i] == event.frequency_hz) {
+                        s_cfg_frequency_idx = i;
+                        break;
+                    }
+                }
+                char buf[16];
+                cfg_format_frequency(buf, sizeof(buf), event.frequency_hz);
+                cfg_style_value(8, buf);
+                if (s_page == UI_PAGE_CONFIG) {
+                    update_title("Settings", "OK", COL_GREEN);
+                }
+            } else {
+                if (s_page == UI_PAGE_CONFIG) {
+                    update_title("Settings", "FAIL", COL_VBAT_RED);
+                }
+            }
         }
     }
     update_rx_comfort_progress();
@@ -1731,6 +1797,30 @@ void ui_gw_update_vbat(uint16_t vbat_mv)
         .vbat_mv = vbat_mv,
     };
     (void)post_ui_event(&event);
+}
+
+void ui_gw_set_current_frequency(uint32_t frequency_hz)
+{
+    for (int i = 0; i < APP_FLRC_FREQUENCY_PRESET_COUNT; ++i) {
+        if (s_frequency_presets[i] == frequency_hz) {
+            s_cfg_frequency_idx = i;
+            ESP_LOGW(TAG, "frequency UI initialized: index=%d hz=%lu", i,
+                     (unsigned long)frequency_hz);
+            return;
+        }
+    }
+    ESP_LOGE(TAG, "frequency UI init rejected: unsupported hz=%lu",
+             (unsigned long)frequency_hz);
+}
+
+void ui_gw_frequency_result(bool success, uint32_t frequency_hz)
+{
+    const ui_event_t event = {
+        .type = UI_EVENT_FREQUENCY_RESULT,
+        .frequency_hz = frequency_hz,
+        .success = success,
+    };
+    (void)post_important_ui_event(&event);
 }
 void ui_gw_show_qr(const char *payload)
 {
