@@ -51,8 +51,8 @@ static const adc_btn_t s_adc_btns[] = {
     { BSP_BTN_VOL_UP, 2410 },   /* K4 */
 };
 
-/* A pressed button must be within this window of its target voltage. */
-#define ADC_MATCH_WINDOW_MV     250
+/* Maximum accepted error from the closest button target voltage. */
+#define ADC_MAX_ERROR_MV        250
 /* Above this threshold, no button is pressed. */
 #define ADC_IDLE_THRESHOLD_MV   2900
 
@@ -83,12 +83,19 @@ static int read_key_mv(void)
 static bsp_btn_id_t classify_adc(int mv)
 {
     if (mv < 0 || mv >= ADC_IDLE_THRESHOLD_MV) return BSP_BTN_COUNT;
+
+    bsp_btn_id_t closest = BSP_BTN_COUNT;
+    int closest_error = ADC_MAX_ERROR_MV + 1;
     for (size_t i = 0; i < sizeof(s_adc_btns) / sizeof(s_adc_btns[0]); i++) {
-        if (abs(mv - s_adc_btns[i].mv) <= ADC_MATCH_WINDOW_MV) {
-            return s_adc_btns[i].id;
+        int error = abs(mv - s_adc_btns[i].mv);
+        if (error < closest_error) {
+            closest = s_adc_btns[i].id;
+            closest_error = error;
+        } else if (error == closest_error) {
+            closest = BSP_BTN_COUNT;
         }
     }
-    return BSP_BTN_COUNT;   /* ambiguous / in-between reading */
+    return closest;
 }
 
 static void fire(bsp_btn_id_t id, bool pressed)
