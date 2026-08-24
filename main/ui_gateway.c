@@ -163,8 +163,8 @@ static uint16_t s_stats_total_retransmitted = 0;
 static bool s_stats_first_eot_seen = false;
 
 /* PAGE_CONFIG objects */
-static lv_obj_t *s_cfg_touch_btns[8] = {NULL};
-static lv_obj_t *s_cfg_touch_lbls[8] = {NULL};
+static lv_obj_t *s_cfg_touch_btns[9] = {NULL};
+static lv_obj_t *s_cfg_touch_lbls[9] = {NULL};
 static int s_volume_level = 13; /* 0~15, default 13 → 130% */
 static ui_gw_sound_trigger_cb_t s_sound_trigger_cb = NULL;
 static int s_sound_trigger_idx = 0;
@@ -175,6 +175,8 @@ static ui_gw_voice_alarm_cb_t s_voice_alarm_cb = NULL;
 static bool s_alarm_on = false;
 static ui_gw_low_power_cb_t s_low_power_cb = NULL;
 static bool s_low_power_on = false;
+static ui_gw_intercom_cb_t s_intercom_cb = NULL;
+static bool s_intercom_on = false;
 static ui_gw_wifi_prov_cb_t s_wifi_prov_cb = NULL;
 static ui_gw_wifi_disconnect_cb_t s_wifi_disconnect_cb = NULL;
 static ui_gw_rx_abort_cb_t s_rx_abort_cb = NULL;
@@ -828,6 +830,14 @@ static void cfg_apply_low_power_lock(bool low_power_on)
     cfg_set_ctrl_enabled(4, !low_power_on);  /* Sound trigger */
 }
 
+static void cfg_apply_intercom_lock(bool intercom_on)
+{
+    const int controls[] = {0, 2, 4, 5, 6, 7};
+    for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); ++i) {
+        cfg_set_ctrl_enabled(controls[i], !intercom_on);
+    }
+}
+
 /* Switch toggle callback — handles all on/off toggles */
 static void cfg_switch_cb(lv_event_t *e)
 {
@@ -865,6 +875,18 @@ static void cfg_switch_cb(lv_event_t *e)
                 gw_nvs_save_u8("lowpwr", on ? 1 : 0);
                 /* Lock/unlock Sound trigger to match low power. */
                 cfg_apply_low_power_lock(on);
+            } else {
+                if (on) lv_obj_clear_state(sw, LV_STATE_CHECKED);
+                else lv_obj_add_state(sw, LV_STATE_CHECKED);
+            }
+        }
+        break;
+    case 8: /* Intercom */
+        if (s_intercom_cb) {
+            if (s_intercom_cb(on ? 1 : 0)) {
+                s_intercom_on = on;
+                gw_nvs_save_u8("intercom", on ? 1 : 0);
+                cfg_apply_intercom_lock(on);
             } else {
                 if (on) lv_obj_clear_state(sw, LV_STATE_CHECKED);
                 else lv_obj_add_state(sw, LV_STATE_CHECKED);
@@ -927,6 +949,7 @@ static void create_config_page(void)
     /* ── AUDIO section ── */
     lv_obj_t *sec_audio = cfg_create_section(cont, "AUDIO");
 
+    cfg_create_toggle_row(sec_audio, "Intercom", "Two-way voice", 8, s_intercom_on);
     cfg_create_toggle_row(sec_audio, "Voice Alarm", "Play alert on trigger", 6, s_alarm_on);
 
     char vol_buf[8];
@@ -942,6 +965,9 @@ static void create_config_page(void)
     /* If low power is already on, gray out Sound trigger to match the node. */
     if (s_low_power_on) {
         cfg_set_ctrl_enabled(4, false);  /* Sound trigger */
+    }
+    if (s_intercom_on) {
+        cfg_apply_intercom_lock(true);
     }
 
     /* ── WiFi info panel ── */
@@ -1124,6 +1150,9 @@ esp_err_t ui_gw_init(void)
     s_pir_on = gw_nvs_load_u8("pir", 0) != 0;
     s_alarm_on = gw_nvs_load_u8("alarm", 0) != 0;
     s_low_power_on = gw_nvs_load_u8("lowpwr", 0) != 0;
+    /* A live radio session never survives a reboot; do not restore it active. */
+    s_intercom_on = false;
+    gw_nvs_save_u8("intercom", 0);
     bsp_audio_set_volume((uint8_t)(s_volume_level * 10));
     ESP_LOGI(TAG, "NVS load: vol=%d snd=%d pir=%d alarm=%d",
              s_volume_level, s_sound_trigger_idx, s_pir_on, s_alarm_on);
@@ -1178,6 +1207,11 @@ void ui_gw_set_voice_alarm_cb(ui_gw_voice_alarm_cb_t cb)
 void ui_gw_set_low_power_cb(ui_gw_low_power_cb_t cb)
 {
     s_low_power_cb = cb;
+}
+
+void ui_gw_set_intercom_cb(ui_gw_intercom_cb_t cb)
+{
+    s_intercom_cb = cb;
 }
 
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed)

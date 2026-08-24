@@ -50,6 +50,7 @@ esp_err_t AudioDiagnostics::init()
 
 void AudioDiagnostics::handle_button(bsp_btn_id_t id, bool pressed)
 {
+    if (intercom_active_) return;
     switch (id) {
     case BSP_BTN_USER1:
         if (pressed) {
@@ -61,6 +62,16 @@ void AudioDiagnostics::handle_button(bsp_btn_id_t id, bool pressed)
 
     default:
         break;
+    }
+}
+
+void AudioDiagnostics::set_intercom_active(bool active)
+{
+    intercom_active_ = active;
+    if (active && state_ != State::idle) {
+        state_ = State::idle;
+        apply_state();
+        xSemaphoreGive(audio_sem_);
     }
 }
 
@@ -102,7 +113,7 @@ void AudioDiagnostics::task()
             bsp_audio_pa_enable(false);
             drain_rx(APP_AUDIO_SAMPLE_RATE_HZ / 20);
 
-            while (state_ == State::recording) {
+            while (state_ == State::recording && !intercom_active_) {
                 size_t room = rec_cap_ - rec_len_;
                 if (room == 0) {
                     ESP_LOGW(TAG, "record buffer full");
@@ -227,7 +238,7 @@ void AudioDiagnostics::play_mono_buffer()
     ESP_LOGI(TAG, "play mono start: samples=%u bytes=%u",
              static_cast<unsigned>(samples), static_cast<unsigned>(rec_len_));
 
-    while (pos < samples) {
+    while (pos < samples && !intercom_active_) {
         size_t batch = samples - pos;
         if (batch > 256) batch = 256;
 

@@ -96,6 +96,26 @@
  * keeping each radio packet to about 50 ms of audio. */
 #define APP_FLRC_OPUS_FRAMES_PER_PACKET 5U
 
+/* Gateway-master TDD intercom. Each master slot is followed by one node reply. */
+#define APP_INTERCOM_SLOT_PERIOD_MS     20U
+#define APP_INTERCOM_NODE_GUARD_US      2000U
+#define APP_INTERCOM_TX_TIMEOUT_MS      10U
+#define APP_INTERCOM_START_TIMEOUT_MS   1200U
+#define APP_INTERCOM_STOP_TIMEOUT_MS    800U
+#define APP_INTERCOM_SYNC_TIMEOUT_MS    250U
+#define APP_INTERCOM_LINK_TIMEOUT_MS    1200U
+#define APP_INTERCOM_TX_QUEUE_FRAMES    4U
+#define APP_INTERCOM_FRAMES_PER_PACKET  2U
+#define APP_INTERCOM_INPUT_GAIN         4
+
+/* NLMS acoustic echo cancellation. The reference is the decoded PCM actually
+ * written to I2S. Delay is board-dependent and is intentionally tunable. */
+#define APP_AEC_REFERENCE_DELAY_MS      40U
+#define APP_AEC_NLMS_STEP               0.12f
+#define APP_AEC_NLMS_EPSILON            0.001f
+#define APP_AEC_MIN_REFERENCE_ENERGY    0.00002f
+#define APP_AEC_DOUBLE_TALK_RATIO       2.5f
+
 /* RX timeout used by the packet receiver before it re-arms listening. */
 #define APP_FLRC_RX_TIMEOUT_MS          100U
 
@@ -219,6 +239,7 @@
 #define APP_CFG_KEY_PIR_TRIGGER         0x05
 #define APP_CFG_KEY_VOICE_ALARM         0x06
 #define APP_CFG_KEY_LOW_POWER           0x07
+#define APP_CFG_KEY_INTERCOM            0x08
 #define APP_TRIGGER_COOLDOWN_SEC        15U
 #define APP_PIR_GPIO                    GPIO_NUM_12
 #define APP_SOUND_TRIGGER_THRESH_LOW    1200

@@ -2,6 +2,7 @@ idf_component_register(SRCS
                            "app_main.cpp"
                            "audio_diagnostics.cpp"
                            "audio_processor.cpp"
+                           "echo_canceller.cpp"
                            "camera_dvp.cpp"
                            "image_transfer.cpp"
                            "opus_codec.cpp"

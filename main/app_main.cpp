@@ -184,6 +184,7 @@ uint8_t load_config_u8(const char *key, uint8_t def)
 
 bool on_image_capture_request(uint16_t session_id);
 esp_err_t gateway_image_pipeline_init();
+void on_gw_rx_abort(void);
 
 void auto_capture_timer_cb(void *arg)
 {
@@ -381,6 +382,9 @@ void on_config_received(uint8_t key, uint32_t value)
             update_camera_timer_status();
             ESP_LOGI(TAG, "low power: sound trigger disabled");
         }
+    } else if (key == APP_CFG_KEY_INTERCOM) {
+        ESP_LOGI(TAG, "config: intercom prepare session=%lu",
+                 static_cast<unsigned long>(value));
     }
 }
 
@@ -391,6 +395,11 @@ void on_low_power_standby(bool entering)
     if (!entering) return;
     if (g_capture_busy) return;  // never release mid-capture
     g_camera_uart.low_power_standby();
+}
+
+void on_intercom_state(bool active)
+{
+    g_audio.set_intercom_active(active);
 }
 
 void switch_mode_and_restart()
@@ -741,6 +750,11 @@ void image_capture_task(void *arg)
 // are deliberately forgotten because the gateway counter restarts after reboot.
 bool on_image_capture_request(uint16_t session_id)
 {
+    if (g_radio.intercom_active()) {
+        ESP_LOGD(TAG, "capture ignored while intercom is active");
+        g_radio.notify_capture_dropped();
+        return false;
+    }
     if (g_app_mode != AppMode::camera) {
         ESP_LOGW(TAG, "ImageCmd received but not in camera mode");
         g_radio.notify_capture_dropped();
@@ -870,7 +884,8 @@ void gateway_image_task(void *arg)
             continue;
         }
 
-        if (g_app_mode != AppMode::radio || !ui_gw_stream_active()) {
+        if (g_app_mode != AppMode::radio || !ui_gw_stream_active() ||
+            g_radio.intercom_active()) {
             gateway_image_frame_free(&frame);
             continue;
         }
@@ -1164,9 +1179,20 @@ void on_image_rx_eot_nack(uint16_t missing_count, bool is_first_eot)
 
 bool on_gw_capture(void)
 {
+    if (g_radio.intercom_active()) return false;
     ESP_LOGI(TAG, "UI capture: trigger remote photo");
     g_radio.trigger_image_capture();
     return true;
+}
+
+bool on_gw_intercom_change(uint32_t enable)
+{
+    ESP_LOGI(TAG, "UI intercom: %s", enable ? "on" : "off");
+    if (enable) {
+        gateway_image_queue_discard_pending();
+        on_gw_rx_abort();
+    }
+    return g_radio.set_intercom(enable != 0);
 }
 
 // Gateway UI: user left the transfer page — abort the in-progress RX so the
@@ -1370,8 +1396,8 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "led init: %s", esp_err_to_name(e));
     }
     if (g_app_mode == AppMode::radio) {
-        if ((e = bsp_audio_init_playback_only(APP_AUDIO_SAMPLE_RATE_HZ)) != ESP_OK) {
-            ESP_LOGE(TAG, "audio init (playback): %s", esp_err_to_name(e));
+        if ((e = bsp_audio_init(APP_AUDIO_SAMPLE_RATE_HZ)) != ESP_OK) {
+            ESP_LOGE(TAG, "audio init (duplex): %s", esp_err_to_name(e));
         }
     } else {
         if ((e = bsp_audio_init(APP_AUDIO_SAMPLE_RATE_HZ)) != ESP_OK) {
@@ -1415,6 +1441,7 @@ extern "C" void app_main(void)
             g_radio.set_image_rx_eot_cb(on_image_rx_eot_nack);
             g_radio.set_config_received_cb(on_config_received);
             g_radio.set_low_power_standby_cb(on_low_power_standby);
+            g_radio.set_intercom_state_cb(on_intercom_state);
         }
         if (g_app_mode == AppMode::radio && radio_ok) {
 #if APP_RADIO_TASKS_ENABLE
@@ -1507,6 +1534,7 @@ extern "C" void app_main(void)
                 ui_gw_set_pir_trigger_cb(on_gw_pir_trigger_change);
                 ui_gw_set_voice_alarm_cb(on_gw_voice_alarm_change);
                 ui_gw_set_low_power_cb(on_gw_low_power_change);
+                ui_gw_set_intercom_cb(on_gw_intercom_change);
                 ui_gw_set_wifi_prov_cb(on_wifi_prov_request);
                 ui_gw_set_wifi_disconnect_cb(on_wifi_disconnect_request);
                 ui_gw_set_rx_abort_cb(on_gw_rx_abort);

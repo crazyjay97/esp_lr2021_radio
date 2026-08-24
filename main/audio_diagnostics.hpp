@@ -10,6 +10,7 @@ public:
     esp_err_t init();
     void handle_button(bsp_btn_id_t id, bool pressed);
     void play_startup_chime();
+    void set_intercom_active(bool active);
 
 private:
     enum class State {
@@ -21,6 +22,8 @@ private:
     static void task_trampoline(void *arg);
 
     void task();
+
+    volatile bool intercom_active_ = false;
     void apply_state();
     void start_record(const char *source);
     void stop_record(const char *source);

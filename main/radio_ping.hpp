@@ -13,6 +13,7 @@
 #include "LiotLr2021.h"
 #include "opus_codec.hpp"
 #include "audio_processor.hpp"
+#include "echo_canceller.hpp"
 #include "image_transfer.hpp"
 
 // Returns true if the node accepted the request (or is legitimately re-acking a
@@ -33,6 +34,7 @@ typedef void (*vbat_received_cb_t)(uint16_t vbat_mv);
 // Low power: called when the node enters (true) / leaves (false) CAD sleep
 // standby, so the app can release/restore power-hungry peripherals (camera, I2S).
 typedef void (*low_power_standby_cb_t)(bool entering);
+typedef void (*intercom_state_cb_t)(bool active);
 
 class RadioPing {
 public:
@@ -63,9 +65,12 @@ public:
     void set_image_rx_eot_cb(image_rx_eot_cb_t cb) { image_rx_eot_cb_ = cb; }
     void set_config_received_cb(config_received_cb_t cb) { config_received_cb_ = cb; }
     void set_low_power_standby_cb(low_power_standby_cb_t cb) { low_power_standby_cb_ = cb; }
+    void set_intercom_state_cb(intercom_state_cb_t cb) { intercom_state_cb_ = cb; }
     void set_inter_packet_us(uint32_t us) { image_tx_inter_packet_us_ = us; }
 
     bool send_config(uint8_t key, uint32_t value);
+    bool set_intercom(bool enable);
+    bool intercom_active() const { return intercom_active_ && intercom_start_confirmed_; }
 
     ImageTransfer &image_xfer() { return image_xfer_; }
     uint32_t last_transfer_ms() const { return image_rx_transfer_ms_; }
@@ -126,11 +131,17 @@ private:
     void schedule_rx();
     void schedule_tx();
     bool configure_flrc();
-    bool build_voice_packet(uint16_t *tx_size);
+    bool build_voice_packet(uint16_t *tx_size, uint8_t flags = 0);
     void capture_voice_packet();
+    void enqueue_voice_frame(const uint8_t *payload, uint16_t len);
+    void start_intercom_local(uint16_t session);
+    void stop_intercom_local();
+    void service_intercom();
+    bool send_intercom_slot(uint8_t flags);
+    bool leave_rx_for_tx();
     void handle_rx_packet();
     void dispatch_rx_packet(uint16_t len, int16_t rssi);
-    void queue_voice_packet(uint16_t len, int16_t rssi);
+    bool queue_voice_packet(uint16_t len, int16_t rssi);
     void log_rx(uint16_t seq, uint16_t len, int16_t rssi);
     void wait_for_jitter_buffer();
     void conceal_missing_frames(uint16_t seq);
@@ -167,7 +178,8 @@ private:
     void handle_image_nack();
     void handle_image_done();
     void image_tx_task();
-    bool send_single_packet(const uint8_t *data, uint16_t len);
+    bool send_single_packet(const uint8_t *data, uint16_t len,
+                            uint32_t timeout_ms = 50U);
     struct ImageTxRequest;
     uint16_t build_image_fragment(uint8_t *pkt, const ImageTxRequest &req,
                                   uint16_t frag_index, uint16_t total_fragments);
@@ -216,6 +228,7 @@ private:
     ralf_t radio_ = RALF_LR20XX_INSTANTIATE(nullptr);
     OpusCodec codec_;
     AudioProcessor audio_proc_;
+    EchoCanceller echo_canceller_;
     ImageTransfer image_xfer_;
     QueueHandle_t voice_queue_ = nullptr;
     QueueHandle_t tx_queue_ = nullptr;
@@ -251,6 +264,21 @@ private:
     bool have_expected_play_seq_ = false;
     bool playback_pa_on_ = false;
     bool playback_active_ = false;
+    volatile bool intercom_active_ = false;
+    volatile bool intercom_start_confirmed_ = false;
+    volatile bool intercom_stop_confirmed_ = false;
+    bool intercom_reply_pending_ = false;
+    bool intercom_stop_reply_ = false;
+    bool intercom_stop_requested_ = false;
+    uint16_t intercom_session_ = 0;
+    uint16_t intercom_prepared_session_ = 0;
+    uint16_t intercom_last_stopped_session_ = 0;
+    int64_t intercom_next_slot_us_ = 0;
+    int64_t intercom_reply_due_us_ = 0;
+    uint32_t intercom_last_sync_ms_ = 0;
+    uint32_t intercom_tx_slots_ = 0;
+    uint32_t intercom_rx_slots_ = 0;
+    uint32_t intercom_missed_slots_ = 0;
 
     // Image transfer state
     image_capture_cb_t image_capture_cb_ = nullptr;
@@ -260,6 +288,7 @@ private:
     image_rx_eot_cb_t image_rx_eot_cb_ = nullptr;
     config_received_cb_t config_received_cb_ = nullptr;
     low_power_standby_cb_t low_power_standby_cb_ = nullptr;
+    intercom_state_cb_t intercom_state_cb_ = nullptr;
     uint16_t image_session_id_ = 1;
     volatile bool image_tx_active_ = false;
     uint32_t image_tx_inter_packet_us_ = APP_IMAGE_TX_INTER_PACKET_US;

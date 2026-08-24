@@ -46,6 +46,13 @@ constexpr uint8_t kPacketTypeConfigAck = 10;
 constexpr uint8_t kPacketTypeImageCmdAck = 11;
 constexpr uint8_t kPacketTypeVbat = 12;
 constexpr uint16_t kHeaderSize = 14;
+constexpr uint8_t kVoiceFlagMaster = 0x01;
+constexpr uint8_t kVoiceFlagNodeReply = 0x02;
+constexpr uint8_t kVoiceFlagStart = 0x04;
+constexpr uint8_t kVoiceFlagStop = 0x08;
+constexpr uint8_t kVoiceFlagStopAck = 0x10;
+constexpr uint8_t kVoiceFlagMask = kVoiceFlagMaster | kVoiceFlagNodeReply |
+    kVoiceFlagStart | kVoiceFlagStop | kVoiceFlagStopAck;
 
 // Continuous-stream fast path. The gateway places the next session in bytes
 // 12..13 of the previous frame's final empty-missing ACK. The node holds that
@@ -190,7 +197,7 @@ esp_err_t RadioPing::init_gateway()
     instance_ = this;
     is_gateway_ = true;
 
-    esp_err_t err = codec_.init_decoder_only();
+    esp_err_t err = codec_.init();
     if (err != ESP_OK) {
         return err;
     }
@@ -198,6 +205,11 @@ esp_err_t RadioPing::init_gateway()
     voice_queue_ = xQueueCreate(APP_VOICE_RX_QUEUE_LEN, sizeof(VoicePacket));
     if (voice_queue_ == nullptr) {
         ESP_LOGE(TAG, "voice queue alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+    tx_queue_ = xQueueCreate(APP_VOICE_TX_QUEUE_LEN, sizeof(TxFrame));
+    if (tx_queue_ == nullptr) {
+        ESP_LOGE(TAG, "tx queue alloc failed");
         return ESP_ERR_NO_MEM;
     }
 
@@ -247,7 +259,117 @@ esp_err_t RadioPing::start_gateway()
                                  APP_VOICE_PLAY_TASK_STACK_BYTES, this,
                                  APP_VOICE_PLAY_TASK_PRIORITY, nullptr,
                                  APP_VOICE_PLAY_TASK_CORE);
+    if (ok != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ok = xTaskCreatePinnedToCore(tx_task_trampoline, "voice_tx",
+                                 APP_VOICE_TX_TASK_STACK_BYTES, this,
+                                 APP_VOICE_TX_TASK_PRIORITY, nullptr,
+                                 APP_VOICE_TX_TASK_CORE);
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+void RadioPing::start_intercom_local(uint16_t session)
+{
+    intercom_session_ = session;
+    intercom_prepared_session_ = session;
+    intercom_start_confirmed_ = false;
+    intercom_stop_confirmed_ = false;
+    intercom_stop_requested_ = false;
+    intercom_stop_reply_ = false;
+    intercom_reply_pending_ = false;
+    intercom_last_sync_ms_ = smtc_modem_hal_get_time_in_ms();
+    intercom_tx_slots_ = 0;
+    intercom_rx_slots_ = 0;
+    intercom_missed_slots_ = 0;
+    intercom_next_slot_us_ = esp_timer_get_time() + 20000;
+    ptt_active_ = false;
+    tx_burst_active_ = false;
+    tx_flush_pending_ = false;
+    sound_trigger_pending_ = false;
+    pir_triggered_ = false;
+    if (tx_queue_) xQueueReset(tx_queue_);
+    if (voice_queue_) xQueueReset(voice_queue_);
+    codec_.reset_encoder();
+    codec_.reset_decoder();
+    audio_proc_.reset();
+    echo_canceller_.reset();
+    have_expected_rx_seq_ = false;
+    have_expected_play_seq_ = false;
+    playback_active_ = false;
+    intercom_active_ = true;
+    if (intercom_state_cb_) intercom_state_cb_(true);
+    cad_wakeup_ms_ = 0;
+    pir_push_wake_ = false;
+    if (task_handle_) xTaskNotifyGive(task_handle_);
+    ESP_LOGI(TAG, "intercom local start session=%u role=%s", session,
+             is_gateway_ ? "gateway" : "node");
+}
+
+void RadioPing::stop_intercom_local()
+{
+    intercom_last_stopped_session_ = intercom_session_;
+    intercom_active_ = false;
+    if (intercom_state_cb_) intercom_state_cb_(false);
+    intercom_reply_pending_ = false;
+    intercom_stop_requested_ = false;
+    intercom_stop_reply_ = false;
+    if (tx_queue_) xQueueReset(tx_queue_);
+    if (voice_queue_) xQueueReset(voice_queue_);
+    set_playback_pa(false);
+    playback_active_ = false;
+    echo_canceller_.reset();
+    ESP_LOGI(TAG, "intercom local stop session=%u", intercom_session_);
+}
+
+bool RadioPing::set_intercom(bool enable)
+{
+    if (!is_gateway_) return false;
+    if (enable == intercom_active_) return true;
+
+    if (enable) {
+        abort_image_rx();
+        uint16_t session = static_cast<uint16_t>(intercom_session_ + 1U);
+        if (session == 0) session = 1;
+        if (!send_config(APP_CFG_KEY_INTERCOM, session)) return false;
+        start_intercom_local(session);
+
+        const uint32_t start = smtc_modem_hal_get_time_in_ms();
+        while (!intercom_start_confirmed_ &&
+               smtc_modem_hal_get_time_in_ms() - start < APP_INTERCOM_START_TIMEOUT_MS) {
+            vTaskDelay(ms_to_ticks_min_1(2));
+        }
+        if (!intercom_start_confirmed_) {
+            ESP_LOGW(TAG, "intercom start handshake timeout session=%u", session);
+            intercom_stop_requested_ = true;
+            if (task_handle_) xTaskNotifyGive(task_handle_);
+            const uint32_t stop_start = smtc_modem_hal_get_time_in_ms();
+            while (!intercom_stop_confirmed_ &&
+                   smtc_modem_hal_get_time_in_ms() - stop_start <
+                       APP_INTERCOM_STOP_TIMEOUT_MS) {
+                vTaskDelay(ms_to_ticks_min_1(2));
+            }
+            stop_intercom_local();
+            schedule_rx();
+            return false;
+        }
+        return true;
+    }
+
+    intercom_stop_confirmed_ = false;
+    intercom_stop_requested_ = true;
+    if (task_handle_) xTaskNotifyGive(task_handle_);
+    const uint32_t start = smtc_modem_hal_get_time_in_ms();
+    while (!intercom_stop_confirmed_ &&
+           smtc_modem_hal_get_time_in_ms() - start < APP_INTERCOM_STOP_TIMEOUT_MS) {
+        vTaskDelay(ms_to_ticks_min_1(2));
+    }
+    const bool acknowledged = intercom_stop_confirmed_;
+    stop_intercom_local();
+    schedule_rx();
+    if (!acknowledged) ESP_LOGW(TAG, "intercom stop ACK timeout");
+    return acknowledged;
 }
 
 esp_err_t RadioPing::start()
@@ -286,7 +408,7 @@ esp_err_t RadioPing::start()
 void RadioPing::handle_button(bsp_btn_id_t id, bool pressed)
 {
     if (id != APP_PTT_BUTTON) return;
-    if (suspended_) return;
+    if (suspended_ || intercom_active_) return;
 
     ptt_active_ = pressed;
     ESP_LOGI(TAG, "PTT %s -> FLRC voice %s", pressed ? "down" : "up",
@@ -386,6 +508,11 @@ void RadioPing::task()
         if (!suspended_) {
             poll_once();
             update_playback_timeout();
+            if (intercom_active_) {
+                service_intercom();
+                ulTaskNotifyTake(pdTRUE, ms_to_ticks_min_1(APP_RADIO_TASK_POLL_MS));
+                continue;
+            }
             check_image_rx_timeout();
             check_image_rx_abort();
             check_image_capture_request();
@@ -420,7 +547,7 @@ void RadioPing::tx_task()
         // sample the mic at all — no voice prep, no Opus pre-encoding, no sound
         // trigger. PIR is a hardware GPIO wake source, so its trigger is still
         // handled here after wakeup.
-        if (g_low_power_enabled && !is_gateway_) {
+        if (g_low_power_enabled && !is_gateway_ && !intercom_active_) {
             if (pir_triggered_) {
                 pir_triggered_ = false;
                 bool dispatched = false;
@@ -449,6 +576,25 @@ void RadioPing::tx_task()
 
         if (!read_mono_frame(tx_pcm_, APP_AUDIO_FRAME_SAMPLES)) {
             vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
+            continue;
+        }
+
+        if (intercom_active_) {
+            echo_canceller_.process_capture(tx_pcm_, APP_AUDIO_FRAME_SAMPLES);
+            for (size_t i = 0; i < APP_AUDIO_FRAME_SAMPLES; ++i) {
+                int32_t scaled = static_cast<int32_t>(tx_pcm_[i]) *
+                    APP_INTERCOM_INPUT_GAIN;
+                if (scaled > 32767) scaled = 32767;
+                if (scaled < -32768) scaled = -32768;
+                tx_pcm_[i] = static_cast<int16_t>(scaled);
+            }
+            uint8_t encoded[APP_OPUS_MAX_PACKET_BYTES];
+            const int encoded_len = codec_.encode(tx_pcm_, APP_AUDIO_FRAME_SAMPLES,
+                                                   encoded,
+                                                   APP_OPUS_MAX_PACKET_BYTES);
+            if (encoded_len > 0 && encoded_len <= 255) {
+                enqueue_voice_frame(encoded, static_cast<uint16_t>(encoded_len));
+            }
             continue;
         }
 
@@ -536,7 +682,10 @@ void RadioPing::play_task()
             continue;
         }
 
-        audio_proc_.process_rx_frame(rx_pcm_, static_cast<size_t>(decoded));
+        if (!intercom_active_) {
+            audio_proc_.process_rx_frame(rx_pcm_, static_cast<size_t>(decoded));
+        }
+        echo_canceller_.push_reference(rx_pcm_, static_cast<size_t>(decoded));
         play_mono_frame(rx_pcm_, static_cast<size_t>(decoded));
         last_rx_audio_ms_ = smtc_modem_hal_get_time_in_ms();
         playback_active_ = true;
@@ -573,7 +722,7 @@ void RadioPing::poll_once()
     }
 
     if (mode_ == Mode::idle) {
-        if (g_low_power_enabled && !is_gateway_) {
+        if (g_low_power_enabled && !is_gateway_ && !intercom_active_) {
             // Low-power CAD sleep is a NODE-only behavior. The gateway never
             // sleeps: it must stay in continuous FLRC RX so it can receive a
             // node's self-initiated (PIR-triggered) image push, which arrives
@@ -711,7 +860,7 @@ void RadioPing::schedule_rx()
     // capture) breaks out of RX via ral_set_standby first. Nodes keep the short
     // timeout so they can fall back into CAD sleep between windows.
     uint32_t rx_timeout = APP_FLRC_RX_TIMEOUT_MS;
-    if (image_rx_pending_ || is_gateway_) {
+    if (image_rx_pending_ || is_gateway_ || intercom_active_) {
         rx_timeout = RAL_RX_TIMEOUT_CONTINUOUS_MODE;
     }
 
@@ -776,6 +925,104 @@ void RadioPing::schedule_tx()
     }
 }
 
+bool RadioPing::leave_rx_for_tx()
+{
+    if (mode_ == Mode::idle) return true;
+    if (mode_ != Mode::rx_pending && mode_ != Mode::cad_pending) return false;
+
+    smtc_modem_hal_protect_api_call();
+    ral_status_t status = ral_set_standby(&radio_.ral, RAL_STANDBY_CFG_XOSC);
+    if (status == RAL_STATUS_OK) {
+        status = ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+    }
+    smtc_modem_hal_unprotect_api_call();
+    irq_pending_ = false;
+    cad_pending_ms_ = 0;
+    mode_ = Mode::idle;
+    return status == RAL_STATUS_OK;
+}
+
+void RadioPing::service_intercom()
+{
+    if (!intercom_active_) return;
+    const int64_t now_us = esp_timer_get_time();
+
+    if (is_gateway_) {
+        if (now_us < intercom_next_slot_us_) return;
+        const int64_t period_us =
+            static_cast<int64_t>(APP_INTERCOM_SLOT_PERIOD_MS) * 1000LL;
+        intercom_next_slot_us_ += period_us;
+        if (intercom_next_slot_us_ <= now_us) {
+            intercom_next_slot_us_ = now_us + period_us;
+            intercom_missed_slots_++;
+        }
+        uint8_t flags = kVoiceFlagMaster;
+        if (!intercom_start_confirmed_) flags |= kVoiceFlagStart;
+        if (intercom_stop_requested_) flags |= kVoiceFlagStop;
+        (void)send_intercom_slot(flags);
+        return;
+    }
+
+    if (intercom_start_confirmed_ &&
+        smtc_modem_hal_get_time_in_ms() - intercom_last_sync_ms_ >
+            APP_INTERCOM_LINK_TIMEOUT_MS) {
+        ESP_LOGW(TAG, "intercom master sync lost; leaving session");
+        stop_intercom_local();
+        schedule_rx();
+        return;
+    }
+    if (!intercom_start_confirmed_ &&
+        smtc_modem_hal_get_time_in_ms() - intercom_last_sync_ms_ >
+            APP_INTERCOM_START_TIMEOUT_MS) {
+        ESP_LOGW(TAG, "intercom prepared session timed out");
+        stop_intercom_local();
+        schedule_rx();
+        return;
+    }
+    if (!intercom_reply_pending_ || now_us < intercom_reply_due_us_) return;
+    intercom_reply_pending_ = false;
+    if (smtc_modem_hal_get_time_in_ms() - intercom_last_sync_ms_ >
+        APP_INTERCOM_SYNC_TIMEOUT_MS) {
+        intercom_missed_slots_++;
+        return;
+    }
+    uint8_t flags = kVoiceFlagNodeReply;
+    if (intercom_stop_reply_) flags |= kVoiceFlagStopAck;
+    const bool stop_after_reply = intercom_stop_reply_;
+    (void)send_intercom_slot(flags);
+    if (stop_after_reply) {
+        stop_intercom_local();
+        schedule_rx();
+    }
+}
+
+bool RadioPing::send_intercom_slot(uint8_t flags)
+{
+    if (!leave_rx_for_tx()) {
+        intercom_missed_slots_++;
+        return false;
+    }
+    uint16_t tx_size = 0;
+    if (!build_voice_packet(&tx_size, flags)) {
+        intercom_missed_slots_++;
+        schedule_rx();
+        return false;
+    }
+    const bool ok = send_single_packet(tx_buf_, tx_size,
+                                       APP_INTERCOM_TX_TIMEOUT_MS);
+    if (ok) intercom_tx_slots_++;
+    else intercom_missed_slots_++;
+    schedule_rx();
+    if (((intercom_tx_slots_ + intercom_missed_slots_) % 100U) == 1U) {
+        ESP_LOGI(TAG, "intercom slots tx=%lu rx=%lu missed=%lu queued=%u",
+                 static_cast<unsigned long>(intercom_tx_slots_),
+                 static_cast<unsigned long>(intercom_rx_slots_),
+                 static_cast<unsigned long>(intercom_missed_slots_),
+                 tx_queue_ ? static_cast<unsigned>(uxQueueMessagesWaiting(tx_queue_)) : 0U);
+    }
+    return ok;
+}
+
 bool RadioPing::configure_flrc()
 {
     ralf_params_flrc_t params = {};
@@ -813,24 +1060,26 @@ bool RadioPing::configure_flrc()
     return true;
 }
 
-bool RadioPing::build_voice_packet(uint16_t *tx_size)
+bool RadioPing::build_voice_packet(uint16_t *tx_size, uint8_t flags)
 {
-    TxFrame frame;
-    if (tx_queue_ == nullptr || xQueueReceive(tx_queue_, &frame, 0) != pdTRUE) {
-        return false;
-    }
+    if (tx_size == nullptr || tx_queue_ == nullptr) return false;
+    TxFrame frame = {};
+    bool have_frame = xQueueReceive(tx_queue_, &frame, 0) == pdTRUE;
+    if (!have_frame && flags == 0) return false;
 
     std::memcpy(tx_buf_, kMagic, sizeof(kMagic));
     tx_buf_[4] = kPacketTypeVoice;
     tx_buf_[5] = 2;
-    put_u16_le(&tx_buf_[6], frame.seq);
+    put_u16_le(&tx_buf_[6], have_frame ? frame.seq : tx_seq_);
     put_u32_le(&tx_buf_[8], smtc_modem_hal_get_time_in_ms());
     tx_buf_[12] = 0;
-    tx_buf_[13] = 0;
+    tx_buf_[13] = flags & kVoiceFlagMask;
 
     uint16_t offset = kHeaderSize;
     uint8_t frame_count = 0;
-    while (frame_count < APP_FLRC_OPUS_FRAMES_PER_PACKET) {
+    const uint8_t frame_limit = intercom_active_ ? APP_INTERCOM_FRAMES_PER_PACKET :
+                                                   APP_FLRC_OPUS_FRAMES_PER_PACKET;
+    while (have_frame && frame_count < frame_limit) {
         if (frame.len == 0 || frame.len > APP_OPUS_MAX_PACKET_BYTES ||
             offset + 1U + frame.len > APP_FLRC_VOICE_MAX_PAYLOAD_BYTES) {
             break;
@@ -841,19 +1090,36 @@ bool RadioPing::build_voice_packet(uint16_t *tx_size)
         offset = static_cast<uint16_t>(offset + frame.len);
         frame_count++;
 
-        if (frame_count >= APP_FLRC_OPUS_FRAMES_PER_PACKET ||
-            xQueueReceive(tx_queue_, &frame, 0) != pdTRUE) {
-            break;
-        }
-    }
-
-    if (frame_count == 0) {
-        return false;
+        have_frame = frame_count < frame_limit &&
+            xQueueReceive(tx_queue_, &frame, 0) == pdTRUE;
     }
 
     tx_buf_[12] = frame_count;
+    if (intercom_active_ || flags != 0) {
+        put_u16_le(&tx_buf_[8], intercom_session_);
+    }
     *tx_size = offset;
-    return true;
+    return frame_count > 0 || flags != 0;
+}
+
+void RadioPing::enqueue_voice_frame(const uint8_t *payload, uint16_t len)
+{
+    if (!tx_queue_ || !payload || len == 0 || len > APP_OPUS_MAX_PACKET_BYTES) return;
+    if (intercom_active_) {
+        TxFrame stale = {};
+        while (uxQueueMessagesWaiting(tx_queue_) >= APP_INTERCOM_TX_QUEUE_FRAMES &&
+               xQueueReceive(tx_queue_, &stale, 0) == pdTRUE) {
+            tx_queue_drops_++;
+        }
+    }
+    TxFrame frame = {.seq = tx_seq_++, .len = len, .payload = {}};
+    std::memcpy(frame.payload, payload, len);
+    if (xQueueSend(tx_queue_, &frame, 0) != pdTRUE) {
+        TxFrame dropped = {};
+        (void)xQueueReceive(tx_queue_, &dropped, 0);
+        tx_queue_drops_++;
+        (void)xQueueSend(tx_queue_, &frame, 0);
+    }
 }
 
 void RadioPing::capture_voice_packet()
@@ -970,8 +1236,55 @@ void RadioPing::dispatch_rx_packet(uint16_t len, int16_t rssi)
         cad_wakeup_ms_ = smtc_modem_hal_get_time_in_ms();
     }
 
+    if (intercom_active_ && rx_buf_[4] == kPacketTypeConfig && !is_gateway_ &&
+        rx_buf_[8] == APP_CFG_KEY_INTERCOM &&
+        static_cast<uint16_t>(get_u32_le(&rx_buf_[9])) == intercom_session_) {
+        intercom_last_sync_ms_ = smtc_modem_hal_get_time_in_ms();
+        send_config_ack(APP_CFG_KEY_INTERCOM, intercom_session_);
+        return;
+    }
+    if (intercom_active_ && rx_buf_[4] != kPacketTypeVoice) {
+        ESP_LOGD(TAG, "intercom ignored packet type=%u", rx_buf_[4]);
+        return;
+    }
+
     if (rx_buf_[4] == kPacketTypeVoice) {
-        queue_voice_packet(len, rssi);
+        const uint16_t session = get_u16_le(&rx_buf_[8]);
+        const uint8_t flags = rx_buf_[13] & kVoiceFlagMask;
+        if (!intercom_active_ && flags == 0) {
+            (void)queue_voice_packet(len, rssi);
+            return;
+        }
+        if (!intercom_active_ && !is_gateway_ &&
+            (flags & kVoiceFlagStop) != 0 &&
+            session == intercom_last_stopped_session_) {
+            intercom_session_ = session;
+            (void)send_intercom_slot(kVoiceFlagNodeReply | kVoiceFlagStopAck);
+            return;
+        }
+        if (!intercom_active_ || session != intercom_session_) {
+            ESP_LOGD(TAG, "voice session mismatch rx=%u local=%u", session,
+                     intercom_session_);
+            return;
+        }
+        const bool valid = queue_voice_packet(len, rssi);
+        if (valid && !is_gateway_ && (flags & kVoiceFlagMaster) != 0) {
+            if ((flags & kVoiceFlagStart) != 0) {
+                intercom_start_confirmed_ = true;
+            }
+            intercom_last_sync_ms_ = smtc_modem_hal_get_time_in_ms();
+            intercom_reply_due_us_ = esp_timer_get_time() +
+                static_cast<int64_t>(APP_INTERCOM_NODE_GUARD_US);
+            intercom_reply_pending_ = true;
+            intercom_stop_reply_ = (flags & kVoiceFlagStop) != 0;
+            intercom_rx_slots_++;
+        } else if (valid && is_gateway_ && (flags & kVoiceFlagNodeReply) != 0) {
+            intercom_rx_slots_++;
+            intercom_start_confirmed_ = true;
+            if ((flags & kVoiceFlagStopAck) != 0) {
+                intercom_stop_confirmed_ = true;
+            }
+        }
     } else if (rx_buf_[4] == kPacketTypePing) {
         uint16_t seq = get_u16_le(&rx_buf_[6]);
         log_rx(seq, len, rssi);
@@ -998,6 +1311,9 @@ void RadioPing::dispatch_rx_packet(uint16_t len, int16_t rssi)
             config_received_cb_(key, value);
         }
         send_config_ack(key, value);
+        if (key == APP_CFG_KEY_INTERCOM && value != 0 && !is_gateway_) {
+            start_intercom_local(static_cast<uint16_t>(value));
+        }
         // Low power: config applied + ACK sent, work done. End the wake window
         // so the main loop returns to CAD sleep on the next idle pass.
         if (g_low_power_enabled && !is_gateway_ && cad_wakeup_ms_ != 0) {
@@ -1025,12 +1341,17 @@ void RadioPing::dispatch_rx_packet(uint16_t len, int16_t rssi)
     }
 }
 
-void RadioPing::queue_voice_packet(uint16_t len, int16_t rssi)
+bool RadioPing::queue_voice_packet(uint16_t len, int16_t rssi)
 {
+    if (!voice_queue_ || len < kHeaderSize) return false;
     uint8_t frame_count = rx_buf_[12];
-    if (frame_count == 0 || frame_count > APP_FLRC_OPUS_FRAMES_PER_PACKET) {
+    const uint8_t flags = rx_buf_[13] & kVoiceFlagMask;
+    if (frame_count == 0) {
+        return flags != 0 && len == kHeaderSize;
+    }
+    if (frame_count > APP_FLRC_OPUS_FRAMES_PER_PACKET) {
         ESP_LOGW(TAG, "RX bad voice packet len=%u frames=%u", len, frame_count);
-        return;
+        return false;
     }
 
     uint16_t seq = get_u16_le(&rx_buf_[6]);
@@ -1038,13 +1359,13 @@ void RadioPing::queue_voice_packet(uint16_t len, int16_t rssi)
     for (uint8_t i = 0; i < frame_count; i++) {
         if (offset >= len) {
             ESP_LOGW(TAG, "RX truncated voice packet len=%u frames=%u", len, frame_count);
-            return;
+            return false;
         }
 
         uint8_t opus_len = rx_buf_[offset++];
         if (opus_len == 0 || opus_len > APP_OPUS_MAX_PACKET_BYTES || offset + opus_len > len) {
             ESP_LOGW(TAG, "RX bad voice frame len=%u opus_len=%u", len, opus_len);
-            return;
+            return false;
         }
 
         uint16_t frame_seq = static_cast<uint16_t>(seq + i);
@@ -1072,6 +1393,7 @@ void RadioPing::queue_voice_packet(uint16_t len, int16_t rssi)
             }
         }
     }
+    return true;
 }
 
 void RadioPing::log_rx(uint16_t seq, uint16_t len, int16_t rssi)
@@ -1216,6 +1538,10 @@ void RadioPing::image_tx_task_trampoline(void *arg)
 
 void RadioPing::trigger_image_capture()
 {
+    if (intercom_active_) {
+        ESP_LOGD(TAG, "image capture ignored while intercom is active");
+        return;
+    }
     // UI and esp_timer callbacks must never touch the radio state directly.
     // Collapse duplicate triggers into one pending request and wake the radio
     // task; it owns all session teardown, mode changes and ImageCmd TX.
@@ -1406,6 +1732,11 @@ void RadioPing::stop_image_req_retry()
 // heap_caps allocation.
 void RadioPing::send_image(const uint8_t *jpeg, size_t jpeg_len, uint16_t session_id)
 {
+    if (intercom_active_) {
+        ESP_LOGW(TAG, "drop image while intercom is active");
+        heap_caps_free(const_cast<uint8_t *>(jpeg));
+        return;
+    }
     if (!image_tx_queue_) {
         ESP_LOGE(TAG, "image_tx_queue not initialized");
         heap_caps_free(const_cast<uint8_t *>(jpeg));
@@ -1784,7 +2115,8 @@ void RadioPing::burst_send_fragments(const ImageTxRequest &req, uint16_t total_f
     tx_done_waiter_ = nullptr;
 }
 
-bool RadioPing::send_single_packet(const uint8_t *data, uint16_t len)
+bool RadioPing::send_single_packet(const uint8_t *data, uint16_t len,
+                                   uint32_t timeout_ms)
 {
     // Register this task as the TX_DONE notify target and drop any stale
     // notification BEFORE arming TX, so a fast TX_DONE (which can fire the
@@ -1808,7 +2140,7 @@ bool RadioPing::send_single_packet(const uint8_t *data, uint16_t len)
     }
 
     mode_ = Mode::tx_pending;
-    bool ok = wait_for_tx_done(50);
+    bool ok = wait_for_tx_done(timeout_ms);
     tx_done_waiter_ = nullptr;
     return ok;
 }
@@ -2358,6 +2690,10 @@ void RadioPing::check_image_rx_abort()
 
 bool RadioPing::send_config(uint8_t key, uint32_t value)
 {
+    if (intercom_active_ && key != APP_CFG_KEY_INTERCOM) {
+        ESP_LOGW(TAG, "config key=%u rejected while intercom is active", key);
+        return false;
+    }
     ESP_LOGI(TAG, "send_config: key=%u value=%lu", key, static_cast<unsigned long>(value));
 
     suspended_ = true;

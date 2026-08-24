@@ -24,6 +24,7 @@ typedef bool (*ui_gw_sound_trigger_cb_t)(uint32_t level);
 typedef bool (*ui_gw_pir_trigger_cb_t)(uint32_t enable);
 typedef bool (*ui_gw_voice_alarm_cb_t)(uint32_t enable);
 typedef bool (*ui_gw_low_power_cb_t)(uint32_t enable);
+typedef bool (*ui_gw_intercom_cb_t)(uint32_t enable);
 typedef void (*ui_gw_wifi_prov_cb_t)(void);
 typedef void (*ui_gw_wifi_disconnect_cb_t)(void);
 // Called when the user leaves the transfer (RX) page: abort the current RX.
@@ -50,6 +51,7 @@ void ui_gw_set_sound_trigger_cb(ui_gw_sound_trigger_cb_t cb);
 void ui_gw_set_pir_trigger_cb(ui_gw_pir_trigger_cb_t cb);
 void ui_gw_set_voice_alarm_cb(ui_gw_voice_alarm_cb_t cb);
 void ui_gw_set_low_power_cb(ui_gw_low_power_cb_t cb);
+void ui_gw_set_intercom_cb(ui_gw_intercom_cb_t cb);
 void ui_gw_set_wifi_prov_cb(ui_gw_wifi_prov_cb_t cb);
 void ui_gw_set_wifi_disconnect_cb(ui_gw_wifi_disconnect_cb_t cb);
 void ui_gw_set_rx_abort_cb(ui_gw_rx_abort_cb_t cb);
