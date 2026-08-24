@@ -415,6 +415,9 @@ void on_low_power_standby(bool entering)
 void on_intercom_state(bool active)
 {
     g_audio.set_intercom_active(active);
+    if (g_app_mode == AppMode::radio) {
+        ui_gw_set_intercom_active(active);
+    }
 }
 
 void switch_mode_and_restart()

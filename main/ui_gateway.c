@@ -177,6 +177,14 @@ static ui_gw_low_power_cb_t s_low_power_cb = NULL;
 static bool s_low_power_on = false;
 static ui_gw_intercom_cb_t s_intercom_cb = NULL;
 static bool s_intercom_on = false;
+static bool s_intercom_active = false;
+typedef enum {
+    INTERCOM_UI_IDLE = 0,
+    INTERCOM_UI_CONNECTING,
+    INTERCOM_UI_ACTIVE,
+    INTERCOM_UI_FAILED,
+} intercom_ui_state_t;
+static intercom_ui_state_t s_intercom_ui_state = INTERCOM_UI_IDLE;
 static ui_gw_wifi_prov_cb_t s_wifi_prov_cb = NULL;
 static ui_gw_wifi_disconnect_cb_t s_wifi_disconnect_cb = NULL;
 static ui_gw_rx_abort_cb_t s_rx_abort_cb = NULL;
@@ -200,8 +208,11 @@ static void create_image_page(void);
 static void create_rx_page(void);
 static void create_link_page(void);
 static void create_config_page(void);
+static void create_intercom_page(void);
 static void create_qr_page(void);
 static void destroy_body_children(void);
+static void stream_stop(void);
+static void start_capture_action(void);
 static void update_title(const char *text, const char *chip, lv_color_t chip_bg);
 static lv_color_t vbat_level_color(uint16_t mv);
 static void gw_vbat_refresh(void);
@@ -601,6 +612,43 @@ static void cfg_wifi_btn_clicked_cb(lv_event_t *e)
 
 static void cfg_style_value(int idx, const char *text);
 
+static void start_capture_action(void)
+{
+    if (s_intercom_on) {
+        ESP_LOGI(TAG, "capture action: intercom armed active=%d",
+                 s_intercom_active ? 1 : 0);
+        stream_stop();
+        if (s_intercom_active) {
+            show_page(UI_PAGE_INTERCOM);
+            return;
+        }
+
+        s_intercom_ui_state = INTERCOM_UI_CONNECTING;
+        show_page(UI_PAGE_INTERCOM);
+        lv_refr_now(NULL);
+
+        bool started = s_intercom_cb && s_intercom_cb(1);
+        s_intercom_active = started;
+        s_intercom_ui_state = started ? INTERCOM_UI_ACTIVE : INTERCOM_UI_FAILED;
+        if (s_page == UI_PAGE_INTERCOM) {
+            show_page(UI_PAGE_INTERCOM);
+        }
+        return;
+    }
+
+    if (s_capture_cb) {
+        s_stream_mode = true;
+        s_stream_first_shown = false;
+        show_page(UI_PAGE_RX);
+        if (s_capture_cb()) {
+            update_title("Waiting...", "RX", COL_AMBER);
+        } else {
+            s_stream_mode = false;
+            show_page(UI_PAGE_IMAGE);
+        }
+    }
+}
+
 /* ─── Touch button clicked callback (value badges only) ─── */
 static void cfg_btn_clicked_cb(lv_event_t *e)
 {
@@ -608,13 +656,7 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
 
     switch (idx) {
     case 0: /* Capture */
-        if (s_capture_cb) {
-            s_stream_mode = true;
-            s_stream_first_shown = false;
-            show_page(UI_PAGE_RX);
-            s_capture_cb();
-            update_title("Waiting...", "RX", COL_AMBER);
-        }
+        start_capture_action();
         break;
     case 2: /* Interval cycle */ {
         int new_idx = (s_cfg_interval_idx + 1) % INTERVAL_PRESET_COUNT;
@@ -832,7 +874,7 @@ static void cfg_apply_low_power_lock(bool low_power_on)
 
 static void cfg_apply_intercom_lock(bool intercom_on)
 {
-    const int controls[] = {0, 2, 4, 5, 6, 7};
+    const int controls[] = {2, 4, 5, 6, 7};
     for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); ++i) {
         cfg_set_ctrl_enabled(controls[i], !intercom_on);
     }
@@ -882,14 +924,28 @@ static void cfg_switch_cb(lv_event_t *e)
         }
         break;
     case 8: /* Intercom */
-        if (s_intercom_cb) {
-            if (s_intercom_cb(on ? 1 : 0)) {
-                s_intercom_on = on;
-                gw_nvs_save_u8("intercom", on ? 1 : 0);
-                cfg_apply_intercom_lock(on);
+        if (on) {
+            s_intercom_on = true;
+            gw_nvs_save_u8("intercom", 1);
+            cfg_apply_intercom_lock(true);
+            if (s_cfg_touch_lbls[0]) {
+                lv_label_set_text(s_cfg_touch_lbls[0], "START INTERCOM");
+            }
+            ESP_LOGI(TAG, "intercom armed; press CAPTURE to start");
+        } else {
+            bool stopped = !s_intercom_active || !s_intercom_cb || s_intercom_cb(0);
+            if (stopped) {
+                s_intercom_on = false;
+                s_intercom_active = false;
+                s_intercom_ui_state = INTERCOM_UI_IDLE;
+                gw_nvs_save_u8("intercom", 0);
+                cfg_apply_intercom_lock(false);
+                cfg_apply_low_power_lock(s_low_power_on);
+                if (s_cfg_touch_lbls[0]) {
+                    lv_label_set_text(s_cfg_touch_lbls[0], "CAPTURE");
+                }
             } else {
-                if (on) lv_obj_clear_state(sw, LV_STATE_CHECKED);
-                else lv_obj_add_state(sw, LV_STATE_CHECKED);
+                lv_obj_add_state(sw, LV_STATE_CHECKED);
             }
         }
         break;
@@ -926,7 +982,7 @@ static void create_config_page(void)
     lv_obj_t *cap_lbl = lv_label_create(cap_btn);
     lv_obj_set_style_text_font(cap_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(cap_lbl, lv_color_white(), 0);
-    lv_label_set_text(cap_lbl, "CAPTURE");
+    lv_label_set_text(cap_lbl, s_intercom_on ? "START INTERCOM" : "CAPTURE");
     lv_obj_center(cap_lbl);
     s_cfg_touch_btns[0] = cap_btn;
     s_cfg_touch_lbls[0] = cap_lbl;
@@ -993,6 +1049,56 @@ static void create_config_page(void)
     }
 
     update_title("Settings", "CFG", COL_GREEN);
+}
+
+static void create_intercom_page(void)
+{
+    const char *headline = "INTERCOM READY";
+    const char *hint = "Press CAPTURE to start";
+    const char *chip = "READY";
+    lv_color_t color = COL_GREEN;
+
+    if (s_intercom_ui_state == INTERCOM_UI_CONNECTING) {
+        headline = "CONNECTING...";
+        hint = "Starting two-way voice";
+        chip = "WAIT";
+        color = COL_AMBER;
+    } else if (s_intercom_ui_state == INTERCOM_UI_ACTIVE) {
+        headline = "INTERCOM ACTIVE";
+        hint = "Two-way voice in progress";
+        chip = "LIVE";
+        color = COL_GREEN;
+    } else if (s_intercom_ui_state == INTERCOM_UI_FAILED) {
+        headline = "CONNECTION FAILED";
+        hint = "Press CAPTURE to retry";
+        chip = "FAIL";
+        color = lv_color_hex(0xB53A32);
+    }
+
+    lv_obj_t *panel = lv_obj_create(s_body);
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_size(panel, 224, 176);
+    lv_obj_set_pos(panel, 8, 24);
+    lv_obj_set_style_bg_color(panel, COL_PANEL_BG, 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(panel, 2, 0);
+    lv_obj_set_style_border_color(panel, color, 0);
+    lv_obj_set_style_radius(panel, 12, 0);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *state = lv_label_create(panel);
+    lv_obj_set_style_text_font(state, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(state, color, 0);
+    lv_label_set_text(state, headline);
+    lv_obj_align(state, LV_ALIGN_CENTER, 0, -20);
+
+    lv_obj_t *desc = lv_label_create(panel);
+    lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(desc, COL_MUTED, 0);
+    lv_label_set_text(desc, hint);
+    lv_obj_align(desc, LV_ALIGN_CENTER, 0, 22);
+
+    update_title("Intercom", chip, color);
 }
 
 /* ─── PAGE: QR Code ─── */
@@ -1082,6 +1188,7 @@ static void show_page(ui_page_t page)
     case UI_PAGE_RX:     create_rx_page();     break;
     case UI_PAGE_LINK:   create_link_page();   break;
     case UI_PAGE_CONFIG: create_config_page(); break;
+    case UI_PAGE_INTERCOM: create_intercom_page(); break;
     case UI_PAGE_QR:     create_qr_page();     break;
     default: break;
     }
@@ -1150,12 +1257,15 @@ esp_err_t ui_gw_init(void)
     s_pir_on = gw_nvs_load_u8("pir", 0) != 0;
     s_alarm_on = gw_nvs_load_u8("alarm", 0) != 0;
     s_low_power_on = gw_nvs_load_u8("lowpwr", 0) != 0;
-    /* A live radio session never survives a reboot; do not restore it active. */
-    s_intercom_on = false;
-    gw_nvs_save_u8("intercom", 0);
+    /* Restore only the armed setting. A live radio session still starts only
+     * after the user presses CAPTURE. */
+    s_intercom_on = gw_nvs_load_u8("intercom", 0) != 0;
+    s_intercom_active = false;
+    s_intercom_ui_state = INTERCOM_UI_IDLE;
     bsp_audio_set_volume((uint8_t)(s_volume_level * 10));
-    ESP_LOGI(TAG, "NVS load: vol=%d snd=%d pir=%d alarm=%d",
-             s_volume_level, s_sound_trigger_idx, s_pir_on, s_alarm_on);
+    ESP_LOGI(TAG, "NVS load: vol=%d snd=%d pir=%d alarm=%d intercom_armed=%d",
+             s_volume_level, s_sound_trigger_idx, s_pir_on, s_alarm_on,
+             s_intercom_on ? 1 : 0);
 
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
     create_shared_layout();
@@ -1214,6 +1324,22 @@ void ui_gw_set_intercom_cb(ui_gw_intercom_cb_t cb)
     s_intercom_cb = cb;
 }
 
+void ui_gw_set_intercom_active(bool active)
+{
+    if (!s_lock) return;
+    xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+
+    s_intercom_active = active;
+    s_intercom_ui_state = active ? INTERCOM_UI_ACTIVE : INTERCOM_UI_IDLE;
+    ESP_LOGI(TAG, "intercom session UI: active=%d armed=%d",
+             active ? 1 : 0, s_intercom_on ? 1 : 0);
+    if (s_page == UI_PAGE_INTERCOM) {
+        show_page(UI_PAGE_INTERCOM);
+    }
+
+    xSemaphoreGiveRecursive(s_lock);
+}
+
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
 {
     if (!pressed) return;
@@ -1222,18 +1348,9 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
 
     if (key == BSP_BTN_VOL_DN) {
-        /* K3 = Capture: start a continuous video stream. Frame 1 uses the RX
-         * progress page; later frames refresh in place (see ui_gw_rx_begin /
-         * ui_gw_rx_complete). */
-        if (s_capture_cb) {
-            s_stream_mode = true;
-            s_stream_first_shown = false;
-            if (s_page != UI_PAGE_RX) {
-                show_page(UI_PAGE_RX);
-            }
-            s_capture_cb();
-            update_title("Waiting...", "RX", COL_AMBER);
-        }
+        /* K3 = Capture. When Intercom is armed, the same key starts the
+         * two-way voice handshake instead of requesting an image stream. */
+        start_capture_action();
     } else if (key == BSP_BTN_VOL_UP) {
         /* K4 = Link page */
         stream_stop();

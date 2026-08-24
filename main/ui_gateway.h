@@ -14,6 +14,7 @@ typedef enum {
     UI_PAGE_RX,
     UI_PAGE_LINK,
     UI_PAGE_CONFIG,
+    UI_PAGE_INTERCOM,
     UI_PAGE_QR,
     UI_PAGE_COUNT
 } ui_page_t;
@@ -52,6 +53,7 @@ void ui_gw_set_pir_trigger_cb(ui_gw_pir_trigger_cb_t cb);
 void ui_gw_set_voice_alarm_cb(ui_gw_voice_alarm_cb_t cb);
 void ui_gw_set_low_power_cb(ui_gw_low_power_cb_t cb);
 void ui_gw_set_intercom_cb(ui_gw_intercom_cb_t cb);
+void ui_gw_set_intercom_active(bool active);
 void ui_gw_set_wifi_prov_cb(ui_gw_wifi_prov_cb_t cb);
 void ui_gw_set_wifi_disconnect_cb(ui_gw_wifi_disconnect_cb_t cb);
 void ui_gw_set_rx_abort_cb(ui_gw_rx_abort_cb_t cb);
