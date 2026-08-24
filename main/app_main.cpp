@@ -1192,7 +1192,14 @@ bool on_gw_intercom_change(uint32_t enable)
         gateway_image_queue_discard_pending();
         on_gw_rx_abort();
     }
-    return g_radio.set_intercom(enable != 0);
+    const uint32_t start_ms = static_cast<uint32_t>(esp_log_timestamp());
+    const bool ok = g_radio.set_intercom(enable != 0);
+    ESP_LOGI(TAG, "UI intercom result: requested=%s ok=%d elapsed=%lums active=%d",
+             enable ? "on" : "off", ok ? 1 : 0,
+             static_cast<unsigned long>(static_cast<uint32_t>(esp_log_timestamp()) -
+                                        start_ms),
+             g_radio.intercom_active() ? 1 : 0);
+    return ok;
 }
 
 // Gateway UI: user left the transfer page — abort the in-progress RX so the

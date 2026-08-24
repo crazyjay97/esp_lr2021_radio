@@ -279,6 +279,8 @@ private:
     uint32_t intercom_tx_slots_ = 0;
     uint32_t intercom_rx_slots_ = 0;
     uint32_t intercom_missed_slots_ = 0;
+    uint32_t intercom_mic_frames_ = 0;
+    uint32_t intercom_play_frames_ = 0;
 
     // Image transfer state
     image_capture_cb_t image_capture_cb_ = nullptr;
@@ -302,6 +304,8 @@ private:
     uint16_t image_rx_eot_count_ = 0;
     int16_t image_rx_last_rssi_ = 0;
     uint16_t image_rx_done_session_ = 0;
+    uint32_t image_req_debug_last_ms_ = 0;
+    uint16_t image_cmd_debug_session_ = 0;
     // Gateway ImageCmd request-retry state. image_req_session_ is fixed for the
     // whole request (NOT re-generated per retry), so retries never spawn a new
     // capture. image_req_active_ is cleared when the node replies (ImageCmdAck)

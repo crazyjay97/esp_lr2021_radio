@@ -1,5 +1,10 @@
 #include "radio_ping.hpp"
 
+// Bring-up switch: the reference implementation first proved TDD/Opus with
+// realtime DSP disabled. The new 256-tap floating-point NLMS path has not yet
+// been CPU-budgeted on this target, so keep it out of the first board test.
+#define APP_INTERCOM_AEC_ENABLE 0
+
 #include <cstring>
 #include <cmath>
 #include <cstdio>
@@ -283,6 +288,8 @@ void RadioPing::start_intercom_local(uint16_t session)
     intercom_tx_slots_ = 0;
     intercom_rx_slots_ = 0;
     intercom_missed_slots_ = 0;
+    intercom_mic_frames_ = 0;
+    intercom_play_frames_ = 0;
     intercom_next_slot_us_ = esp_timer_get_time() + 20000;
     ptt_active_ = false;
     tx_burst_active_ = false;
@@ -305,6 +312,10 @@ void RadioPing::start_intercom_local(uint16_t session)
     if (task_handle_) xTaskNotifyGive(task_handle_);
     ESP_LOGI(TAG, "intercom local start session=%u role=%s", session,
              is_gateway_ ? "gateway" : "node");
+    ESP_LOGI(TAG, "intercom diagnostics: aec=%s low_power=%d cad_active=%d mode=%u",
+             APP_INTERCOM_AEC_ENABLE ? "on" : "off",
+             g_low_power_enabled ? 1 : 0, low_power_cad_active_ ? 1 : 0,
+             static_cast<unsigned>(mode_));
 }
 
 void RadioPing::stop_intercom_local()
@@ -326,10 +337,28 @@ void RadioPing::stop_intercom_local()
 bool RadioPing::set_intercom(bool enable)
 {
     if (!is_gateway_) return false;
-    if (enable == intercom_active_) return true;
+    ESP_LOGI(TAG,
+             "intercom request: enable=%d active=%d started=%d stop_req=%d "
+             "image_req=%d image_rx=%d suspended=%d mode=%u",
+             enable ? 1 : 0, intercom_active_ ? 1 : 0,
+             intercom_start_confirmed_ ? 1 : 0, intercom_stop_requested_ ? 1 : 0,
+             image_req_active_ ? 1 : 0, image_rx_pending_ ? 1 : 0,
+             suspended_ ? 1 : 0, static_cast<unsigned>(mode_));
+    if (enable == intercom_active_) {
+        ESP_LOGI(TAG, "intercom request already in local state enable=%d", enable ? 1 : 0);
+        return true;
+    }
 
     if (enable) {
         abort_image_rx();
+        const uint32_t abort_start = smtc_modem_hal_get_time_in_ms();
+        while (image_rx_abort_req_.load(std::memory_order_acquire) &&
+               smtc_modem_hal_get_time_in_ms() - abort_start < 100U) {
+            vTaskDelay(ms_to_ticks_min_1(2));
+        }
+        if (image_rx_abort_req_.load(std::memory_order_acquire)) {
+            ESP_LOGW(TAG, "image abort not consumed before intercom CONFIG");
+        }
         uint16_t session = static_cast<uint16_t>(intercom_session_ + 1U);
         if (session == 0) session = 1;
         if (!send_config(APP_CFG_KEY_INTERCOM, session)) return false;
@@ -354,6 +383,8 @@ bool RadioPing::set_intercom(bool enable)
             schedule_rx();
             return false;
         }
+        ESP_LOGI(TAG, "intercom START confirmed session=%u in %lums", session,
+                 static_cast<unsigned long>(smtc_modem_hal_get_time_in_ms() - start));
         return true;
     }
 
@@ -369,7 +400,11 @@ bool RadioPing::set_intercom(bool enable)
     stop_intercom_local();
     schedule_rx();
     if (!acknowledged) ESP_LOGW(TAG, "intercom stop ACK timeout");
-    return acknowledged;
+    ESP_LOGI(TAG, "intercom local close complete remote_ack=%d", acknowledged ? 1 : 0);
+    // The UI represents the local owner state. Even if the final radio ACK was
+    // lost, local cleanup is complete and the node has its link-loss failsafe;
+    // returning false here incorrectly forces the switch back to ON.
+    return true;
 }
 
 esp_err_t RadioPing::start()
@@ -508,13 +543,14 @@ void RadioPing::task()
         if (!suspended_) {
             poll_once();
             update_playback_timeout();
+            // Consume control-plane aborts before intercom takes the packet plane.
+            check_image_rx_abort();
             if (intercom_active_) {
                 service_intercom();
                 ulTaskNotifyTake(pdTRUE, ms_to_ticks_min_1(APP_RADIO_TASK_POLL_MS));
                 continue;
             }
             check_image_rx_timeout();
-            check_image_rx_abort();
             check_image_capture_request();
 
             uint16_t chained_session =
@@ -535,10 +571,21 @@ void RadioPing::task()
 
 void RadioPing::tx_task()
 {
+    if (is_gateway_) {
+        ESP_LOGI(TAG, "gateway mic task parked until intercom starts");
+    }
     while (true) {
         // Sound detection remains a local trigger input. It never enters the
         // image payload; dispatch is gated while an image transfer is active.
         if (suspended_) {
+            vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
+            continue;
+        }
+
+        // The gateway has no local sound-trigger or pre-encode consumer. Before
+        // intercom starts, reading I2S every 10 ms only lets this priority-5 task
+        // preempt the core-1 LVGL (priority 4) and JPEG (priority 3) pipeline.
+        if (is_gateway_ && !intercom_active_) {
             vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
             continue;
         }
@@ -580,13 +627,28 @@ void RadioPing::tx_task()
         }
 
         if (intercom_active_) {
+#if APP_INTERCOM_AEC_ENABLE
             echo_canceller_.process_capture(tx_pcm_, APP_AUDIO_FRAME_SAMPLES);
+#endif
+            uint32_t sum_abs = 0;
+            int32_t peak = 0;
             for (size_t i = 0; i < APP_AUDIO_FRAME_SAMPLES; ++i) {
+                int32_t level = abs16(tx_pcm_[i]);
+                sum_abs += static_cast<uint32_t>(level);
+                if (level > peak) peak = level;
                 int32_t scaled = static_cast<int32_t>(tx_pcm_[i]) *
                     APP_INTERCOM_INPUT_GAIN;
                 if (scaled > 32767) scaled = 32767;
                 if (scaled < -32768) scaled = -32768;
                 tx_pcm_[i] = static_cast<int16_t>(scaled);
+            }
+            intercom_mic_frames_++;
+            if (intercom_mic_frames_ == 100U ||
+                (intercom_mic_frames_ % 500U) == 0U) {
+                ESP_LOGI(TAG, "intercom mic: frames=%lu avg_abs=%lu peak=%ld",
+                         static_cast<unsigned long>(intercom_mic_frames_),
+                         static_cast<unsigned long>(sum_abs / APP_AUDIO_FRAME_SAMPLES),
+                         static_cast<long>(peak));
             }
             uint8_t encoded[APP_OPUS_MAX_PACKET_BYTES];
             const int encoded_len = codec_.encode(tx_pcm_, APP_AUDIO_FRAME_SAMPLES,
@@ -685,7 +747,26 @@ void RadioPing::play_task()
         if (!intercom_active_) {
             audio_proc_.process_rx_frame(rx_pcm_, static_cast<size_t>(decoded));
         }
+#if APP_INTERCOM_AEC_ENABLE
         echo_canceller_.push_reference(rx_pcm_, static_cast<size_t>(decoded));
+#endif
+        if (intercom_active_) {
+            uint32_t sum_abs = 0;
+            int32_t peak = 0;
+            for (int i = 0; i < decoded; ++i) {
+                int32_t level = abs16(rx_pcm_[i]);
+                sum_abs += static_cast<uint32_t>(level);
+                if (level > peak) peak = level;
+            }
+            intercom_play_frames_++;
+            if (intercom_play_frames_ == 100U ||
+                (intercom_play_frames_ % 500U) == 0U) {
+                ESP_LOGI(TAG, "intercom playback: frames=%lu avg_abs=%lu peak=%ld",
+                         static_cast<unsigned long>(intercom_play_frames_),
+                         static_cast<unsigned long>(sum_abs / static_cast<uint32_t>(decoded)),
+                         static_cast<long>(peak));
+            }
+        }
         play_mono_frame(rx_pcm_, static_cast<size_t>(decoded));
         last_rx_audio_ms_ = smtc_modem_hal_get_time_in_ms();
         playback_active_ = true;
@@ -945,6 +1026,25 @@ bool RadioPing::leave_rx_for_tx()
 void RadioPing::service_intercom()
 {
     if (!intercom_active_) return;
+
+    // A low-power node may still own the radio in LoRa CAD when CONFIG arrives.
+    // Intercom requires FLRC before the first START/master slot can be received.
+    if (low_power_cad_active_) {
+        if (!leave_rx_for_tx()) {
+            ESP_LOGW(TAG, "intercom CAD exit deferred: mode=%u",
+                     static_cast<unsigned>(mode_));
+            return;
+        }
+        if (!configure_flrc()) {
+            intercom_missed_slots_++;
+            ESP_LOGW(TAG, "intercom FLRC restore failed");
+            return;
+        }
+        low_power_cad_active_ = false;
+        cad_wakeup_ms_ = 0;
+        schedule_rx();
+        ESP_LOGI(TAG, "intercom restored FLRC from low-power CAD");
+    }
     const int64_t now_us = esp_timer_get_time();
 
     if (is_gateway_) {
@@ -1011,7 +1111,16 @@ bool RadioPing::send_intercom_slot(uint8_t flags)
     const bool ok = send_single_packet(tx_buf_, tx_size,
                                        APP_INTERCOM_TX_TIMEOUT_MS);
     if (ok) intercom_tx_slots_++;
-    else intercom_missed_slots_++;
+    else {
+        intercom_missed_slots_++;
+        if (intercom_missed_slots_ == 1U ||
+            (intercom_missed_slots_ % 50U) == 0U) {
+            ESP_LOGW(TAG, "intercom TX failed role=%s flags=0x%02x mode=%u missed=%lu",
+                     is_gateway_ ? "gateway" : "node", flags,
+                     static_cast<unsigned>(mode_),
+                     static_cast<unsigned long>(intercom_missed_slots_));
+        }
+    }
     schedule_rx();
     if (((intercom_tx_slots_ + intercom_missed_slots_) % 100U) == 1U) {
         ESP_LOGI(TAG, "intercom slots tx=%lu rx=%lu missed=%lu queued=%u",
@@ -1270,6 +1379,9 @@ void RadioPing::dispatch_rx_packet(uint16_t len, int16_t rssi)
         const bool valid = queue_voice_packet(len, rssi);
         if (valid && !is_gateway_ && (flags & kVoiceFlagMaster) != 0) {
             if ((flags & kVoiceFlagStart) != 0) {
+                if (!intercom_start_confirmed_) {
+                    ESP_LOGI(TAG, "intercom START received session=%u rssi=%d", session, rssi);
+                }
                 intercom_start_confirmed_ = true;
             }
             intercom_last_sync_ms_ = smtc_modem_hal_get_time_in_ms();
@@ -1280,8 +1392,12 @@ void RadioPing::dispatch_rx_packet(uint16_t len, int16_t rssi)
             intercom_rx_slots_++;
         } else if (valid && is_gateway_ && (flags & kVoiceFlagNodeReply) != 0) {
             intercom_rx_slots_++;
+            if (!intercom_start_confirmed_) {
+                ESP_LOGI(TAG, "intercom first node reply session=%u rssi=%d", session, rssi);
+            }
             intercom_start_confirmed_ = true;
             if ((flags & kVoiceFlagStopAck) != 0) {
+                ESP_LOGI(TAG, "intercom STOP_ACK received session=%u", session);
                 intercom_stop_confirmed_ = true;
             }
         }
@@ -1539,7 +1655,9 @@ void RadioPing::image_tx_task_trampoline(void *arg)
 void RadioPing::trigger_image_capture()
 {
     if (intercom_active_) {
-        ESP_LOGD(TAG, "image capture ignored while intercom is active");
+        ESP_LOGW(TAG, "image capture blocked: intercom active=%d started=%d session=%u",
+                 intercom_active_ ? 1 : 0, intercom_start_confirmed_ ? 1 : 0,
+                 intercom_session_);
         return;
     }
     // UI and esp_timer callbacks must never touch the radio state directly.
@@ -1547,6 +1665,12 @@ void RadioPing::trigger_image_capture()
     // task; it owns all session teardown, mode changes and ImageCmd TX.
     s_image_stream_active.store(true, std::memory_order_release);
     image_capture_req_.store(true, std::memory_order_release);
+    ESP_LOGI(TAG,
+             "image capture queued: suspended=%d mode=%u req_active=%d rx_pending=%d "
+             "abort_pending=%d",
+             suspended_ ? 1 : 0, static_cast<unsigned>(mode_),
+             image_req_active_ ? 1 : 0, image_rx_pending_ ? 1 : 0,
+             image_rx_abort_req_.load(std::memory_order_acquire) ? 1 : 0);
     TaskHandle_t task = task_handle_;
     if (task != nullptr) {
         xTaskNotifyGive(task);
@@ -1615,6 +1739,10 @@ void RadioPing::start_image_capture_request()
     // (no wakeup) and floods continuously. check_image_req_retry (radio task
     // loop) drives the flood and starts fresh rounds until the node replies.
     image_req_active_ = true;
+    image_req_debug_last_ms_ = smtc_modem_hal_get_time_in_ms();
+    ESP_LOGI(TAG, "image request start: session=%u low_power=%d mode=%u",
+             image_req_session_, g_low_power_enabled ? 1 : 0,
+             static_cast<unsigned>(mode_));
     start_image_req_round();
 
     image_rx_pending_ = true;
@@ -1693,6 +1821,16 @@ void RadioPing::check_image_req_retry()
         return;
     }
     uint32_t now = smtc_modem_hal_get_time_in_ms();
+
+    if (now - image_req_debug_last_ms_ >= 1000U) {
+        image_req_debug_last_ms_ = now;
+        ESP_LOGI(TAG,
+                 "image request waiting: session=%u mode=%u suspended=%d rx_pending=%d "
+                 "received=%u/%u",
+                 image_req_session_, static_cast<unsigned>(mode_), suspended_ ? 1 : 0,
+                 image_rx_pending_ ? 1 : 0, image_xfer_.rx_received_count(),
+                 image_xfer_.rx_total_count());
+    }
 
     // Low power: if the current round's flood window has elapsed with no
     // ImageStart, start a fresh round (new LoRa wakeup to re-open the node's
@@ -2198,6 +2336,14 @@ void RadioPing::handle_image_cmd()
         accepted = image_capture_cb_(session_id);
     }
 
+    if (session_id != image_cmd_debug_session_) {
+        image_cmd_debug_session_ = session_id;
+        ESP_LOGI(TAG,
+                 "RX ImageCmd: session=%u accepted=%d intercom=%d image_tx=%d mode=%u",
+                 session_id, accepted ? 1 : 0, intercom_active_ ? 1 : 0,
+                 image_tx_active_ ? 1 : 0, static_cast<unsigned>(mode_));
+    }
+
     if (accepted) {
         uint8_t ack[kHeaderSize];
         std::memcpy(ack, kMagic, sizeof(kMagic));
@@ -2225,7 +2371,9 @@ void RadioPing::handle_image_cmd_ack()
     if (session_id != image_req_session_) {
         return;
     }
-    // ESP_LOGI(TAG, "RX ImageCmdAck: session=%u", session_id);
+    ESP_LOGI(TAG, "RX ImageCmdAck: session=%u request_age=%lums", session_id,
+             static_cast<unsigned long>(smtc_modem_hal_get_time_in_ms() -
+                                        image_cmd_sent_ms_));
     stop_image_req_retry();
     schedule_rx();
 }
@@ -2263,6 +2411,16 @@ void RadioPing::handle_image_start(uint16_t len)
     uint16_t total_frags = get_u16_le(&rx_buf_[8]);
     uint32_t expected_crc32 = get_u32_le(&rx_buf_[10]);
     uint16_t vbat_mv = has_vbat ? get_u16_le(&rx_buf_[14]) : 0;
+
+    const bool first_start_for_session =
+        !image_xfer_.rx_active() || image_xfer_.rx_session_id() != session_id;
+    if (first_start_for_session) {
+        ESP_LOGI(TAG,
+                 "RX ImageStart: session=%u total=%u req_session=%u req_active=%d "
+                 "rx_pending=%d mode=%u",
+                 session_id, total_frags, image_req_session_, image_req_active_ ? 1 : 0,
+                 image_rx_pending_ ? 1 : 0, static_cast<unsigned>(mode_));
+    }
 
     // While a gateway request is waiting for ImageStart, only that request's
     // session may start the transfer. Once reassembly is active, only a repeat
@@ -2662,8 +2820,13 @@ void RadioPing::check_image_rx_timeout()
         return;
     }
 
-    // ESP_LOGW(TAG, "image RX: timeout (10s no activity), giving up. %u/%u received",
-    //          image_xfer_.rx_received_count(), image_xfer_.rx_total_count());
+    ESP_LOGW(TAG,
+             "image RX timeout: session=%u received=%u/%u req_active=%d mode=%u "
+             "intercom=%d suspended=%d",
+             image_xfer_.rx_session_id(), image_xfer_.rx_received_count(),
+             image_xfer_.rx_total_count(), image_req_active_ ? 1 : 0,
+             static_cast<unsigned>(mode_), intercom_active_ ? 1 : 0,
+             suspended_ ? 1 : 0);
     image_rx_pending_ = false;
     image_xfer_.rx_reset();
     image_rx_nack_sent_ = 0;
@@ -2678,9 +2841,13 @@ void RadioPing::check_image_rx_abort()
     if (!image_rx_abort_req_.exchange(false, std::memory_order_acq_rel)) return;
 
     image_capture_req_.store(false, std::memory_order_release);
-    if (image_rx_pending_ || image_req_active_) {
-        ESP_LOGI(TAG, "image RX aborted by user (left transfer page)");
-    }
+    ESP_LOGI(TAG,
+             "image RX abort consumed: req_active=%d rx_pending=%d session=%u "
+             "received=%u/%u mode=%u intercom=%d",
+             image_req_active_ ? 1 : 0, image_rx_pending_ ? 1 : 0,
+             image_xfer_.rx_session_id(), image_xfer_.rx_received_count(),
+             image_xfer_.rx_total_count(), static_cast<unsigned>(mode_),
+             intercom_active_ ? 1 : 0);
     image_req_active_ = false;
     image_rx_pending_ = false;
     image_xfer_.rx_reset();

@@ -383,7 +383,7 @@
 #define APP_LCD_Y_GAP                   0
 /* Commands use the conservative clock; APP_LCD_SPI_PCLK_HZ is pixel DMA only. */
 #define APP_LCD_SPI_CMD_PCLK_HZ         10000000U
-#define APP_LCD_SPI_PCLK_HZ             20000000U
+#define APP_LCD_SPI_PCLK_HZ             16000000U
 #define APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS 64U
 #define APP_LCD_SPI_QUEUE_DEPTH         10U
 #define APP_LCD_SPI_SCLK_DRIVE_CAP      3U
