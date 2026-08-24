@@ -2,6 +2,7 @@
 #include "app_config.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_wifi.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -15,6 +16,21 @@
 #include <stdio.h>
 
 static const char *TAG = "wifi_mgr";
+
+static void log_heap_state(const char *stage)
+{
+    const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    const uint32_t dma_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA |
+                              MALLOC_CAP_8BIT;
+    ESP_LOGI(TAG,
+             "[HEAP] %s internal free=%u largest=%u min=%u | dma free=%u largest=%u",
+             stage,
+             (unsigned)heap_caps_get_free_size(internal_caps),
+             (unsigned)heap_caps_get_largest_free_block(internal_caps),
+             (unsigned)heap_caps_get_minimum_free_size(internal_caps),
+             (unsigned)heap_caps_get_free_size(dma_caps),
+             (unsigned)heap_caps_get_largest_free_block(dma_caps));
+}
 
 #define NVS_NAMESPACE    "wifi_cfg"
 #define NVS_KEY_SSID     "ssid"
@@ -323,7 +339,9 @@ static esp_err_t wifi_hw_start(void)
     cfg.static_tx_buf_num = 0;
     cfg.dynamic_tx_buf_num = 12;
     cfg.tx_buf_type = 1;
+    log_heap_state("before esp_wifi_init");
     ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi init");
+    log_heap_state("after esp_wifi_init");
 
 #if APP_WIFI_STA_ENABLE
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG, "set mode");
@@ -337,9 +355,12 @@ static esp_err_t wifi_hw_start(void)
     ap_cfg.ap.channel = 1;
     ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
     ap_cfg.ap.max_connection = 4;
-    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg), TAG,
+                        "set AP config");
 
+    log_heap_state("before esp_wifi_start");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
+    log_heap_state("after esp_wifi_start");
 
     s_wifi_started = true;
     ESP_LOGI(TAG, "WiFi APSTA started, AP: %s (open)", s_service_name);

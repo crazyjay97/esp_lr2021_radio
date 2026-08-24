@@ -72,6 +72,7 @@ void      bsp_led_set(bool r, bool g, bool b);
 
 /* ---------- Audio (ES8311 codec + CST8302A PA + I2S) -------------------- */
 esp_err_t bsp_audio_init(uint32_t sample_rate_hz);
+esp_err_t bsp_audio_init_gateway_duplex(uint32_t sample_rate_hz);
 esp_err_t bsp_audio_init_playback_only(uint32_t sample_rate_hz);
 esp_err_t bsp_audio_pa_enable(bool on);                  /* PA enable via P6 */
 esp_err_t bsp_audio_suspend(void);

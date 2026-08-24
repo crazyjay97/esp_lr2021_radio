@@ -39,6 +39,21 @@ constexpr const char *TAG = "app";
 constexpr const char *kNvsNs = "app";
 constexpr const char *kModeKey = "mode";
 
+void log_heap_state(const char *stage)
+{
+    constexpr uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    constexpr uint32_t dma_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA |
+                                  MALLOC_CAP_8BIT;
+    ESP_LOGI(TAG,
+             "[HEAP] %s internal free=%u largest=%u min=%u | dma free=%u largest=%u",
+             stage,
+             static_cast<unsigned>(heap_caps_get_free_size(internal_caps)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(internal_caps)),
+             static_cast<unsigned>(heap_caps_get_minimum_free_size(internal_caps)),
+             static_cast<unsigned>(heap_caps_get_free_size(dma_caps)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(dma_caps)));
+}
+
 enum class AppMode : uint8_t {
     camera = 0,
     radio = 1,
@@ -1356,6 +1371,7 @@ extern "C" void app_main(void)
 
     printf("PSRAM free: %d\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     printf("PSRAM total: %d\n", heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+    log_heap_state("startup");
 
 #if APP_CAMERA_LCD_BRINGUP
     bsp_i2c_scan();
@@ -1403,7 +1419,7 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "led init: %s", esp_err_to_name(e));
     }
     if (g_app_mode == AppMode::radio) {
-        if ((e = bsp_audio_init(APP_AUDIO_SAMPLE_RATE_HZ)) != ESP_OK) {
+        if ((e = bsp_audio_init_gateway_duplex(APP_AUDIO_SAMPLE_RATE_HZ)) != ESP_OK) {
             ESP_LOGE(TAG, "audio init (duplex): %s", esp_err_to_name(e));
         }
     } else {
@@ -1414,6 +1430,7 @@ extern "C" void app_main(void)
     if ((e = g_audio.init()) != ESP_OK) {
         ESP_LOGE(TAG, "audio diagnostics init: %s", esp_err_to_name(e));
     }
+    log_heap_state("after audio");
 #if APP_RADIO_FEATURES_ENABLE
     {
         // Driver 0.0.7 loads LR2021 PRAM during ral_init(). Configure NRST as a
@@ -1509,6 +1526,7 @@ extern "C" void app_main(void)
             esp_timer_start_once(pir_arm_timer, 5000000ULL); // 5s
         }
     }
+    log_heap_state("after radio");
 #else
     ESP_LOGW(TAG, "radio feature disabled for camera/audio isolation");
 #endif
@@ -1547,7 +1565,12 @@ extern "C" void app_main(void)
                 ui_gw_set_rx_abort_cb(on_gw_rx_abort);
 
                 wifi_mgr_set_state_cb(on_wifi_state_change);
-                wifi_mgr_init();
+                log_heap_state("before wifi");
+                if ((e = wifi_mgr_init()) != ESP_OK) {
+                    ESP_LOGE(TAG, "wifi manager init: %s", esp_err_to_name(e));
+                } else {
+                    log_heap_state("after wifi");
+                }
             }
         }
     }
