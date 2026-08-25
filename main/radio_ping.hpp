@@ -281,6 +281,9 @@ private:
     uint32_t intercom_missed_slots_ = 0;
     uint32_t intercom_mic_frames_ = 0;
     uint32_t intercom_play_frames_ = 0;
+    uint64_t intercom_aec_us_total_ = 0;
+    uint32_t intercom_aec_us_max_ = 0;
+    uint32_t intercom_input_clip_samples_ = 0;
 
     // Image transfer state
     image_capture_cb_t image_capture_cb_ = nullptr;

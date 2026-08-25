@@ -44,14 +44,14 @@
 /* Low-delay mode avoids the heavier SILK VOIP path that was hitting WDT. */
 #define APP_OPUS_APPLICATION            OPUS_APPLICATION_RESTRICTED_LOWDELAY
 
-/* 16 kHz speech has enough FLRC budget; 24 kbps improves low-delay quality. */
-#define APP_OPUS_BITRATE_BPS            24000
+/* The stable FLRC link has enough budget for clearer low-delay speech. */
+#define APP_OPUS_BITRATE_BPS            32000
 
 /* Fixed bitrate makes packet sizing and radio scheduling easier to debug. */
 #define APP_OPUS_USE_VBR                0
 
-/* Keep encoder CPU bounded on ESP32-S3; raise only after WDT/headroom tests. */
-#define APP_OPUS_COMPLEXITY             0
+/* Complexity 3 improves CELT speech quality while keeping CPU use bounded. */
+#define APP_OPUS_COMPLEXITY             3
 
 /* Keep DTX off for the first bring-up so packet timing remains predictable. */
 #define APP_OPUS_USE_DTX                0
@@ -88,9 +88,11 @@
 /* Keep the existing voice packet aggregation boundary unchanged. */
 #define APP_FLRC_VOICE_MAX_PAYLOAD_BYTES 255U
 
-/* Image bulk transfer uses one fixed 511-byte packet per fragment. */
-#define APP_FLRC_MAX_PAYLOAD_BYTES      511U
-#define APP_FLRC_BURST_PAYLOAD_LEN      511U
+/* Keep the 2-byte FIFO command plus payload at 512 bytes. The radio HAL uses
+ * stack buffers, and a 512-byte aligned polling transfer can use the project's
+ * reserved DMA bounce buffers without allocating temporary internal memory. */
+#define APP_FLRC_MAX_PAYLOAD_BYTES      510U
+#define APP_FLRC_BURST_PAYLOAD_LEN      510U
 
 /* Pack several 10 ms Opus frames per FLRC packet to reduce TX overhead while
  * keeping each radio packet to about 50 ms of audio. */
@@ -106,15 +108,15 @@
 #define APP_INTERCOM_LINK_TIMEOUT_MS    1200U
 #define APP_INTERCOM_TX_QUEUE_FRAMES    4U
 #define APP_INTERCOM_FRAMES_PER_PACKET  2U
-#define APP_INTERCOM_INPUT_GAIN         4
+/* Keep the end-to-end acoustic loop below unity when two units are nearby.
+ * Playback attenuation is applied before both the AEC reference and I2S. */
+#define APP_INTERCOM_INPUT_GAIN         2
+#define APP_INTERCOM_PLAYBACK_PERCENT   60U
+#define APP_INTERCOM_AEC_ENABLE         1
 
-/* NLMS acoustic echo cancellation. The reference is the decoded PCM actually
- * written to I2S. Delay is board-dependent and is intentionally tunable. */
-#define APP_AEC_REFERENCE_DELAY_MS      40U
-#define APP_AEC_NLMS_STEP               0.12f
-#define APP_AEC_NLMS_EPSILON            0.001f
-#define APP_AEC_MIN_REFERENCE_ENERGY    0.00002f
-#define APP_AEC_DOUBLE_TALK_RATIO       2.5f
+/* Official ESP-SR direct VOIP_HIGH_PERF AEC. The runtime chunk size is
+ * bridged to the project's 10 ms audio frames without a worker task. */
+#define APP_AFE_AEC_FILTER_LENGTH       4U
 
 /* RX timeout used by the packet receiver before it re-arms listening. */
 #define APP_FLRC_RX_TIMEOUT_MS          100U
@@ -182,14 +184,16 @@
 /* Run Opus decode/playback away from direct radio control. */
 #define APP_VOICE_PLAY_TASK_CORE        1
 
-/* Opus encode plus I2S read run here so RAC polling is not blocked by audio. */
-#define APP_VOICE_TX_TASK_PRIORITY      5
+/* Keep capture/AEC/Opus below the CPU0 radio task so the 2 ms RAC service can
+ * preempt VOIP_HIGH_PERF processing without dropping a TDD slot. */
+#define APP_VOICE_TX_TASK_PRIORITY      3
 /* Was 32768; cut to 16KB to reclaim internal SRAM under 32KB I-cache. See
  * APP_RADIO_TASK_STACK_BYTES note. STACK-probe logs verify real usage. */
 #define APP_VOICE_TX_TASK_STACK_BYTES   16384U
 
-/* Keep Opus encode away from the radio/control task on CPU0. */
-#define APP_VOICE_TX_TASK_CORE          1
+/* Balance the synchronous AEC load onto CPU0. Intercom excludes image traffic,
+ * and the priority-4 radio task remains above this priority-3 audio task. */
+#define APP_VOICE_TX_TASK_CORE          0
 
 /* ----- Audio DSP (noise suppression / voice enhancement) -------------------- */
 
@@ -304,7 +308,8 @@
 // downsample/JPEG loop immediately. This lets img_tx reclaim the CPU to load the
 // next packet without relying on those (library) loops to yield voluntarily —
 // the precondition for overlapping next-frame encode with the current TX burst.
-// Stays below the voice tasks (5) so real-time audio is unaffected.
+// Image transfer is mutually exclusive with intercom, so this priority-4 task
+// never competes with the priority-3 capture/AEC/Opus task during a call.
 #define APP_IMAGE_TX_TASK_PRIORITY      4
 // Pin the radio image-TX task to core 0 (the main radio task's core), away from
 // the image-capture/encode task on core 1. During a stream the capture task

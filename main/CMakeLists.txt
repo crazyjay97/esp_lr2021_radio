@@ -20,6 +20,7 @@ idf_component_register(SRCS
                        INCLUDE_DIRS "."
                        REQUIRES
                            lierda-iot__esp_lora_driver
+                           espressif__esp-sr
                            esp_driver_gpio
                            esp_driver_cam
                            esp_driver_i2c
@@ -43,3 +44,7 @@ target_link_libraries(${COMPONENT_LIB} INTERFACE
                       "-Wl,--wrap=spi_device_queue_trans")
 target_link_libraries(${COMPONENT_LIB} INTERFACE
                       "-u __wrap_spi_device_queue_trans")
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+                      "-Wl,--wrap=spi_device_polling_transmit")
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+                      "-u __wrap_spi_device_polling_transmit")

@@ -1,10 +1,5 @@
 #include "radio_ping.hpp"
 
-// Bring-up switch: the reference implementation first proved TDD/Opus with
-// realtime DSP disabled. The new 256-tap floating-point NLMS path has not yet
-// been CPU-budgeted on this target, so keep it out of the first board test.
-#define APP_INTERCOM_AEC_ENABLE 0
-
 #include <cstring>
 #include <cmath>
 #include <cstdio>
@@ -77,6 +72,32 @@ int32_t abs16(int16_t v)
     return v < 0 ? -static_cast<int32_t>(v) : v;
 }
 
+void apply_intercom_playback_gain(int16_t *pcm, size_t samples)
+{
+    const int32_t gain_percent =
+        static_cast<int32_t>(APP_INTERCOM_PLAYBACK_PERCENT);
+    for (size_t i = 0; i < samples; ++i) {
+        const int32_t scaled = static_cast<int32_t>(pcm[i]) * gain_percent;
+        pcm[i] = static_cast<int16_t>(scaled / 100);
+    }
+}
+
+void log_intercom_heap(const char *stage)
+{
+    constexpr uint32_t kInternalCaps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    constexpr uint32_t kDmaCaps =
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
+    ESP_LOGI(TAG,
+             "intercom heap %s: internal free=%u largest=%u | "
+             "dma free=%u largest=%u",
+             stage,
+             static_cast<unsigned>(heap_caps_get_free_size(kInternalCaps)),
+             static_cast<unsigned>(
+                 heap_caps_get_largest_free_block(kInternalCaps)),
+             static_cast<unsigned>(heap_caps_get_free_size(kDmaCaps)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(kDmaCaps)));
+}
+
 void put_u16_le(uint8_t *p, uint16_t v)
 {
     p[0] = static_cast<uint8_t>(v);
@@ -147,6 +168,7 @@ esp_err_t RadioPing::init()
         return err;
     }
 
+
     voice_queue_ = xQueueCreate(APP_VOICE_RX_QUEUE_LEN, sizeof(VoicePacket));
     if (voice_queue_ == nullptr) {
         ESP_LOGE(TAG, "voice queue alloc failed");
@@ -206,6 +228,7 @@ esp_err_t RadioPing::init_gateway()
     if (err != ESP_OK) {
         return err;
     }
+
 
     voice_queue_ = xQueueCreate(APP_VOICE_RX_QUEUE_LEN, sizeof(VoicePacket));
     if (voice_queue_ == nullptr) {
@@ -290,6 +313,9 @@ void RadioPing::start_intercom_local(uint16_t session)
     intercom_missed_slots_ = 0;
     intercom_mic_frames_ = 0;
     intercom_play_frames_ = 0;
+    intercom_aec_us_total_ = 0;
+    intercom_aec_us_max_ = 0;
+    intercom_input_clip_samples_ = 0;
     intercom_next_slot_us_ = esp_timer_get_time() + 20000;
     ptt_active_ = false;
     tx_burst_active_ = false;
@@ -312,10 +338,18 @@ void RadioPing::start_intercom_local(uint16_t session)
     if (task_handle_) xTaskNotifyGive(task_handle_);
     ESP_LOGI(TAG, "intercom local start session=%u role=%s", session,
              is_gateway_ ? "gateway" : "node");
-    ESP_LOGI(TAG, "intercom diagnostics: aec=%s low_power=%d cad_active=%d mode=%u",
-             APP_INTERCOM_AEC_ENABLE ? "on" : "off",
-             g_low_power_enabled ? 1 : 0, low_power_cad_active_ ? 1 : 0,
-             static_cast<unsigned>(mode_));
+    ESP_LOGI(TAG,
+             "intercom diagnostics: aec=esp-sr-direct-voip-high-perf ready=%d "
+             "low_power=%d cad_active=%d mode=%u tx_core=%u tx_prio=%u "
+             "play_core=%u play_prio=%u tx_gain=%u play_gain=%u%%",
+             echo_canceller_.ready() ? 1 : 0, g_low_power_enabled ? 1 : 0,
+             low_power_cad_active_ ? 1 : 0, static_cast<unsigned>(mode_),
+             static_cast<unsigned>(APP_VOICE_TX_TASK_CORE),
+             static_cast<unsigned>(APP_VOICE_TX_TASK_PRIORITY),
+             static_cast<unsigned>(APP_VOICE_PLAY_TASK_CORE),
+             static_cast<unsigned>(APP_VOICE_PLAY_TASK_PRIORITY),
+             static_cast<unsigned>(APP_INTERCOM_INPUT_GAIN),
+             static_cast<unsigned>(APP_INTERCOM_PLAYBACK_PERCENT));
 }
 
 void RadioPing::stop_intercom_local()
@@ -359,9 +393,22 @@ bool RadioPing::set_intercom(bool enable)
         if (image_rx_abort_req_.load(std::memory_order_acquire)) {
             ESP_LOGW(TAG, "image abort not consumed before intercom CONFIG");
         }
+#if APP_INTERCOM_AEC_ENABLE
+        log_intercom_heap("before AEC");
+        if (!echo_canceller_.ready() &&
+            !echo_canceller_.init()) {
+            ESP_LOGE(TAG,
+                     "intercom start rejected: gateway ESP-SR direct AEC init failed");
+            return false;
+        }
+        log_intercom_heap("after AEC");
+#endif
         uint16_t session = static_cast<uint16_t>(intercom_session_ + 1U);
         if (session == 0) session = 1;
-        if (!send_config(APP_CFG_KEY_INTERCOM, session)) return false;
+        if (!send_config(APP_CFG_KEY_INTERCOM, session)) {
+            echo_canceller_.reset();
+            return false;
+        }
         start_intercom_local(session);
 
         const uint32_t start = smtc_modem_hal_get_time_in_ms();
@@ -583,8 +630,8 @@ void RadioPing::tx_task()
         }
 
         // The gateway has no local sound-trigger or pre-encode consumer. Before
-        // intercom starts, reading I2S every 10 ms only lets this priority-5 task
-        // preempt the core-1 LVGL (priority 4) and JPEG (priority 3) pipeline.
+        // intercom starts, avoid waking the CPU0 capture task and competing with
+        // the higher-priority radio service for I2S data that no consumer needs.
         if (is_gateway_ && !intercom_active_) {
             vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
             continue;
@@ -627,8 +674,11 @@ void RadioPing::tx_task()
         }
 
         if (intercom_active_) {
+            uint32_t aec_us = 0;
 #if APP_INTERCOM_AEC_ENABLE
+            const int64_t aec_start_us = esp_timer_get_time();
             echo_canceller_.process_capture(tx_pcm_, APP_AUDIO_FRAME_SAMPLES);
+            aec_us = static_cast<uint32_t>(esp_timer_get_time() - aec_start_us);
 #endif
             uint32_t sum_abs = 0;
             int32_t peak = 0;
@@ -638,17 +688,31 @@ void RadioPing::tx_task()
                 if (level > peak) peak = level;
                 int32_t scaled = static_cast<int32_t>(tx_pcm_[i]) *
                     APP_INTERCOM_INPUT_GAIN;
-                if (scaled > 32767) scaled = 32767;
-                if (scaled < -32768) scaled = -32768;
+                if (scaled > 32767) {
+                    scaled = 32767;
+                    intercom_input_clip_samples_++;
+                }
+                if (scaled < -32768) {
+                    scaled = -32768;
+                    intercom_input_clip_samples_++;
+                }
                 tx_pcm_[i] = static_cast<int16_t>(scaled);
             }
             intercom_mic_frames_++;
+            intercom_aec_us_total_ += aec_us;
+            if (aec_us > intercom_aec_us_max_) intercom_aec_us_max_ = aec_us;
             if (intercom_mic_frames_ == 100U ||
                 (intercom_mic_frames_ % 500U) == 0U) {
-                ESP_LOGI(TAG, "intercom mic: frames=%lu avg_abs=%lu peak=%ld",
+                ESP_LOGI(TAG,
+                         "intercom mic: frames=%lu avg_abs=%lu peak=%ld "
+                         "clip_total=%lu aec_avg=%luus aec_max=%luus",
                          static_cast<unsigned long>(intercom_mic_frames_),
                          static_cast<unsigned long>(sum_abs / APP_AUDIO_FRAME_SAMPLES),
-                         static_cast<long>(peak));
+                         static_cast<long>(peak),
+                         static_cast<unsigned long>(intercom_input_clip_samples_),
+                         static_cast<unsigned long>(intercom_aec_us_total_ /
+                                                    intercom_mic_frames_),
+                         static_cast<unsigned long>(intercom_aec_us_max_));
             }
             uint8_t encoded[APP_OPUS_MAX_PACKET_BYTES];
             const int encoded_len = codec_.encode(tx_pcm_, APP_AUDIO_FRAME_SAMPLES,
@@ -657,6 +721,12 @@ void RadioPing::tx_task()
             if (encoded_len > 0 && encoded_len <= 255) {
                 enqueue_voice_frame(encoded, static_cast<uint16_t>(encoded_len));
             }
+
+            // Direct VOIP_HIGH_PERF is synchronous and can otherwise keep its
+            // pinned core continuously ready. Block for one tick so the idle
+            // task can service TWDT; the higher-priority radio task can still
+            // preempt AEC/Opus whenever its 2 ms poll wakes.
+            vTaskDelay(ms_to_ticks_min_1(1));
             continue;
         }
 
@@ -746,9 +816,13 @@ void RadioPing::play_task()
 
         if (!intercom_active_) {
             audio_proc_.process_rx_frame(rx_pcm_, static_cast<size_t>(decoded));
+        } else {
+            apply_intercom_playback_gain(rx_pcm_, static_cast<size_t>(decoded));
         }
 #if APP_INTERCOM_AEC_ENABLE
-        echo_canceller_.push_reference(rx_pcm_, static_cast<size_t>(decoded));
+        if (intercom_active_) {
+            echo_canceller_.push_reference(rx_pcm_, static_cast<size_t>(decoded));
+        }
 #endif
         if (intercom_active_) {
             uint32_t sum_abs = 0;
@@ -1423,6 +1497,18 @@ void RadioPing::dispatch_rx_packet(uint16_t len, int16_t rssi)
         uint8_t key = rx_buf_[8];
         uint32_t value = get_u32_le(&rx_buf_[9]);
         ESP_LOGI(TAG, "RX Config: key=%u value=%lu", key, static_cast<unsigned long>(value));
+#if APP_INTERCOM_AEC_ENABLE
+        if (key == APP_CFG_KEY_INTERCOM && value != 0 && !is_gateway_ &&
+            !echo_canceller_.ready()) {
+            log_intercom_heap("node before AEC");
+            if (!echo_canceller_.init()) {
+                ESP_LOGE(TAG,
+                         "intercom CONFIG rejected: node ESP-SR direct AEC init failed");
+                return;
+            }
+            log_intercom_heap("node after AEC");
+        }
+#endif
         if (config_received_cb_) {
             config_received_cb_(key, value);
         }
@@ -1562,6 +1648,14 @@ void RadioPing::conceal_missing_frames(uint16_t seq)
             if (decoded <= 0) {
                 ESP_LOGW(TAG, "Opus PLC failed: %d", decoded);
                 break;
+            }
+            if (intercom_active_) {
+                apply_intercom_playback_gain(rx_pcm_, static_cast<size_t>(decoded));
+#if APP_INTERCOM_AEC_ENABLE
+                // PLC audio is also written to I2S. Keep it in the far-end
+                // reference timeline or every loss permanently shifts AEC.
+                echo_canceller_.push_reference(rx_pcm_, static_cast<size_t>(decoded));
+#endif
             }
             play_mono_frame(rx_pcm_, static_cast<size_t>(decoded));
             last_rx_audio_ms_ = smtc_modem_hal_get_time_in_ms();
@@ -2864,6 +2958,10 @@ bool RadioPing::send_config(uint8_t key, uint32_t value)
     ESP_LOGI(TAG, "send_config: key=%u value=%lu", key, static_cast<unsigned long>(value));
 
     suspended_ = true;
+    const uint32_t ack_timeout_ms =
+        (key == APP_CFG_KEY_INTERCOM && value != 0)
+            ? APP_INTERCOM_START_TIMEOUT_MS
+            : kConfigAckTimeoutMs;
 
     uint8_t pkt[kHeaderSize];
     std::memcpy(pkt, kMagic, sizeof(kMagic));
@@ -2907,7 +3005,7 @@ bool RadioPing::send_config(uint8_t key, uint32_t value)
 
         uint32_t wait_start = smtc_modem_hal_get_time_in_ms();
         while (!config_ack_received_) {
-            if (smtc_modem_hal_get_time_in_ms() - wait_start > kConfigAckTimeoutMs) {
+            if (smtc_modem_hal_get_time_in_ms() - wait_start > ack_timeout_ms) {
                 break;
             }
             if (irq_pending_) {

@@ -17,13 +17,27 @@
 static const char *TAG = "ui_gw";
 static const char *kGwNvs = "ui_gw";
 
-static void gw_nvs_save_u8(const char *key, uint8_t val)
+static bool gw_nvs_save_u8(const char *key, uint8_t val)
 {
     nvs_handle_t h;
-    if (nvs_open(kGwNvs, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_u8(h, key, val);
-    nvs_commit(h);
+    esp_err_t err = nvs_open(kGwNvs, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open failed: key=%s err=%s", key, esp_err_to_name(err));
+        return false;
+    }
+
+    err = nvs_set_u8(h, key, val);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
     nvs_close(h);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS save failed: key=%s value=%u err=%s",
+                 key, val, esp_err_to_name(err));
+        return false;
+    }
+    return true;
 }
 
 static uint8_t gw_nvs_load_u8(const char *key, uint8_t def)
@@ -925,26 +939,34 @@ static void cfg_switch_cb(lv_event_t *e)
         break;
     case 8: /* Intercom */
         if (on) {
+            if (!gw_nvs_save_u8("intercom", 1)) {
+                lv_obj_clear_state(sw, LV_STATE_CHECKED);
+                break;
+            }
             s_intercom_on = true;
-            gw_nvs_save_u8("intercom", 1);
             cfg_apply_intercom_lock(true);
             if (s_cfg_touch_lbls[0]) {
                 lv_label_set_text(s_cfg_touch_lbls[0], "START INTERCOM");
             }
-            ESP_LOGI(TAG, "intercom armed; press CAPTURE to start");
+            ESP_LOGI(TAG, "intercom armed persisted=1; press CAPTURE to start");
         } else {
+            if (!gw_nvs_save_u8("intercom", 0)) {
+                lv_obj_add_state(sw, LV_STATE_CHECKED);
+                break;
+            }
             bool stopped = !s_intercom_active || !s_intercom_cb || s_intercom_cb(0);
             if (stopped) {
                 s_intercom_on = false;
                 s_intercom_active = false;
                 s_intercom_ui_state = INTERCOM_UI_IDLE;
-                gw_nvs_save_u8("intercom", 0);
                 cfg_apply_intercom_lock(false);
                 cfg_apply_low_power_lock(s_low_power_on);
                 if (s_cfg_touch_lbls[0]) {
                     lv_label_set_text(s_cfg_touch_lbls[0], "CAPTURE");
                 }
+                ESP_LOGI(TAG, "intercom disarmed persisted=0");
             } else {
+                (void)gw_nvs_save_u8("intercom", 1);
                 lv_obj_add_state(sw, LV_STATE_CHECKED);
             }
         }
