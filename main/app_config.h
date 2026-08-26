@@ -114,8 +114,8 @@
 #define APP_INTERCOM_PLAYBACK_PERCENT   60U
 #define APP_INTERCOM_AEC_ENABLE         1
 
-/* Official ESP-SR direct VOIP_HIGH_PERF AEC. The runtime chunk size is
- * bridged to the project's 10 ms audio frames without a worker task. */
+/* Official ESP-SR direct full-duplex AEC. The runtime chunk size is bridged
+ * to the project's 10 ms audio frames without an AFE worker task. */
 #define APP_AFE_AEC_FILTER_LENGTH       4U
 
 /* RX timeout used by the packet receiver before it re-arms listening. */
@@ -185,7 +185,7 @@
 #define APP_VOICE_PLAY_TASK_CORE        1
 
 /* Keep capture/AEC/Opus below the CPU0 radio task so the 2 ms RAC service can
- * preempt VOIP_HIGH_PERF processing without dropping a TDD slot. */
+ * preempt FD_LOW_COST processing without dropping a TDD slot. */
 #define APP_VOICE_TX_TASK_PRIORITY      3
 /* Was 32768; cut to 16KB to reclaim internal SRAM under 32KB I-cache. See
  * APP_RADIO_TASK_STACK_BYTES note. STACK-probe logs verify real usage. */

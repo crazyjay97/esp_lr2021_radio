@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "esp_afe_aec.h"
+#include "esp_aec.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -17,6 +17,7 @@ public:
     EchoCanceller &operator=(const EchoCanceller &) = delete;
 
     bool init();
+    void deinit();
     bool ready() const { return ready_.load(std::memory_order_acquire); }
     void reset();
     void push_reference(const int16_t *pcm, size_t samples);
@@ -30,14 +31,13 @@ private:
     void reset_stream_buffers();
     void report_error(const char *operation, int result);
 
-    afe_aec_handle_t *aec_handle_ = nullptr;
+    aec_handle_t *aec_handle_ = nullptr;
     SemaphoreHandle_t aec_mutex_ = nullptr;
     SemaphoreHandle_t reference_mutex_ = nullptr;
 
     int16_t *reference_ring_ = nullptr;
     int16_t *mic_pending_ = nullptr;
     int16_t *reference_pending_ = nullptr;
-    int16_t *aec_input_ = nullptr;
     int16_t *aec_output_ = nullptr;
     int16_t *output_ring_ = nullptr;
 
@@ -54,6 +54,7 @@ private:
     size_t reference_samples_ = 0;
     uint32_t error_count_ = 0;
     uint32_t reference_overflow_count_ = 0;
+    uint32_t reference_underflow_count_ = 0;
     uint32_t reference_wait_frames_ = 0;
     bool reference_started_ = false;
 

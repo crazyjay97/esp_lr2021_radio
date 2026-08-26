@@ -8,7 +8,7 @@
 
 namespace {
 
-constexpr const char *TAG = "afe_aec";
+constexpr const char *TAG = "aec";
 
 int16_t *allocate_psram_samples(size_t samples)
 {
@@ -41,30 +41,27 @@ bool EchoCanceller::init()
         return false;
     }
 
-    aec_handle_ = afe_aec_create("MR", APP_AFE_AEC_FILTER_LENGTH,
-                                 AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
-    if (aec_handle_ == nullptr || aec_handle_->handle == nullptr) {
+    aec_handle_ = aec_create(APP_AUDIO_SAMPLE_RATE_HZ,
+                             APP_AFE_AEC_FILTER_LENGTH, 1,
+                             AEC_MODE_FD_LOW_COST);
+    if (aec_handle_ == nullptr) {
         ESP_LOGE(TAG, "official direct AEC create failed");
         release();
         return false;
     }
 
-    const int frame_samples = afe_aec_get_chunksize(aec_handle_);
-    const afe_pcm_config_t &pcm_config = aec_handle_->pcm_config;
-    if (aec_handle_->mode != AEC_MODE_VOIP_HIGH_PERF ||
-        aec_handle_->handle->config.mode != AEC_MODE_VOIP_HIGH_PERF ||
-        frame_samples <= 0 ||
-        pcm_config.sample_rate != static_cast<int>(APP_AUDIO_SAMPLE_RATE_HZ) ||
-        pcm_config.total_ch_num != 2 || pcm_config.mic_num != 1 ||
-        pcm_config.ref_num != 1) {
+    const int frame_samples = aec_get_chunksize(aec_handle_);
+    const aec_config_t &config = aec_handle_->config;
+    if (config.mode != AEC_MODE_FD_LOW_COST || frame_samples <= 0 ||
+        config.sample_rate != static_cast<int>(APP_AUDIO_SAMPLE_RATE_HZ) ||
+        config.filter_length != static_cast<int>(APP_AFE_AEC_FILTER_LENGTH) ||
+        config.mic_num != 1 || config.ref_num != 1 || config.out_num != 1) {
         ESP_LOGE(TAG,
-                 "unexpected direct AEC format: mode=%d core_mode=%d "
-                 "rate=%d frame=%d channels=%d mic=%d ref=%d",
-                 static_cast<int>(aec_handle_->mode),
-                 static_cast<int>(aec_handle_->handle->config.mode),
-                 pcm_config.sample_rate, frame_samples,
-                 pcm_config.total_ch_num, pcm_config.mic_num,
-                 pcm_config.ref_num);
+                 "unexpected direct AEC format: mode=%d rate=%d frame=%d "
+                 "filter=%d mic=%d ref=%d out=%d",
+                 static_cast<int>(config.mode), config.sample_rate,
+                 frame_samples, config.filter_length, config.mic_num,
+                 config.ref_num, config.out_num);
         release();
         return false;
     }
@@ -85,12 +82,11 @@ bool EchoCanceller::init()
     reference_ring_ = allocate_psram_samples(kReferenceRingSamples);
     mic_pending_ = allocate_psram_samples(pending_capacity_);
     reference_pending_ = allocate_psram_samples(pending_capacity_);
-    aec_input_ = allocate_psram_samples(frame_samples_ * 2U);
     aec_output_ = allocate_psram_samples(frame_samples_);
     output_ring_ = allocate_psram_samples(output_capacity_);
     if (reference_ring_ == nullptr || mic_pending_ == nullptr ||
-        reference_pending_ == nullptr || aec_input_ == nullptr ||
-        aec_output_ == nullptr || output_ring_ == nullptr) {
+        reference_pending_ == nullptr || aec_output_ == nullptr ||
+        output_ring_ == nullptr) {
         ESP_LOGE(TAG, "PSRAM buffer allocation failed");
         release();
         return false;
@@ -99,16 +95,21 @@ bool EchoCanceller::init()
     reset_stream_buffers();
     ready_.store(true, std::memory_order_release);
     ESP_LOGI(TAG,
-             "ESP-SR direct AEC ready: api=afe_aec format=MR type=VC "
-             "mode=VOIP_HIGH_PERF nlp=%d aec_frame=%u io_frame=%u "
-             "bridge_delay=%lums reference=fifo filter=%u worker_tasks=0",
-             static_cast<int>(aec_handle_->handle->config.nlp_level),
+             "ESP-SR direct AEC ready: api=aec mode=FD_LOW_COST nlp=%d "
+             "aec_frame=%u io_frame=%u bridge_delay=%lums "
+             "reference=fifo filter=%u worker_tasks=0",
+             static_cast<int>(config.nlp_level),
              static_cast<unsigned>(frame_samples_),
              static_cast<unsigned>(APP_AUDIO_FRAME_SAMPLES),
              static_cast<unsigned long>(
                  bridge_delay_samples_ * 1000U / APP_AUDIO_SAMPLE_RATE_HZ),
              static_cast<unsigned>(APP_AFE_AEC_FILTER_LENGTH));
     return true;
+}
+
+void EchoCanceller::deinit()
+{
+    release();
 }
 
 void EchoCanceller::release()
@@ -120,19 +121,17 @@ void EchoCanceller::release()
     const bool have_reference_lock = reference_mutex_ != nullptr &&
         xSemaphoreTake(reference_mutex_, portMAX_DELAY) == pdTRUE;
 
-    if (aec_handle_ != nullptr) afe_aec_destroy(aec_handle_);
+    if (aec_handle_ != nullptr) aec_destroy(aec_handle_);
     aec_handle_ = nullptr;
 
     heap_caps_free(reference_ring_);
     heap_caps_free(mic_pending_);
     heap_caps_free(reference_pending_);
-    heap_caps_free(aec_input_);
     heap_caps_free(aec_output_);
     heap_caps_free(output_ring_);
     reference_ring_ = nullptr;
     mic_pending_ = nullptr;
     reference_pending_ = nullptr;
-    aec_input_ = nullptr;
     aec_output_ = nullptr;
     output_ring_ = nullptr;
     frame_samples_ = 0;
@@ -148,6 +147,7 @@ void EchoCanceller::release()
     reference_samples_ = 0;
     error_count_ = 0;
     reference_overflow_count_ = 0;
+    reference_underflow_count_ = 0;
     reference_wait_frames_ = 0;
     reference_started_ = false;
 
@@ -165,8 +165,6 @@ void EchoCanceller::reset()
     }
 
     if (xSemaphoreTake(reference_mutex_, portMAX_DELAY) == pdTRUE) {
-        // Keep the official AEC instance resident between calls. The direct
-        // API has no reset entry point, so only clear project-owned streams.
         reset_stream_buffers();
         xSemaphoreGive(reference_mutex_);
     }
@@ -180,7 +178,6 @@ void EchoCanceller::reset_stream_buffers()
     std::memset(mic_pending_, 0, pending_capacity_ * sizeof(int16_t));
     std::memset(reference_pending_, 0,
                 pending_capacity_ * sizeof(int16_t));
-    std::memset(aec_input_, 0, frame_samples_ * 2U * sizeof(int16_t));
     std::memset(aec_output_, 0, frame_samples_ * sizeof(int16_t));
     std::memset(output_ring_, 0, output_capacity_ * sizeof(int16_t));
 
@@ -193,6 +190,7 @@ void EchoCanceller::reset_stream_buffers()
     reference_samples_ = 0;
     error_count_ = 0;
     reference_overflow_count_ = 0;
+    reference_underflow_count_ = 0;
     reference_wait_frames_ = 0;
     reference_started_ = false;
 }
@@ -210,6 +208,7 @@ void EchoCanceller::push_reference(const int16_t *pcm, size_t samples)
         pcm += samples - kReferenceRingSamples;
         samples = kReferenceRingSamples;
     }
+
     const size_t free_samples = kReferenceRingSamples - reference_samples_;
     if (samples > free_samples) {
         const size_t drop = samples - free_samples;
@@ -269,6 +268,17 @@ void EchoCanceller::process_capture(int16_t *pcm, size_t samples)
 
     if (reference_copied < samples) {
         ++reference_wait_frames_;
+        if (reference_started_) {
+            ++reference_underflow_count_;
+            if (reference_underflow_count_ == 1U ||
+                (reference_underflow_count_ % 100U) == 0U) {
+                ESP_LOGW(TAG,
+                         "reference FIFO underflow: missing=%u events=%lu",
+                         static_cast<unsigned>(samples - reference_copied),
+                         static_cast<unsigned long>(
+                             reference_underflow_count_));
+            }
+        }
         std::memset(reference_pending_ + pending_samples_ + reference_copied,
                     0, (samples - reference_copied) * sizeof(int16_t));
     } else if (!reference_started_) {
@@ -279,18 +289,8 @@ void EchoCanceller::process_capture(int16_t *pcm, size_t samples)
     pending_samples_ += samples;
 
     while (pending_samples_ >= frame_samples_) {
-        for (size_t i = 0; i < frame_samples_; ++i) {
-            aec_input_[i * 2U] = mic_pending_[i];
-            aec_input_[i * 2U + 1U] = reference_pending_[i];
-        }
-
-        const size_t output_bytes =
-            afe_aec_process(aec_handle_, aec_input_, aec_output_);
-        const size_t expected_bytes = frame_samples_ * sizeof(int16_t);
-        if (output_bytes != expected_bytes) {
-            report_error("process", static_cast<int>(output_bytes));
-            std::memset(aec_output_, 0, expected_bytes);
-        }
+        aec_process(aec_handle_, mic_pending_, reference_pending_,
+                    aec_output_);
         append_output(aec_output_, frame_samples_);
 
         pending_samples_ -= frame_samples_;

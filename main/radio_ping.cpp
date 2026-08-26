@@ -339,7 +339,7 @@ void RadioPing::start_intercom_local(uint16_t session)
     ESP_LOGI(TAG, "intercom local start session=%u role=%s", session,
              is_gateway_ ? "gateway" : "node");
     ESP_LOGI(TAG,
-             "intercom diagnostics: aec=esp-sr-direct-voip-high-perf ready=%d "
+             "intercom diagnostics: aec=esp-sr-direct-fd-low-cost ready=%d "
              "low_power=%d cad_active=%d mode=%u tx_core=%u tx_prio=%u "
              "play_core=%u play_prio=%u tx_gain=%u play_gain=%u%%",
              echo_canceller_.ready() ? 1 : 0, g_low_power_enabled ? 1 : 0,
@@ -364,7 +364,7 @@ void RadioPing::stop_intercom_local()
     if (voice_queue_) xQueueReset(voice_queue_);
     set_playback_pa(false);
     playback_active_ = false;
-    echo_canceller_.reset();
+    echo_canceller_.deinit();
     ESP_LOGI(TAG, "intercom local stop session=%u", intercom_session_);
 }
 
@@ -406,7 +406,7 @@ bool RadioPing::set_intercom(bool enable)
         uint16_t session = static_cast<uint16_t>(intercom_session_ + 1U);
         if (session == 0) session = 1;
         if (!send_config(APP_CFG_KEY_INTERCOM, session)) {
-            echo_canceller_.reset();
+            echo_canceller_.deinit();
             return false;
         }
         start_intercom_local(session);
@@ -675,6 +675,13 @@ void RadioPing::tx_task()
 
         if (intercom_active_) {
             uint32_t aec_us = 0;
+            uint32_t raw_sum_abs = 0;
+            int32_t raw_peak = 0;
+            for (size_t i = 0; i < APP_AUDIO_FRAME_SAMPLES; ++i) {
+                const int32_t level = abs16(tx_pcm_[i]);
+                raw_sum_abs += static_cast<uint32_t>(level);
+                if (level > raw_peak) raw_peak = level;
+            }
 #if APP_INTERCOM_AEC_ENABLE
             const int64_t aec_start_us = esp_timer_get_time();
             echo_canceller_.process_capture(tx_pcm_, APP_AUDIO_FRAME_SAMPLES);
@@ -704,9 +711,13 @@ void RadioPing::tx_task()
             if (intercom_mic_frames_ == 100U ||
                 (intercom_mic_frames_ % 500U) == 0U) {
                 ESP_LOGI(TAG,
-                         "intercom mic: frames=%lu avg_abs=%lu peak=%ld "
+                         "intercom mic: frames=%lu raw_avg=%lu raw_peak=%ld "
+                         "aec_avg_abs=%lu aec_peak=%ld "
                          "clip_total=%lu aec_avg=%luus aec_max=%luus",
                          static_cast<unsigned long>(intercom_mic_frames_),
+                         static_cast<unsigned long>(
+                             raw_sum_abs / APP_AUDIO_FRAME_SAMPLES),
+                         static_cast<long>(raw_peak),
                          static_cast<unsigned long>(sum_abs / APP_AUDIO_FRAME_SAMPLES),
                          static_cast<long>(peak),
                          static_cast<unsigned long>(intercom_input_clip_samples_),
@@ -722,7 +733,7 @@ void RadioPing::tx_task()
                 enqueue_voice_frame(encoded, static_cast<uint16_t>(encoded_len));
             }
 
-            // Direct VOIP_HIGH_PERF is synchronous and can otherwise keep its
+            // Direct FD_LOW_COST is synchronous and can otherwise keep its
             // pinned core continuously ready. Block for one tick so the idle
             // task can service TWDT; the higher-priority radio task can still
             // preempt AEC/Opus whenever its 2 ms poll wakes.
@@ -1654,7 +1665,8 @@ void RadioPing::conceal_missing_frames(uint16_t seq)
 #if APP_INTERCOM_AEC_ENABLE
                 // PLC audio is also written to I2S. Keep it in the far-end
                 // reference timeline or every loss permanently shifts AEC.
-                echo_canceller_.push_reference(rx_pcm_, static_cast<size_t>(decoded));
+                echo_canceller_.push_reference(rx_pcm_,
+                                               static_cast<size_t>(decoded));
 #endif
             }
             play_mono_frame(rx_pcm_, static_cast<size_t>(decoded));
@@ -1687,9 +1699,7 @@ bool RadioPing::read_mono_frame(int16_t *mono, size_t samples)
     }
 
     for (size_t i = 0; i < samples; i++) {
-        int16_t left = stereo[2 * i];
-        int16_t right = stereo[2 * i + 1];
-        mono[i] = (abs16(left) >= abs16(right)) ? left : right;
+        mono[i] = stereo[2 * i];
     }
     return true;
 }
