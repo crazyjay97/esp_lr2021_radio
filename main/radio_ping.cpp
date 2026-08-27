@@ -733,11 +733,14 @@ void RadioPing::tx_task()
                 enqueue_voice_frame(encoded, static_cast<uint16_t>(encoded_len));
             }
 
-            // Direct FD_LOW_COST is synchronous and can otherwise keep its
-            // pinned core continuously ready. Block for one tick so the idle
-            // task can service TWDT; the higher-priority radio task can still
-            // preempt AEC/Opus whenever its 2 ms poll wakes.
-            vTaskDelay(ms_to_ticks_min_1(1));
+            // The blocking i2s_channel_read() at the top of this loop already
+            // paces capture to the 10 ms frame boundary and yields the core
+            // (idle can service TWDT) while it waits, so no extra vTaskDelay is
+            // needed. Adding one pushed the per-frame period past 10 ms (~90 fps
+            // measured), backlogging the I2S RX DMA ring and periodically
+            // dropping samples, which degraded audio and drifted AEC reference
+            // alignment. The priority-4 radio task still preempts AEC/Opus on
+            // its 2 ms poll.
             continue;
         }
 

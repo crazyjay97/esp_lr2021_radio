@@ -109,9 +109,14 @@
 #define APP_INTERCOM_TX_QUEUE_FRAMES    4U
 #define APP_INTERCOM_FRAMES_PER_PACKET  2U
 /* Keep the end-to-end acoustic loop below unity when two units are nearby.
- * Playback attenuation is applied before both the AEC reference and I2S. */
-#define APP_INTERCOM_INPUT_GAIN         2
-#define APP_INTERCOM_PLAYBACK_PERCENT   60U
+ * Playback attenuation is applied before both the AEC reference and I2S.
+ * Digital loop gain = INPUT_GAIN * PLAYBACK_PERCENT/100. At 1 * 0.50 = 0.50
+ * (-6 dB) this leaves ~7.6 dB of headroom over the old 2 * 0.60 = 1.20
+ * (+1.58 dB), which self-oscillated when two units were close. Dropping the
+ * input gain to 1 also removes the post-AEC x2 clipping. Restore level with
+ * the ES8311 analog PGA rather than digital gain if it turns out too quiet. */
+#define APP_INTERCOM_INPUT_GAIN         1
+#define APP_INTERCOM_PLAYBACK_PERCENT   50U
 #define APP_INTERCOM_AEC_ENABLE         1
 
 /* Official ESP-SR direct full-duplex AEC. The runtime chunk size is bridged
