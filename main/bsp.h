@@ -77,6 +77,12 @@ esp_err_t bsp_audio_init_playback_only(uint32_t sample_rate_hz);
 esp_err_t bsp_audio_pa_enable(bool on);                  /* PA enable via P6 */
 esp_err_t bsp_audio_suspend(void);
 esp_err_t bsp_audio_resume(void);
+/* Rebuild the duplex I2S at a new DMA ring depth at runtime. Used to shrink the
+ * node's ring for the duration of an intercom call (shallow ring = lower, more
+ * stable speaker-path latency so the AEC can lock). No-op if the depth is
+ * already active or the I2S is currently released (records it for the next
+ * resume instead). Rebuilds only a duplex (TX+RX) channel. */
+esp_err_t bsp_audio_set_dma_desc_num(uint32_t dma_desc_num);
 esp_err_t bsp_audio_set_volume(uint8_t volume_percent);  /* 0..100 for DAC  */
 esp_err_t bsp_audio_set_mic_gain_db(uint8_t gain_db);    /* 0..42 PGA       */
 esp_err_t bsp_audio_write(const void *buf, size_t bytes, size_t *out_written);

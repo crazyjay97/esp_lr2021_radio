@@ -50,6 +50,14 @@ bool EchoCanceller::init()
         return false;
     }
 
+    /* Start with aggressive NLP: the freshly created adaptive filter has not
+     * converged and its residual echo would otherwise loop into howling.
+     * process_capture() relaxes NLP to the steady level after the warm-up. */
+    aec_set_nlp_level(aec_handle_,
+                      static_cast<aec_nlp_level_t>(APP_AFE_AEC_NLP_LEVEL_STARTUP));
+    nlp_steady_ = false;
+    nlp_processed_frames_ = 0;
+
     const int frame_samples = aec_get_chunksize(aec_handle_);
     const aec_config_t &config = aec_handle_->config;
     if (config.mode != AEC_MODE_FD_LOW_COST || frame_samples <= 0 ||
@@ -79,6 +87,12 @@ bool EchoCanceller::init()
          APP_AUDIO_FRAME_SAMPLES) * APP_AUDIO_FRAME_SAMPLES;
     output_capacity_ = bridge_delay_samples_ + frame_samples_;
 
+    /* aec_process() consumes one frame_samples_ chunk per call, so the warm-up
+     * duration in ms maps to a chunk count via the sample rate. */
+    nlp_warmup_frames_ = static_cast<uint32_t>(
+        (static_cast<uint64_t>(APP_AFE_AEC_NLP_WARMUP_MS) *
+         APP_AUDIO_SAMPLE_RATE_HZ) / (1000ULL * frame_samples_));
+
     reference_ring_ = allocate_psram_samples(kReferenceRingSamples);
     mic_pending_ = allocate_psram_samples(pending_capacity_);
     reference_pending_ = allocate_psram_samples(pending_capacity_);
@@ -95,10 +109,14 @@ bool EchoCanceller::init()
     reset_stream_buffers();
     ready_.store(true, std::memory_order_release);
     ESP_LOGI(TAG,
-             "ESP-SR direct AEC ready: api=aec mode=FD_LOW_COST nlp=%d "
+             "ESP-SR direct AEC ready: api=aec mode=FD_LOW_COST "
+             "nlp=%d->%d warmup=%ums(%ufr) "
              "aec_frame=%u io_frame=%u bridge_delay=%lums "
              "reference=fifo filter=%u worker_tasks=0",
-             static_cast<int>(config.nlp_level),
+             static_cast<int>(APP_AFE_AEC_NLP_LEVEL_STARTUP),
+             static_cast<int>(APP_AFE_AEC_NLP_LEVEL_STEADY),
+             static_cast<unsigned>(APP_AFE_AEC_NLP_WARMUP_MS),
+             static_cast<unsigned>(nlp_warmup_frames_),
              static_cast<unsigned>(frame_samples_),
              static_cast<unsigned>(APP_AUDIO_FRAME_SAMPLES),
              static_cast<unsigned long>(
@@ -163,6 +181,15 @@ void EchoCanceller::reset()
         xSemaphoreGive(aec_mutex_);
         return;
     }
+
+    /* Re-arm the NLP warm-up: a re-used AEC handle keeps its converged filter,
+     * but a fresh call still benefits from aggressive suppression until the
+     * reference/mic alignment settles again. */
+    aec_set_nlp_level(
+        aec_handle_,
+        static_cast<aec_nlp_level_t>(APP_AFE_AEC_NLP_LEVEL_STARTUP));
+    nlp_steady_ = false;
+    nlp_processed_frames_ = 0;
 
     if (xSemaphoreTake(reference_mutex_, portMAX_DELAY) == pdTRUE) {
         reset_stream_buffers();
@@ -292,6 +319,19 @@ void EchoCanceller::process_capture(int16_t *pcm, size_t samples)
         aec_process(aec_handle_, mic_pending_, reference_pending_,
                     aec_output_);
         append_output(aec_output_, frame_samples_);
+
+        /* Relax NLP from the startup level once the adaptive filter has had the
+         * warm-up window to converge, trading residual-echo strength for speech
+         * clarity. Only crosses once per call (re-armed in reset()/init()). */
+        if (!nlp_steady_ && ++nlp_processed_frames_ >= nlp_warmup_frames_) {
+            aec_set_nlp_level(
+                aec_handle_,
+                static_cast<aec_nlp_level_t>(APP_AFE_AEC_NLP_LEVEL_STEADY));
+            nlp_steady_ = true;
+            ESP_LOGI(TAG, "AEC NLP relaxed to steady level %d after %lu frames",
+                     static_cast<int>(APP_AFE_AEC_NLP_LEVEL_STEADY),
+                     static_cast<unsigned long>(nlp_processed_frames_));
+        }
 
         pending_samples_ -= frame_samples_;
         if (pending_samples_ != 0) {

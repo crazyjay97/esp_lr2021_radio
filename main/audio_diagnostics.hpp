@@ -45,7 +45,7 @@ private:
     uint8_t *rec_buf_ = nullptr;
     size_t rec_cap_ = 0;
     size_t rec_len_ = 0;
-    volatile uint8_t volume_ = 70;
+    volatile uint8_t volume_ = 80;  /* DAC output %, matches gateway config level 8 */
     volatile State state_ = State::idle;
 
     int16_t rec_left_min_ = 0;

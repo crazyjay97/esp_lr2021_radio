@@ -416,7 +416,21 @@ void on_intercom_state(bool active)
 {
     g_audio.set_intercom_active(active);
     if (g_app_mode == AppMode::radio) {
+        // Gateway already runs the shallow 6-desc duplex ring; only refresh UI.
         ui_gw_set_intercom_active(active);
+    } else {
+        // Node: shrink the DMA ring to the gateway depth for the call so the
+        // speaker-path latency is small and stable enough for the AEC to lock,
+        // then restore the deep capture ring on hangup. Called from the radio
+        // task (start/stop_intercom_local), which can block on the I2S rebuild;
+        // the ~40 ms teardown lands inside the 1200 ms START handshake window.
+        const uint32_t desc = active ? APP_INTERCOM_NODE_DMA_DESC_NUM
+                                     : APP_AUDIO_NODE_DEFAULT_DMA_DESC_NUM;
+        esp_err_t e = bsp_audio_set_dma_desc_num(desc);
+        if (e != ESP_OK) {
+            ESP_LOGW(TAG, "intercom DMA depth -> %u failed: %s",
+                     static_cast<unsigned>(desc), esp_err_to_name(e));
+        }
     }
 }
 

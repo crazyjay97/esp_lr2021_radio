@@ -123,6 +123,37 @@
  * to the project's 10 ms audio frames without an AFE worker task. */
 #define APP_AFE_AEC_FILTER_LENGTH       4U
 
+/* AEC NLP (non-linear residual-echo suppressor) aggressiveness:
+ *   0 = AEC_NLP_LEVEL_NORMAL, 1 = AGGR (ESP-SR default), 2 = VERYAGGR.
+ * The adaptive linear AEC filter is recreated (coefficients zeroed) at every
+ * call start and needs a few seconds to converge on the echo path. During that
+ * window the linear stage leaks echo, so NLP must catch it aggressively or the
+ * cross-device loop howls at call onset. Once converged, aggressive NLP only
+ * hurts by eating speech highs (muffled sound). So ramp NLP down over time:
+ * start at STARTUP for the warm-up window, then drop to STEADY.
+ *   STARTUP: strong residual suppression while the filter converges.
+ *   STEADY : relaxed for intelligibility once the filter has locked.
+ * If call onset still howls, raise WARMUP_MS. If steady-state echo returns,
+ * raise STEADY to 1. */
+#define APP_AFE_AEC_NLP_LEVEL_STARTUP   1
+#define APP_AFE_AEC_NLP_LEVEL_STEADY    0
+#define APP_AFE_AEC_NLP_WARMUP_MS       3000U
+
+/* Node I2S DMA ring depth (descriptors; 240 frames each = 15 ms at 16 kHz).
+ * The node normally runs a deep 24-desc ring (~360 ms) so a capture is never
+ * starved while it fights camera/JPEG for the CPU. But that deep TX ring also
+ * makes the speaker-path latency large AND jittery (it drains by however full
+ * it happens to be), so the AEC reference and the real echo drift apart and
+ * near-field echo cancellation cannot lock. During a PURE voice call the node
+ * does not take photos (capture suspends I2S entirely), so the deep ring is
+ * idle overhead here. Shrink to 6 desc (~90 ms, same as the gateway) for the
+ * call to cut the speaker-latency drift, then restore the deep ring on hangup.
+ * TEMPORARY: the image-in-call phase will replace this with a split TX/RX
+ * channel (shallow TX for AEC, deep RX for capture) and retire these. Keep
+ * NODE_DEFAULT in sync with the depth bsp_audio_init() passes. */
+#define APP_INTERCOM_NODE_DMA_DESC_NUM      6U
+#define APP_AUDIO_NODE_DEFAULT_DMA_DESC_NUM 24U
+
 /* RX timeout used by the packet receiver before it re-arms listening. */
 #define APP_FLRC_RX_TIMEOUT_MS          100U
 

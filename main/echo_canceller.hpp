@@ -58,5 +58,11 @@ private:
     uint32_t reference_wait_frames_ = 0;
     bool reference_started_ = false;
 
+    /* NLP warm-up: hold aggressive residual suppression while the adaptive
+     * filter converges after each (re)start, then relax to the steady level. */
+    uint32_t nlp_warmup_frames_ = 0;
+    uint32_t nlp_processed_frames_ = 0;
+    bool nlp_steady_ = false;
+
     std::atomic<bool> ready_{false};
 };

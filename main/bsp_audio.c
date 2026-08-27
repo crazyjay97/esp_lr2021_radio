@@ -445,6 +445,43 @@ esp_err_t bsp_audio_resume(void)
     return err;
 }
 
+esp_err_t bsp_audio_set_dma_desc_num(uint32_t dma_desc_num)
+{
+    if (!s_audio_ready) return ESP_ERR_INVALID_STATE;
+    if (dma_desc_num == 0U) return ESP_ERR_INVALID_ARG;
+    if (dma_desc_num == s_dma_desc_num) return ESP_OK;
+
+    /* I2S released (camera capture holds it): just record the new depth so the
+     * next bsp_audio_resume() rebuilds at it, without touching hardware now. */
+    if (!s_i2s_enabled) {
+        s_dma_desc_num = dma_desc_num;
+        ESP_LOGI(TAG, "I2S DMA depth deferred to %" PRIu32 " (I2S released)",
+                 dma_desc_num);
+        return ESP_OK;
+    }
+
+    /* Rebuild the duplex channel. i2s_deinit() disables the channels first,
+     * which unblocks any voice task parked in i2s_channel_read/write with an
+     * error; s_i2s_enabled is cleared before the handles are deleted so a racing
+     * bsp_audio_read/write returns ESP_ERR_INVALID_STATE instead of touching a
+     * freed handle. Same teardown path the camera suspend/resume already uses. */
+    esp_err_t err = i2s_deinit();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "I2S deinit before depth change failed: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+    err = i2s_init(s_sample_rate_hz, dma_desc_num);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2S reinit at depth %" PRIu32 " failed: %s",
+                 dma_desc_num, esp_err_to_name(err));
+        return err;
+    }
+    s_dma_desc_num = dma_desc_num;
+    ESP_LOGI(TAG, "I2S DMA depth changed to %" PRIu32, dma_desc_num);
+    return ESP_OK;
+}
+
 esp_err_t bsp_audio_set_volume(uint8_t percent)
 {
     if (percent > 100) percent = 100;
