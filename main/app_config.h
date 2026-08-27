@@ -108,6 +108,21 @@
 #define APP_INTERCOM_LINK_TIMEOUT_MS    1200U
 #define APP_INTERCOM_TX_QUEUE_FRAMES    4U
 #define APP_INTERCOM_FRAMES_PER_PACKET  2U
+
+/* Image-in-call fusion. During a call the node may append up to this many image
+ * fragments to its uplink burst right after the voice reply, in the same TX
+ * window (no extra RX/TX turnaround). Airtime budget: ~16-17 ms of slack after
+ * the node reply before the next 20 ms master slot, ~2.9 ms per 510-byte
+ * fragment, so the safe ceiling is single digits. Keep voice timing intact:
+ * raising this eats into the node's window to re-arm RX before the next master.
+ *
+ * Stage 1 (timing probe): APP_INTERCOM_IMAGE_PROBE sends this many DUMMY padded
+ * packets (type kPacketTypeIntercomProbe) after the node voice reply so we can
+ * measure, on hardware, whether appending fragments starves voice slots or the
+ * shallow-ring capture — before wiring the real image path. Set the probe to 0
+ * to disable. The GW counts and drops probe packets. */
+#define APP_INTERCOM_IMAGE_GRANT_MAX    4U
+#define APP_INTERCOM_IMAGE_PROBE        0U
 /* Keep the end-to-end acoustic loop below unity when two units are nearby.
  * Playback attenuation is applied before both the AEC reference and I2S.
  * Digital loop gain = INPUT_GAIN * PLAYBACK_PERCENT/100. At 1 * 0.50 = 0.50

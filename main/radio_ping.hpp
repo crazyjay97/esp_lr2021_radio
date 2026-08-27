@@ -138,6 +138,11 @@ private:
     void stop_intercom_local();
     void service_intercom();
     bool send_intercom_slot(uint8_t flags);
+    /* Stage-1 fusion timing probe: append `count` dummy padded packets to the
+     * node's uplink right after the voice reply, reusing the FS-fallback FIFO
+     * pipeline. Radio must already be in a TX-capable idle state on entry; on
+     * exit it is left idle (caller re-arms RX), matching burst_send_fragments. */
+    void send_intercom_probe_burst(uint16_t count);
     bool leave_rx_for_tx();
     void handle_rx_packet();
     void dispatch_rx_packet(uint16_t len, int16_t rssi);
@@ -279,6 +284,10 @@ private:
     uint32_t intercom_tx_slots_ = 0;
     uint32_t intercom_rx_slots_ = 0;
     uint32_t intercom_missed_slots_ = 0;
+    /* Stage-1 probe counters: node counts probe bursts sent, GW counts probe
+     * packets received. Both feed the airtime/slot-impact measurement. */
+    uint32_t intercom_probe_tx_ = 0;
+    uint32_t intercom_probe_rx_ = 0;
     uint32_t intercom_mic_frames_ = 0;
     uint32_t intercom_play_frames_ = 0;
     uint64_t intercom_aec_us_total_ = 0;

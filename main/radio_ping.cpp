@@ -45,6 +45,10 @@ constexpr uint8_t kPacketTypeConfig = 9;
 constexpr uint8_t kPacketTypeConfigAck = 10;
 constexpr uint8_t kPacketTypeImageCmdAck = 11;
 constexpr uint8_t kPacketTypeVbat = 12;
+/* Stage-1 fusion timing probe: dummy padded packets the node appends after its
+ * voice reply so we can measure slot/audio impact before wiring real image
+ * fragments. The gateway counts and drops these. */
+constexpr uint8_t kPacketTypeIntercomProbe = 13;
 constexpr uint16_t kHeaderSize = 14;
 constexpr uint8_t kVoiceFlagMaster = 0x01;
 constexpr uint8_t kVoiceFlagNodeReply = 0x02;
@@ -1209,6 +1213,20 @@ bool RadioPing::send_intercom_slot(uint8_t flags)
                      static_cast<unsigned long>(intercom_missed_slots_));
         }
     }
+    // Stage-1 fusion timing probe: the node appends N dummy padded packets in
+    // the SAME uplink window as its voice reply (image is one-way node->GW, same
+    // direction). This measures whether the append starves voice slots / shallow-
+    // ring capture before real image data is wired in. GW-only receives+drops.
+    if (ok && !is_gateway_ && (flags & kVoiceFlagNodeReply) &&
+        APP_INTERCOM_IMAGE_PROBE > 0) {
+        send_intercom_probe_burst(APP_INTERCOM_IMAGE_PROBE);
+        if ((intercom_probe_tx_ % 100U) == 1U) {
+            ESP_LOGI(TAG, "intercom probe tx bursts=%lu n=%u/slot missed=%lu",
+                     static_cast<unsigned long>(intercom_probe_tx_),
+                     static_cast<unsigned>(APP_INTERCOM_IMAGE_PROBE),
+                     static_cast<unsigned long>(intercom_missed_slots_));
+        }
+    }
     schedule_rx();
     if (((intercom_tx_slots_ + intercom_missed_slots_) % 100U) == 1U) {
         ESP_LOGI(TAG, "intercom slots tx=%lu rx=%lu missed=%lu queued=%u",
@@ -1218,6 +1236,73 @@ bool RadioPing::send_intercom_slot(uint8_t flags)
                  tx_queue_ ? static_cast<unsigned>(uxQueueMessagesWaiting(tx_queue_)) : 0U);
     }
     return ok;
+}
+
+void RadioPing::send_intercom_probe_burst(uint16_t count)
+{
+    if (count == 0) return;
+
+    const void *ctx = radio_.ral.context;
+
+    // Same TX-notify ownership and FS-fallback FIFO pipeline as
+    // burst_send_fragments, so the probe measures the real image-append path.
+    tx_done_waiter_ = xTaskGetCurrentTaskHandle();
+    xTaskNotifyStateClear(nullptr);
+
+    smtc_modem_hal_protect_api_call();
+    smtc_modem_hal_start_radio_tcxo();
+    smtc_modem_hal_set_ant_switch(true);
+    (void)ral_set_dio_irq_params(&radio_.ral, RAL_IRQ_TX_DONE);
+    (void)ral_clear_irq_status(&radio_.ral, RAL_IRQ_ALL);
+    (void)lr20xx_radio_common_set_rx_tx_fallback_mode(ctx, LR20XX_RADIO_FALLBACK_FS);
+    (void)lr20xx_radio_fifo_clear_tx(ctx);
+    smtc_modem_hal_unprotect_api_call();
+
+    // Reuse the member tx_buf_ (send_single_packet already finished for this
+    // slot) to keep the radio task's stack free, matching the rest of this path.
+    uint8_t *pkt = tx_buf_;
+    std::memcpy(pkt, kMagic, sizeof(kMagic));
+    pkt[4] = kPacketTypeIntercomProbe;
+    pkt[5] = 1;
+    put_u16_le(&pkt[6], static_cast<uint16_t>(intercom_probe_tx_));
+    put_u16_le(&pkt[8], intercom_session_);
+    std::memset(pkt + 10, 0, APP_FLRC_BURST_PAYLOAD_LEN - 10);
+
+    uint16_t next_write = 0;
+    for (int prefill = 0; prefill < 2 && next_write < count; prefill++) {
+        put_u16_le(&pkt[10], next_write);
+        smtc_modem_hal_protect_api_call();
+        (void)lr20xx_radio_fifo_write_tx(ctx, pkt, APP_FLRC_BURST_PAYLOAD_LEN);
+        smtc_modem_hal_unprotect_api_call();
+        next_write++;
+    }
+
+    mode_ = Mode::tx_pending;
+    smtc_modem_hal_protect_api_call();
+    (void)ral_set_tx(&radio_.ral);
+    smtc_modem_hal_unprotect_api_call();
+
+    for (uint16_t pos = 1; pos < count; pos++) {
+        (void)wait_for_tx_done(50);
+        mode_ = Mode::tx_pending;
+        smtc_modem_hal_protect_api_call();
+        (void)ral_set_tx(&radio_.ral);
+        if (next_write < count) {
+            put_u16_le(&pkt[10], next_write);
+            (void)lr20xx_radio_fifo_write_tx(ctx, pkt, APP_FLRC_BURST_PAYLOAD_LEN);
+            next_write++;
+        }
+        smtc_modem_hal_unprotect_api_call();
+    }
+    (void)wait_for_tx_done(50);
+
+    smtc_modem_hal_protect_api_call();
+    (void)lr20xx_radio_common_set_rx_tx_fallback_mode(
+        ctx, LR20XX_RADIO_FALLBACK_STDBY_XOSC);
+    smtc_modem_hal_unprotect_api_call();
+    mode_ = Mode::idle;
+    tx_done_waiter_ = nullptr;
+    intercom_probe_tx_++;
 }
 
 bool RadioPing::configure_flrc()
@@ -1438,6 +1523,19 @@ void RadioPing::dispatch_rx_packet(uint16_t len, int16_t rssi)
         static_cast<uint16_t>(get_u32_le(&rx_buf_[9])) == intercom_session_) {
         intercom_last_sync_ms_ = smtc_modem_hal_get_time_in_ms();
         send_config_ack(APP_CFG_KEY_INTERCOM, intercom_session_);
+        return;
+    }
+    // Stage-1 fusion timing probe: GW counts the node's appended dummy packets
+    // (received in the node's uplink window after its voice reply) and drops
+    // them. Rising intercom_probe_rx_ vs intercom_probe_tx_ (node log) shows how
+    // many appended fragments survive without disturbing the voice slots.
+    if (intercom_active_ && is_gateway_ && rx_buf_[4] == kPacketTypeIntercomProbe) {
+        intercom_probe_rx_++;
+        if ((intercom_probe_rx_ % 200U) == 1U) {
+            ESP_LOGI(TAG, "intercom probe rx=%lu session=%u rssi=%d",
+                     static_cast<unsigned long>(intercom_probe_rx_),
+                     get_u16_le(&rx_buf_[8]), rssi);
+        }
         return;
     }
     if (intercom_active_ && rx_buf_[4] != kPacketTypeVoice) {
