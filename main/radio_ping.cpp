@@ -315,6 +315,18 @@ void RadioPing::start_intercom_local(uint16_t session)
     intercom_tx_slots_ = 0;
     intercom_rx_slots_ = 0;
     intercom_missed_slots_ = 0;
+    // Reset the appended-fragment diagnostic counters so one session's
+    // masters/voice_rx/probe_rx/rearm/crc/hdr ratios stay internally consistent.
+    intercom_probe_tx_ = 0;
+    intercom_probe_rx_ = 0;
+    intercom_probe_sent_ = 0;
+    intercom_probe_deadline_stops_ = 0;
+    intercom_masters_tx_ = 0;
+    intercom_voice_rx_ = 0;
+    intercom_rearm_after_rx_ = 0;
+    rx_crc_errors_ = 0;
+    rx_hdr_errors_ = 0;
+    rx_unknown_packets_ = 0;
     intercom_mic_frames_ = 0;
     intercom_play_frames_ = 0;
     intercom_aec_us_total_ = 0;
@@ -976,13 +988,22 @@ void RadioPing::handle_irq(ral_irq_t irq)
 
     if (completed_mode == Mode::rx_pending) {
         if ((irq & RAL_IRQ_RX_DONE) != 0) {
-            // During an image burst the radio stays in continuous RX. Re-arming
-            // after each fragment would clear bytes of the next fragment that
-            // are already entering the 1024-byte FIFO.
-            bool image_stream = image_rx_pending_;
+            // The radio must stay in continuous RX, not re-arm per packet.
+            // Re-arming (set_standby + set_rx) between the back-to-back packets
+            // of one uplink burst desyncs FLRC framing: the next packet is
+            // already streaming into the 1024B FIFO, so the read pointer lands
+            // mid-packet and every following read is misaligned (magic fails ->
+            // rx_unknown_packets_). Board data proved this: crc=hdr=0 yet ~75%
+            // of appended fragments landed as unknown, one re-arm per packet.
+            // Two paths keep continuous RX: a one-way image burst, and the
+            // gateway during intercom (node appends image/probe fragments right
+            // after its voice reply). Both leave re-arm to the once-per-slot TX
+            // path (send_intercom_slot) after the radio returns from standby.
+            bool keep_continuous_rx =
+                image_rx_pending_ || (intercom_active_ && is_gateway_);
             mode_ = Mode::idle;
             handle_rx_packet();
-            if (image_stream) {
+            if (keep_continuous_rx) {
                 if (mode_ == Mode::idle) {
                     mode_ = Mode::rx_pending;
                 }
@@ -1000,7 +1021,10 @@ void RadioPing::handle_irq(ral_irq_t irq)
             schedule_rx();
         } else if ((irq & RAL_IRQ_RX_HDR_ERROR) != 0) {
             mode_ = Mode::idle;
-            ESP_LOGW(TAG, "RX header error");
+            rx_hdr_errors_++;
+            if ((rx_hdr_errors_ % 10) == 1) {
+                ESP_LOGW(TAG, "RX header errors=%lu", static_cast<unsigned long>(rx_hdr_errors_));
+            }
             schedule_rx();
         } else if ((irq & RAL_IRQ_RX_TIMEOUT) != 0) {
             mode_ = Mode::idle;
@@ -1152,6 +1176,23 @@ void RadioPing::service_intercom()
         if (!intercom_start_confirmed_) flags |= kVoiceFlagStart;
         if (intercom_stop_requested_) flags |= kVoiceFlagStop;
         (void)send_intercom_slot(flags);
+        // Stage-3 fragment-loss diagnostic. voice_rx is the ~100% baseline;
+        // the probe_rx/voice_rx gap is the real appended-fragment loss. Then:
+        //   rearm high + crc/hdr low  -> re-arm flushes the FIFO (structural)
+        //   crc/hdr high              -> FIFO overflow / half-packet reads
+        intercom_masters_tx_++;
+        if ((intercom_masters_tx_ % 100U) == 1U) {
+            ESP_LOGI(TAG,
+                     "intercom gw diag masters=%lu voice_rx=%lu probe_rx=%lu "
+                     "rearm=%lu crc=%lu hdr=%lu unknown=%lu",
+                     static_cast<unsigned long>(intercom_masters_tx_),
+                     static_cast<unsigned long>(intercom_voice_rx_),
+                     static_cast<unsigned long>(intercom_probe_rx_),
+                     static_cast<unsigned long>(intercom_rearm_after_rx_),
+                     static_cast<unsigned long>(rx_crc_errors_),
+                     static_cast<unsigned long>(rx_hdr_errors_),
+                     static_cast<unsigned long>(rx_unknown_packets_));
+        }
         return;
     }
 
@@ -1584,6 +1625,11 @@ void RadioPing::dispatch_rx_packet(uint16_t len, int16_t rssi)
             return;
         }
         const bool valid = queue_voice_packet(len, rssi);
+        if (valid && is_gateway_ && intercom_active_) {
+            // Known-good baseline: node voice replies land ~100% of slots.
+            // The probe_rx/voice_rx gap is the true appended-fragment loss.
+            intercom_voice_rx_++;
+        }
         if (valid && !is_gateway_ && (flags & kVoiceFlagMaster) != 0) {
             if ((flags & kVoiceFlagStart) != 0) {
                 if (!intercom_start_confirmed_) {

@@ -261,6 +261,7 @@ private:
     uint32_t rx_packets_ = 0;
     uint32_t rx_lost_ = 0;
     uint32_t rx_crc_errors_ = 0;
+    uint32_t rx_hdr_errors_ = 0;
     uint32_t rx_unknown_packets_ = 0;
     uint32_t rx_queue_drops_ = 0;
     uint32_t tx_queue_drops_ = 0;
@@ -290,6 +291,12 @@ private:
     uint32_t intercom_probe_rx_ = 0;
     uint32_t intercom_probe_sent_ = 0;
     uint32_t intercom_probe_deadline_stops_ = 0;
+    // Stage-3 diagnostic (gateway side): classify why appended image/probe
+    // fragments go missing after the node voice reply. Sampled on the 20ms
+    // master heartbeat so the numbers surface even when every probe is lost.
+    uint32_t intercom_masters_tx_ = 0;   // masters sent (per-slot denominator)
+    uint32_t intercom_voice_rx_ = 0;     // node voice replies received (~100% baseline)
+    uint32_t intercom_rearm_after_rx_ = 0; // schedule_rx() re-arms during a live session
     uint32_t intercom_mic_frames_ = 0;
     uint32_t intercom_play_frames_ = 0;
     uint64_t intercom_aec_us_total_ = 0;
