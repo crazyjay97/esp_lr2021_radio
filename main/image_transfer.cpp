@@ -525,3 +525,13 @@ void ImageTransfer::rx_reset()
     rx_received_ = 0;
     rx_jpeg_size_ = 0;
 }
+
+void ImageTransfer::rx_restart()
+{
+    if (!rx_received_map_ || rx_total_ == 0) {
+        return;
+    }
+    std::memset(rx_received_map_, 0, rx_total_ * sizeof(bool));
+    rx_received_ = 0;
+    rx_jpeg_size_ = 0;
+}

@@ -42,6 +42,12 @@ public:
     // RX side: free reassembly buffer
     void rx_reset();
 
+    // RX side: clear the received-fragment map for the SAME session/size without
+    // freeing and reallocating buffers. Used by the intercom frame-rate counter,
+    // which reassembles the same repeating frame many times per second and would
+    // otherwise thrash the heap with a full rx_begin() on every completed frame.
+    void rx_restart();
+
     uint16_t rx_session_id() const { return rx_session_id_; }
     uint16_t rx_received_count() const { return rx_received_; }
     uint16_t rx_total_count() const { return rx_total_; }

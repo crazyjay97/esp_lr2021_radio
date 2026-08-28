@@ -143,6 +143,11 @@ private:
      * pipeline. Radio must already be in a TX-capable idle state on entry; on
      * exit it is left idle (caller re-arms RX), matching burst_send_fragments. */
     void send_intercom_probe_burst(uint16_t count);
+    // Stage-3: prepare the fixed frame at call start (node) and send up to `count`
+    // real ImageData fragments from it in the slot tail, advancing the cursor.
+    void prepare_intercom_image();
+    void send_intercom_image_burst(uint16_t count);
+    void handle_intercom_image_data(uint16_t len);
     bool leave_rx_for_tx();
     void handle_rx_packet();
     void dispatch_rx_packet(uint16_t len, int16_t rssi);
@@ -297,6 +302,17 @@ private:
     uint32_t intercom_masters_tx_ = 0;   // masters sent (per-slot denominator)
     uint32_t intercom_voice_rx_ = 0;     // node voice replies received (~100% baseline)
     uint32_t intercom_rearm_after_rx_ = 0; // schedule_rx() re-arms during a live session
+    // Stage-3 real-JPEG piggyback. Node: one fixed in-RAM frame, cycled through
+    // the slot-tail burst with a rolling cursor. Gateway: complete-frame counter
+    // fed by handle_intercom_image_data (reassemble + count, no decode/LCD).
+    uint8_t *intercom_img_buf_ = nullptr;   // node: the fixed frame (PSRAM)
+    size_t   intercom_img_len_ = 0;         // node: frame byte length
+    uint16_t intercom_img_total_frags_ = 0; // node+gw: fragments per frame
+    uint16_t intercom_img_cursor_ = 0;      // node: next fragment index to send
+    uint32_t intercom_img_frames_tx_ = 0;   // node: whole-frame wraps completed
+    uint32_t intercom_img_frames_rx_ = 0;   // gw: complete frames reassembled
+    uint32_t intercom_img_frags_rx_ = 0;    // gw: valid fragments accepted
+    uint32_t intercom_img_rate_ms_ = 0;     // gw: window origin for frames/s log
     uint32_t intercom_mic_frames_ = 0;
     uint32_t intercom_play_frames_ = 0;
     uint64_t intercom_aec_us_total_ = 0;

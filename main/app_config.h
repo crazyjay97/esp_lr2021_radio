@@ -50,8 +50,11 @@
 /* Fixed bitrate makes packet sizing and radio scheduling easier to debug. */
 #define APP_OPUS_USE_VBR                0
 
-/* Complexity 3 improves CELT speech quality while keeping CPU use bounded. */
-#define APP_OPUS_COMPLEXITY             3
+/* Complexity 1: the WDT backtraces landed in the CELT PVQ search
+ * (alg_quant/exp_rotation), so trimming encoder complexity frees core1 headroom
+ * for the image path. At 16 kHz / 32 kbps voice the quality delta from 3 is
+ * negligible. Raise back toward 3 if speech sounds gritty; 0 is the CPU floor. */
+#define APP_OPUS_COMPLEXITY             1
 
 /* Keep DTX off for the first bring-up so packet timing remains predictable. */
 #define APP_OPUS_USE_DTX                0
@@ -134,6 +137,17 @@
 #define APP_INTERCOM_IMAGE_PROBE        4U
 #define APP_INTERCOM_IMAGE_BURST_PRIORITY   2
 #define APP_INTERCOM_IMAGE_BURST_GUARD_US   6000
+/* Stage 3 (real JPEG piggyback): when > 0 the node stops sending DUMMY probe
+ * packets and instead cycles the fragments of ONE fixed in-RAM frame through the
+ * same slot-tail burst, using APP_INTERCOM_IMAGE_PROBE fragments/slot and a
+ * rolling cursor that wraps at end-of-frame. The gateway self-opens reassembly
+ * from the first ImageData it sees during the call and counts complete frames/s
+ * (no decode, no LCD) to measure the achievable frame rate over the live TDD.
+ * APP_INTERCOM_IMAGE_FRAME_BYTES sizes that representative frame (fragment count
+ * = ceil(bytes / APP_IMAGE_FRAGMENT_DATA_SIZE)); set it to your real JPEG size.
+ * Set APP_INTERCOM_IMAGE_ENABLE to 0 to fall back to Stage-1 dummy probes. */
+#define APP_INTERCOM_IMAGE_ENABLE       1
+#define APP_INTERCOM_IMAGE_FRAME_BYTES  5000U
 /* Keep the end-to-end acoustic loop below unity when two units are nearby.
  * Playback attenuation is applied before both the AEC reference and I2S.
  * Digital loop gain = INPUT_GAIN * PLAYBACK_PERCENT/100. At 1 * 0.50 = 0.50
@@ -146,8 +160,14 @@
 #define APP_INTERCOM_AEC_ENABLE         1
 
 /* Official ESP-SR direct full-duplex AEC. The runtime chunk size is bridged
- * to the project's 10 ms audio frames without an AFE worker task. */
-#define APP_AFE_AEC_FILTER_LENGTH       4U
+ * to the project's 10 ms audio frames without an AFE worker task.
+ * Filter length 2 (was 4): the linear filter's per-frame MAC cost scales with
+ * this, so halving it is the single biggest core1 CPU saving before the image
+ * path lands. Trade-off: shorter echo-tail coverage (~64 ms vs ~128 ms). The
+ * small doorbell enclosure has a short tail so 2 should hold; if call onset
+ * howls or steady-state echo returns, raise back to 3-4 (and/or bump
+ * APP_AFE_AEC_NLP_LEVEL_STEADY to 1). */
+#define APP_AFE_AEC_FILTER_LENGTH       2U
 
 /* AEC NLP (non-linear residual-echo suppressor) aggressiveness:
  *   0 = AEC_NLP_LEVEL_NORMAL, 1 = AGGR (ESP-SR default), 2 = VERYAGGR.
