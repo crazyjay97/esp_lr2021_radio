@@ -607,6 +607,58 @@ void finish_image_capture_task()
     vTaskDelete(nullptr);
 }
 
+#if APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS > 0
+// Stage-3 coexistence probe (node only). Every APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS
+// during a live call, try ONE capture + JPEG encode with NO audio suspend and NO
+// transmit/display, and log the cost. This is the gate that answers the only hard
+// unknown before wiring real JPEG into the call: can the SP0A39 DVP capture + the
+// core1 encode run alongside live I2S/AEC/Opus, and at what price. It runs at the
+// preemptible image priority so AEC/Opus always win; compare the "[IMG PROBE]"
+// timings against the node's intercom mic/playback logs for glitches.
+static void intercom_capture_probe_task(void *arg)
+{
+    (void)arg;
+    uint32_t attempts = 0;
+    uint32_t fails = 0;
+    for (;;) {
+        // Only while a call is up; otherwise poll cheaply and wait.
+        if (!g_radio.intercom_active()) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+        // Respect the shared capture guard so we never race any other capture.
+        bool expected_idle = false;
+        if (!g_capture_busy.compare_exchange_strong(expected_idle, true,
+                                                    std::memory_order_acq_rel)) {
+            vTaskDelay(pdMS_TO_TICKS(APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS));
+            continue;
+        }
+
+        const uint32_t t0 = static_cast<uint32_t>(esp_log_timestamp());
+        size_t jpeg_len = 0;
+        uint8_t *jpeg = prepare_jpeg_blob(&jpeg_len);  // capture + encode, no suspend
+        const uint32_t dt = static_cast<uint32_t>(esp_log_timestamp()) - t0;
+        attempts++;
+        if (jpeg) {
+            heap_caps_free(jpeg);  // probe only: measure, then discard
+        } else {
+            fails++;
+        }
+        g_capture_busy.store(false, std::memory_order_release);
+
+        ESP_LOGI(TAG,
+                 "[IMG PROBE] capture+encode=%lums jpeg=%u bytes ok=%d "
+                 "attempts=%lu fails=%lu (no suspend, not sent)",
+                 static_cast<unsigned long>(dt),
+                 static_cast<unsigned>(jpeg_len), jpeg ? 1 : 0,
+                 static_cast<unsigned long>(attempts),
+                 static_cast<unsigned long>(fails));
+
+        vTaskDelay(pdMS_TO_TICKS(APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS));
+    }
+}
+#endif
+
 void image_capture_task(void *arg)
 {
     auto *ctx = static_cast<ImageCaptureCtx *>(arg);
@@ -1518,6 +1570,17 @@ extern "C" void app_main(void)
             start_auto_capture_timer();
             update_camera_timer_status();
             start_countdown_timer();
+
+#if APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS > 0
+            // Stage-3 coexistence probe: capture+encode during a live call, no
+            // suspend/tx/display, just measure. Priority below voice so AEC wins.
+            if (xTaskCreatePinnedToCore(intercom_capture_probe_task, "img_probe",
+                                        APP_IMAGE_TASK_STACK_BYTES, nullptr,
+                                        APP_IMAGE_TASK_PRIORITY, nullptr,
+                                        APP_IMAGE_TASK_CORE) != pdPASS) {
+                ESP_LOGW(TAG, "intercom capture probe task create failed");
+            }
+#endif
 
             // PIR sensor on GPIO12: delay 5s then arm high-level trigger
             // (allow residual touch IC signals to settle after power-on)

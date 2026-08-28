@@ -148,6 +148,18 @@
  * Set APP_INTERCOM_IMAGE_ENABLE to 0 to fall back to Stage-1 dummy probes. */
 #define APP_INTERCOM_IMAGE_ENABLE       1
 #define APP_INTERCOM_IMAGE_FRAME_BYTES  5000U
+/* Stage-3 coexistence probe (node / camera mode only). When > 0, during a live
+ * call the node attempts ONE camera capture + software JPEG encode every N ms,
+ * WITHOUT suspending audio and WITHOUT transmitting or displaying anything —
+ * purely to measure whether the SP0A39 DVP capture (esp_cam_ctlr + DMA) and the
+ * core1 JPEG encode can coexist with the live I2S/AEC/Opus path, and at what
+ * cost. It runs at APP_IMAGE_TASK_PRIORITY (below voice_tx/voice_play) so AEC
+ * always preempts it. Read the "[IMG PROBE]" lines (capture+encode ms, jpeg
+ * bytes, ok/fail) against the node's intercom mic/playback logs (missed, aec_max,
+ * frames) for audio disruption. This is the gate before feeding real JPEG into
+ * the slot-tail burst; set to 0 to disable. The synthetic-frame burst keeps
+ * running alongside so the radio load stays realistic during the probe. */
+#define APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS  1000U
 /* Keep the end-to-end acoustic loop below unity when two units are nearby.
  * Playback attenuation is applied before both the AEC reference and I2S.
  * Digital loop gain = INPUT_GAIN * PLAYBACK_PERCENT/100. At 1 * 0.50 = 0.50
