@@ -1217,23 +1217,32 @@ bool RadioPing::send_intercom_slot(uint8_t flags)
     // the SAME uplink window as its voice reply (image is one-way node->GW, same
     // direction). This measures whether the append starves voice slots / shallow-
     // ring capture before real image data is wired in. GW-only receives+drops.
-    if (ok && !is_gateway_ && (flags & kVoiceFlagNodeReply) &&
-        APP_INTERCOM_IMAGE_PROBE > 0) {
+    if (ok && intercom_active_ && !is_gateway_ && (flags & kVoiceFlagNodeReply) &&
+        (flags & kVoiceFlagStopAck) == 0 && APP_INTERCOM_IMAGE_PROBE > 0) {
         send_intercom_probe_burst(APP_INTERCOM_IMAGE_PROBE);
         if ((intercom_probe_tx_ % 100U) == 1U) {
-            ESP_LOGI(TAG, "intercom probe tx bursts=%lu n=%u/slot missed=%lu",
+            // sent/bursts = avg fragments that actually fit per slot (varies with
+            // AEC load); deadline_stops = slots that hit the guard and yielded.
+            ESP_LOGI(TAG, "intercom probe bursts=%lu sent=%lu req=%u/slot "
+                          "dl_stops=%lu missed=%lu",
                      static_cast<unsigned long>(intercom_probe_tx_),
+                     static_cast<unsigned long>(intercom_probe_sent_),
                      static_cast<unsigned>(APP_INTERCOM_IMAGE_PROBE),
+                     static_cast<unsigned long>(intercom_probe_deadline_stops_),
                      static_cast<unsigned long>(intercom_missed_slots_));
         }
     }
     schedule_rx();
     if (((intercom_tx_slots_ + intercom_missed_slots_) % 100U) == 1U) {
-        ESP_LOGI(TAG, "intercom slots tx=%lu rx=%lu missed=%lu queued=%u",
+        // drops = tx_queue frames discarded before air (enqueue_voice_frame is
+        // silent on drop). If drops tracks rx_lost, the loss is node-side queue
+        // overflow, not over-the-air; if drops stays ~0, the loss is OTA/RX.
+        ESP_LOGI(TAG, "intercom slots tx=%lu rx=%lu missed=%lu queued=%u drops=%lu",
                  static_cast<unsigned long>(intercom_tx_slots_),
                  static_cast<unsigned long>(intercom_rx_slots_),
                  static_cast<unsigned long>(intercom_missed_slots_),
-                 tx_queue_ ? static_cast<unsigned>(uxQueueMessagesWaiting(tx_queue_)) : 0U);
+                 tx_queue_ ? static_cast<unsigned>(uxQueueMessagesWaiting(tx_queue_)) : 0U,
+                 static_cast<unsigned long>(tx_queue_drops_));
     }
     return ok;
 }
@@ -1244,8 +1253,22 @@ void RadioPing::send_intercom_probe_burst(uint16_t count)
 
     const void *ctx = radio_.ral.context;
 
-    // Same TX-notify ownership and FS-fallback FIFO pipeline as
-    // burst_send_fragments, so the probe measures the real image-append path.
+    // Per-slot deadline: the next master is expected one slot period after the
+    // one we just replied to. intercom_reply_due_us_ was set to (master_rx +
+    // GUARD), so master_rx + SLOT_PERIOD is the next master. Stop the burst
+    // BURST_GUARD_US before that, leaving time to restore priority and re-arm RX.
+    const int64_t next_master_us =
+        intercom_reply_due_us_ - static_cast<int64_t>(APP_INTERCOM_NODE_GUARD_US) +
+        static_cast<int64_t>(APP_INTERCOM_SLOT_PERIOD_MS) * 1000LL;
+    const int64_t deadline_us =
+        next_master_us - static_cast<int64_t>(APP_INTERCOM_IMAGE_BURST_GUARD_US);
+
+    // Yield discipline: drop THIS task below voice_tx (AEC) for the burst so the
+    // AEC always preempts us and its reference-FIFO cadence stays aligned. The
+    // TX_DONE IRQ still just posts a notification; it cannot bump us over AEC.
+    const UBaseType_t saved_prio = uxTaskPriorityGet(nullptr);
+    vTaskPrioritySet(nullptr, APP_INTERCOM_IMAGE_BURST_PRIORITY);
+
     tx_done_waiter_ = xTaskGetCurrentTaskHandle();
     xTaskNotifyStateClear(nullptr);
 
@@ -1268,33 +1291,25 @@ void RadioPing::send_intercom_probe_burst(uint16_t count)
     put_u16_le(&pkt[8], intercom_session_);
     std::memset(pkt + 10, 0, APP_FLRC_BURST_PAYLOAD_LEN - 10);
 
-    uint16_t next_write = 0;
-    for (int prefill = 0; prefill < 2 && next_write < count; prefill++) {
-        put_u16_le(&pkt[10], next_write);
-        smtc_modem_hal_protect_api_call();
-        (void)lr20xx_radio_fifo_write_tx(ctx, pkt, APP_FLRC_BURST_PAYLOAD_LEN);
-        smtc_modem_hal_unprotect_api_call();
-        next_write++;
-    }
-
-    mode_ = Mode::tx_pending;
-    smtc_modem_hal_protect_api_call();
-    (void)ral_set_tx(&radio_.ral);
-    smtc_modem_hal_unprotect_api_call();
-
-    for (uint16_t pos = 1; pos < count; pos++) {
-        (void)wait_for_tx_done(50);
+    // One fragment at a time: each loop is a clean deadline check + AEC-yield
+    // point (wait_for_tx_done blocks, so voice_tx runs during the ~2.9 ms air
+    // time). No prefill pipeline — that would commit 2 packets before we could
+    // re-check the deadline.
+    uint16_t sent = 0;
+    for (uint16_t pos = 0; pos < count; pos++) {
+        if (esp_timer_get_time() >= deadline_us) {
+            intercom_probe_deadline_stops_++;
+            break;
+        }
+        put_u16_le(&pkt[10], pos);
         mode_ = Mode::tx_pending;
         smtc_modem_hal_protect_api_call();
+        (void)lr20xx_radio_fifo_write_tx(ctx, pkt, APP_FLRC_BURST_PAYLOAD_LEN);
         (void)ral_set_tx(&radio_.ral);
-        if (next_write < count) {
-            put_u16_le(&pkt[10], next_write);
-            (void)lr20xx_radio_fifo_write_tx(ctx, pkt, APP_FLRC_BURST_PAYLOAD_LEN);
-            next_write++;
-        }
         smtc_modem_hal_unprotect_api_call();
+        (void)wait_for_tx_done(50);
+        sent++;
     }
-    (void)wait_for_tx_done(50);
 
     smtc_modem_hal_protect_api_call();
     (void)lr20xx_radio_common_set_rx_tx_fallback_mode(
@@ -1302,7 +1317,13 @@ void RadioPing::send_intercom_probe_burst(uint16_t count)
     smtc_modem_hal_unprotect_api_call();
     mode_ = Mode::idle;
     tx_done_waiter_ = nullptr;
+
+    // Restore full priority BEFORE returning so re-arm RX / next master service
+    // runs at the normal radio priority.
+    vTaskPrioritySet(nullptr, saved_prio);
+
     intercom_probe_tx_++;
+    intercom_probe_sent_ += sent;
 }
 
 bool RadioPing::configure_flrc()

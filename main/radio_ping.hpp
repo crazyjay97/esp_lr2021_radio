@@ -288,6 +288,8 @@ private:
      * packets received. Both feed the airtime/slot-impact measurement. */
     uint32_t intercom_probe_tx_ = 0;
     uint32_t intercom_probe_rx_ = 0;
+    uint32_t intercom_probe_sent_ = 0;
+    uint32_t intercom_probe_deadline_stops_ = 0;
     uint32_t intercom_mic_frames_ = 0;
     uint32_t intercom_play_frames_ = 0;
     uint64_t intercom_aec_us_total_ = 0;

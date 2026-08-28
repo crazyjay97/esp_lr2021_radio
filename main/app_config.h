@@ -120,9 +120,20 @@
  * packets (type kPacketTypeIntercomProbe) after the node voice reply so we can
  * measure, on hardware, whether appending fragments starves voice slots or the
  * shallow-ring capture — before wiring the real image path. Set the probe to 0
- * to disable. The GW counts and drops probe packets. */
+ * to disable. The GW counts and drops probe packets.
+ *
+ * Scheduling (learned on hardware): sending fragments synchronously in the radio
+ * task at its normal priority preempts the AEC (voice_tx) every TX_DONE and
+ * desyncs the reference FIFO -> howling + watchdog. So the burst YIELDS: it drops
+ * the radio task to APP_INTERCOM_IMAGE_BURST_PRIORITY (below voice_tx) for the
+ * duration so AEC always preempts it, and stops early once fewer than
+ * APP_INTERCOM_IMAGE_BURST_GUARD_US remain before the next master slot, leaving
+ * time to restore priority and re-arm RX. Image is elastic: fragments/slot vary
+ * with AEC load, but the voice slot is never touched. */
 #define APP_INTERCOM_IMAGE_GRANT_MAX    4U
-#define APP_INTERCOM_IMAGE_PROBE        0U
+#define APP_INTERCOM_IMAGE_PROBE        4U
+#define APP_INTERCOM_IMAGE_BURST_PRIORITY   2
+#define APP_INTERCOM_IMAGE_BURST_GUARD_US   6000
 /* Keep the end-to-end acoustic loop below unity when two units are nearby.
  * Playback attenuation is applied before both the AEC reference and I2S.
  * Digital loop gain = INPUT_GAIN * PLAYBACK_PERCENT/100. At 1 * 0.50 = 0.50
@@ -235,16 +246,23 @@
 /* Run Opus decode/playback away from direct radio control. */
 #define APP_VOICE_PLAY_TASK_CORE        1
 
-/* Keep capture/AEC/Opus below the CPU0 radio task so the 2 ms RAC service can
- * preempt FD_LOW_COST processing without dropping a TDD slot. */
-#define APP_VOICE_TX_TASK_PRIORITY      3
+/* AEC now runs on CPU1 (see APP_VOICE_TX_TASK_CORE), so it no longer contends
+ * with the CPU0 radio TDD. On CPU1 it must sit ABOVE the JPEG encoder
+ * (img_cap, APP_IMAGE_TASK_PRIORITY=3) so a 10 ms AEC frame preempts the
+ * ~90 ms elastic JPEG encode instead of being starved by it; it stays below
+ * voice_play(5) so speaker output/RX re-arm keep priority. */
+#define APP_VOICE_TX_TASK_PRIORITY      4
 /* Was 32768; cut to 16KB to reclaim internal SRAM under 32KB I-cache. See
  * APP_RADIO_TASK_STACK_BYTES note. STACK-probe logs verify real usage. */
 #define APP_VOICE_TX_TASK_STACK_BYTES   16384U
 
-/* Balance the synchronous AEC load onto CPU0. Intercom excludes image traffic,
- * and the priority-4 radio task remains above this priority-3 audio task. */
-#define APP_VOICE_TX_TASK_CORE          0
+/* Move capture/AEC/Opus off CPU0 onto CPU1. On CPU0 the radio TDD (20 ms hard
+ * deadline) and a 16 ms worst-case AEC frame were two hard-real-time jobs
+ * fighting one core: raising radio starves AEC (howling), raising AEC blocks
+ * radio RX re-arm across the master (deaf, superframe stretches to ~35 ms).
+ * Splitting them turns that into "hard AEC vs elastic JPEG" on CPU1, which is
+ * a tunable trade-off (drop JPEG frames, never voice). */
+#define APP_VOICE_TX_TASK_CORE          1
 
 /* ----- Audio DSP (noise suppression / voice enhancement) -------------------- */
 
