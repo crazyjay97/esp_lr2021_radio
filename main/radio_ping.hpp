@@ -254,6 +254,15 @@ private:
     // block-wait and free the CPU for the burst's idle airtime. nullptr => the
     // ISR falls back to notifying task_handle_ (RX path / main loop wakeups).
     volatile TaskHandle_t tx_done_waiter_ = nullptr;
+    // Fix A (RX-anchored intercom timing): esp_timer_get_time() sampled inside the
+    // DIO ISR on every interrupt, i.e. at hardware IRQ latency (µs, ~constant) from
+    // the packet-end. handle_irq snapshots it into rx_done_us_ the instant it
+    // classifies an RX_DONE, BEFORE handle_rx_packet runs. The node then anchors
+    // its intercom reply/next-master timing to rx_done_us_ instead of the task
+    // dispatch time, which the core0 image burst jitters late — that jitter was
+    // pushing the burst deadline past the real next master and dropping voice.
+    volatile int64_t last_irq_us_ = 0;   // ISR: time of most recent DIO interrupt
+    int64_t rx_done_us_ = 0;             // task: snapshot at the RX_DONE that woke us
 
     uint8_t tx_buf_[APP_FLRC_MAX_PAYLOAD_BYTES] = {};
     uint8_t rx_buf_[APP_FLRC_MAX_PAYLOAD_BYTES] = {};

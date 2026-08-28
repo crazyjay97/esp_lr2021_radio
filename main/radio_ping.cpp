@@ -987,6 +987,10 @@ void RadioPing::irq_callback(void *context)
 {
     auto *self = static_cast<RadioPing *>(context);
     if (self != nullptr) {
+        // Fix A: stamp the interrupt instant here, at hardware IRQ latency from the
+        // packet-end, so intercom timing anchors to RX_DONE instead of task dispatch
+        // (which the core0 image burst delays). esp_timer_get_time() is ISR-safe.
+        self->last_irq_us_ = esp_timer_get_time();
         self->irq_pending_ = true;
         // If a task is block-waiting for TX_DONE inside send_single_packet, wake
         // that task directly; otherwise wake the main radio task (RX / poll loop).
@@ -1022,6 +1026,10 @@ void RadioPing::handle_irq(ral_irq_t irq)
             bool keep_continuous_rx =
                 image_rx_pending_ || (intercom_active_ && is_gateway_);
             mode_ = Mode::idle;
+            // Fix A: capture the ISR timestamp of THIS RX_DONE before processing, so
+            // the node's reply/next-master anchor is the packet arrival, not the
+            // (burst-jittered) dispatch time. Only the RX_DONE path sets this.
+            rx_done_us_ = last_irq_us_;
             handle_rx_packet();
             if (keep_continuous_rx) {
                 if (mode_ == Mode::idle) {
@@ -1796,7 +1804,15 @@ void RadioPing::dispatch_rx_packet(uint16_t len, int16_t rssi)
                 intercom_start_confirmed_ = true;
             }
             intercom_last_sync_ms_ = smtc_modem_hal_get_time_in_ms();
-            intercom_reply_due_us_ = esp_timer_get_time() +
+            // Fix A: anchor to the RX_DONE ISR timestamp (rx_done_us_), NOT
+            // esp_timer_get_time() here — this runs at task-dispatch time, which the
+            // core0 image burst delays by a variable amount. Everything downstream
+            // (the burst deadline in send_intercom_image_burst = reply_due - GUARD +
+            // SLOT_PERIOD - BURST_GUARD) inherits this anchor, so an accurate master
+            // arrival estimate stops the burst on time and re-arms RX before the next
+            // master. Fall back to now if the snapshot is somehow unset.
+            intercom_reply_due_us_ =
+                (rx_done_us_ != 0 ? rx_done_us_ : esp_timer_get_time()) +
                 static_cast<int64_t>(APP_INTERCOM_NODE_GUARD_US);
             intercom_reply_pending_ = true;
             intercom_stop_reply_ = (flags & kVoiceFlagStop) != 0;
