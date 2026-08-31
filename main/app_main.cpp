@@ -8,6 +8,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
@@ -83,7 +84,9 @@ esp_timer_handle_t g_ptt_timer = nullptr;
 constexpr UBaseType_t kGatewayImageQueueLength = 2;
 constexpr uint32_t kGatewayImageTaskStackBytes = 16384U;
 constexpr UBaseType_t kGatewayImageTaskPriority = 3;
-constexpr BaseType_t kGatewayImageTaskCore = 1;
+// Gateway decode/compose is elastic work. Move it to CPU0, where the measured
+// steady-state headroom is much larger; the priority-4 radio task still preempts it.
+constexpr BaseType_t kGatewayImageTaskCore = 0;
 
 struct GatewayImageFrame {
     uint8_t *jpeg = nullptr;
@@ -98,6 +101,124 @@ struct GatewayImageFrame {
 
 QueueHandle_t g_gateway_image_queue = nullptr;
 TaskHandle_t g_gateway_image_task_handle = nullptr;
+
+// Live-intercom capture/JPEG is elastic work. Keep it below the radio task and
+// its slot-tail burst while moving the load away from the saturated CPU1.
+constexpr UBaseType_t kIntercomImageTaskPriority = 1;
+constexpr BaseType_t kIntercomImageTaskCore = 0;
+
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+constexpr uint32_t kCpuStatsPeriodMs = 5000U;
+constexpr uint32_t kCpuStatsTaskStackBytes = 3072U;
+constexpr UBaseType_t kCpuStatsTaskPriority = 1;
+constexpr BaseType_t kCpuStatsTaskCore = 0;
+
+struct TaskRuntimeProbe {
+    const char *name;
+    uint32_t previous = 0;
+    bool primed = false;
+};
+
+uint32_t read_task_runtime(TaskHandle_t handle)
+{
+    if (!handle) return 0;
+    TaskStatus_t status = {};
+    vTaskGetInfo(handle, &status, pdFALSE, eReady);
+    return static_cast<uint32_t>(status.ulRunTimeCounter);
+}
+
+uint32_t sample_task_runtime(TaskHandle_t handle, uint32_t *previous, bool *primed)
+{
+    if (!handle) {
+        *primed = false;
+        return 0;
+    }
+    const uint32_t current = read_task_runtime(handle);
+    if (!*primed) {
+        *previous = current;
+        *primed = true;
+        return 0;
+    }
+    const uint32_t delta = current - *previous;
+    *previous = current;
+    return delta;
+}
+
+uint32_t runtime_percent_x10(uint32_t runtime_us, uint64_t elapsed_us)
+{
+    if (elapsed_us == 0) return 0;
+    const uint64_t value = static_cast<uint64_t>(runtime_us) * 1000ULL / elapsed_us;
+    return static_cast<uint32_t>(value > 1000ULL ? 1000ULL : value);
+}
+
+void cpu_stats_task(void *arg)
+{
+    (void)arg;
+    TaskRuntimeProbe idle0 = {nullptr};
+    TaskRuntimeProbe idle1 = {nullptr};
+    TaskRuntimeProbe probes[] = {
+        {"radio_ping"}, {"voice_tx"}, {"voice_play"},
+        {"img_feed"}, {"gw_image"}, {"lvgl"},
+    };
+
+    const TaskHandle_t idle0_handle = xTaskGetIdleTaskHandleForCore(0);
+    const TaskHandle_t idle1_handle = xTaskGetIdleTaskHandleForCore(1);
+    (void)sample_task_runtime(idle0_handle, &idle0.previous, &idle0.primed);
+    (void)sample_task_runtime(idle1_handle, &idle1.previous, &idle1.primed);
+    for (auto &probe : probes) {
+        (void)sample_task_runtime(xTaskGetHandle(probe.name),
+                                  &probe.previous, &probe.primed);
+    }
+    int64_t previous_us = esp_timer_get_time();
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(kCpuStatsPeriodMs));
+        const int64_t now_us = esp_timer_get_time();
+        const uint64_t elapsed_us = static_cast<uint64_t>(now_us - previous_us);
+        previous_us = now_us;
+
+        const uint32_t idle0_delta = sample_task_runtime(
+            idle0_handle, &idle0.previous, &idle0.primed);
+        const uint32_t idle1_delta = sample_task_runtime(
+            idle1_handle, &idle1.previous, &idle1.primed);
+        uint32_t task_pct_x10[sizeof(probes) / sizeof(probes[0])] = {};
+        for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); ++i) {
+            const uint32_t delta = sample_task_runtime(
+                xTaskGetHandle(probes[i].name),
+                &probes[i].previous, &probes[i].primed);
+            task_pct_x10[i] = runtime_percent_x10(delta, elapsed_us);
+        }
+
+        const uint32_t idle0_pct_x10 = runtime_percent_x10(idle0_delta, elapsed_us);
+        const uint32_t idle1_pct_x10 = runtime_percent_x10(idle1_delta, elapsed_us);
+        const uint32_t core0_busy_x10 = 1000U - idle0_pct_x10;
+        const uint32_t core1_busy_x10 = 1000U - idle1_pct_x10;
+        const uint32_t elapsed_ms = static_cast<uint32_t>(elapsed_us / 1000ULL);
+
+        ESP_LOGI(TAG,
+                 "[CPU] win=%lums core0=%lu.%01lu%% core1=%lu.%01lu%% | "
+                 "radio=%lu.%01lu voice_tx=%lu.%01lu voice_play=%lu.%01lu "
+                 "img_feed=%lu.%01lu gw_image=%lu.%01lu lvgl=%lu.%01lu",
+                 static_cast<unsigned long>(elapsed_ms),
+                 static_cast<unsigned long>(core0_busy_x10 / 10U),
+                 static_cast<unsigned long>(core0_busy_x10 % 10U),
+                 static_cast<unsigned long>(core1_busy_x10 / 10U),
+                 static_cast<unsigned long>(core1_busy_x10 % 10U),
+                 static_cast<unsigned long>(task_pct_x10[0] / 10U),
+                 static_cast<unsigned long>(task_pct_x10[0] % 10U),
+                 static_cast<unsigned long>(task_pct_x10[1] / 10U),
+                 static_cast<unsigned long>(task_pct_x10[1] % 10U),
+                 static_cast<unsigned long>(task_pct_x10[2] / 10U),
+                 static_cast<unsigned long>(task_pct_x10[2] % 10U),
+                 static_cast<unsigned long>(task_pct_x10[3] / 10U),
+                 static_cast<unsigned long>(task_pct_x10[3] % 10U),
+                 static_cast<unsigned long>(task_pct_x10[4] / 10U),
+                 static_cast<unsigned long>(task_pct_x10[4] % 10U),
+                 static_cast<unsigned long>(task_pct_x10[5] / 10U),
+                 static_cast<unsigned long>(task_pct_x10[5] % 10U));
+    }
+}
+#endif
 
 const char *mode_name(AppMode mode)
 {
@@ -663,10 +784,10 @@ static void intercom_capture_probe_task(void *arg)
 #if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
 // Stage-4 real JPEG slow-refresh (node only). Every APP_INTERCOM_IMAGE_REAL_CAPTURE_MS
 // during a live call, capture + software-encode ONE real JPEG (no audio suspend) and
-// publish it to the radio's pending-image slot. The radio task adopts it at the next
-// burst frame boundary and cycles its fragments through the slot tail (blind
-// redundancy, no retransmission). Runs at the preemptible image priority so AEC/Opus
-// always win. Replaces the discard-only probe when real capture is enabled.
+// publish it to the radio's pending-image slot. The radio task sends every fragment
+// once through the slot tail, then releases that JPEG. It runs on CPU0 below both
+// normal radio work and the temporary slot-tail burst priority, so neither radio nor
+// CPU1 AEC/Opus is blocked. Replaces the discard-only probe when real capture is enabled.
 static void intercom_capture_feed_task(void *arg)
 {
     (void)arg;
@@ -1171,7 +1292,9 @@ void on_image_rx_complete(ImageTransfer *xfer)
 // reassembled JPEG copy it hands ownership of. Wrap it as a from_intercom frame and
 // push to the same decode+display pipeline (image page). The queue push frees it on
 // success; we free it here on any early-out so the copy never leaks.
-void on_intercom_image_frame(uint8_t *jpeg, size_t len, uint16_t session, void *ctx)
+void on_intercom_image_frame(uint8_t *jpeg, size_t len, uint16_t session,
+                              uint16_t fragments, uint32_t transfer_ms,
+                              uint32_t reassemble_ms, void *ctx)
 {
     (void)ctx;
     if (!jpeg || len == 0) {
@@ -1183,8 +1306,9 @@ void on_intercom_image_frame(uint8_t *jpeg, size_t len, uint16_t session, void *
     frame.jpeg_len = len;
     frame.session_id = session;
     frame.from_intercom = true;
-    frame.transfer_ms = 0;      // no per-frame transfer timing on the piggyback path
-    frame.reassemble_ms = 0;
+    frame.transfer_ms = transfer_ms;
+    frame.reassemble_ms = reassemble_ms;
+    frame.fragments = fragments;
     frame.queued_ms = static_cast<uint32_t>(esp_log_timestamp());
     if (!gateway_image_queue_push(frame)) {
         ESP_LOGW(TAG, "intercom image queue unavailable: drop session=%u", session);
@@ -1672,12 +1796,11 @@ extern "C" void app_main(void)
             }
 #endif
 #if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
-            // Stage-4 real JPEG slow-refresh: capture+encode during a live call and
-            // publish to the radio's pending slot. Priority below voice so AEC wins.
+            // Live-call capture/JPEG uses CPU0 idle time below radio/burst priority.
             if (xTaskCreatePinnedToCore(intercom_capture_feed_task, "img_feed",
                                         APP_IMAGE_TASK_STACK_BYTES, nullptr,
-                                        APP_IMAGE_TASK_PRIORITY, nullptr,
-                                        APP_IMAGE_TASK_CORE) != pdPASS) {
+                                        kIntercomImageTaskPriority, nullptr,
+                                        kIntercomImageTaskCore) != pdPASS) {
                 ESP_LOGW(TAG, "intercom capture feed task create failed");
             }
 #endif
@@ -1797,4 +1920,12 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "display: ST7789T3 %ux%u camera capture UI",
              APP_LCD_H_RES, APP_LCD_V_RES);
     ESP_LOGI(TAG, "K5: switch camera/radio mode. K6/PTT: FLRC voice in radio mode. K4=vol+, K3=vol-");
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+    if (xTaskCreatePinnedToCore(cpu_stats_task, "cpu_stats",
+                                kCpuStatsTaskStackBytes, nullptr,
+                                kCpuStatsTaskPriority, nullptr,
+                                kCpuStatsTaskCore) != pdPASS) {
+        ESP_LOGW(TAG, "CPU stats task create failed");
+    }
+#endif
 }

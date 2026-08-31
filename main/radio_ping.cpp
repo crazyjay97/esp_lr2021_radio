@@ -328,6 +328,27 @@ void RadioPing::start_intercom_local(uint16_t session)
     intercom_img_frames_tx_ = 0;
     intercom_img_frames_rx_ = 0;
     intercom_img_frags_rx_ = 0;
+    intercom_img_frames_adopted_ = 0;
+    intercom_img_frag_tx_attempts_ = 0;
+    intercom_img_frag_tx_done_ = 0;
+    intercom_img_frag_tx_timeouts_ = 0;
+    intercom_img_sessions_seen_ = 0;
+    intercom_img_sessions_unseen_ = 0;
+    intercom_img_sessions_incomplete_ = 0;
+    intercom_img_missing_unique_ = 0;
+    intercom_img_frags_unique_ = 0;
+    intercom_img_frags_duplicate_ = 0;
+    intercom_img_frag_seq_lost_ = 0;
+    intercom_img_crc_errors_ = 0;
+    intercom_img_malformed_ = 0;
+    intercom_img_alloc_failures_ = 0;
+    intercom_img_reassemble_failures_ = 0;
+    intercom_img_rx_session_ = 0;
+    intercom_img_rx_active_ = false;
+    intercom_img_expected_frag_ = 0;
+    intercom_img_have_expected_frag_ = false;
+    intercom_img_current_complete_ = false;
+    intercom_img_rx_frame_start_ms_ = 0;
     intercom_img_rate_ms_ = smtc_modem_hal_get_time_in_ms();
     // Gateway per-frame display de-dup state: clear it so the first frame of THIS
     // call is always pushed even if a prior call ended on the same session id.
@@ -358,7 +379,7 @@ void RadioPing::start_intercom_local(uint16_t session)
     playback_active_ = false;
     intercom_active_ = true;
     if (!is_gateway_) {
-        prepare_intercom_image();  // node: load the fixed frame to cycle
+        prepare_intercom_image();  // node: prepare the one-shot image path
     }
     if (intercom_state_cb_) intercom_state_cb_(true);
     cad_wakeup_ms_ = 0;
@@ -382,6 +403,12 @@ void RadioPing::start_intercom_local(uint16_t session)
 
 void RadioPing::stop_intercom_local()
 {
+    // Settle the trailing gateway session before taking the final snapshot so a
+    // call that ends mid-JPEG is reported as incomplete instead of disappearing.
+    if (is_gateway_) {
+        finalize_intercom_image_rx_session();
+    }
+    log_intercom_image_stats(true);
     intercom_last_stopped_session_ = intercom_session_;
     intercom_active_ = false;
     if (intercom_state_cb_) intercom_state_cb_(false);
@@ -1225,6 +1252,9 @@ void RadioPing::service_intercom()
                      static_cast<unsigned long>(rx_hdr_errors_),
                      static_cast<unsigned long>(rx_unknown_packets_));
         }
+        if ((intercom_masters_tx_ % 250U) == 0U) {
+            log_intercom_image_stats(false);
+        }
         return;
     }
 
@@ -1294,8 +1324,8 @@ bool RadioPing::send_intercom_slot(uint8_t flags)
         (flags & kVoiceFlagStopAck) == 0 && APP_INTERCOM_IMAGE_PROBE > 0) {
         // Stage 3/4: enter the image path when a frame is already loaded OR a
         // freshly captured one is waiting in the pending slot. The pending frame
-        // is adopted inside send_intercom_image_burst at the next frame boundary
-        // (cursor==0), which flips total_frags_ positive — checking only
+        // is adopted inside send_intercom_image_burst when no frame is active,
+        // which flips total_frags_ positive — checking only
         // total_frags_ here would deadlock (never adopt the first frame).
         if (APP_INTERCOM_IMAGE_ENABLE &&
             (intercom_img_total_frags_ > 0 || intercom_img_pending_ != nullptr)) {
@@ -1303,18 +1333,8 @@ bool RadioPing::send_intercom_slot(uint8_t flags)
         } else {
             send_intercom_probe_burst(APP_INTERCOM_IMAGE_PROBE);
         }
-        if ((intercom_probe_tx_ % 100U) == 1U) {
-            // sent/bursts = avg fragments that actually fit per slot (varies with
-            // AEC load); deadline_stops = slots that hit the guard and yielded;
-            // frames_tx = whole frames the node has cycled onto the air.
-            ESP_LOGI(TAG, "intercom probe bursts=%lu sent=%lu req=%u/slot "
-                          "dl_stops=%lu missed=%lu frames_tx=%lu",
-                     static_cast<unsigned long>(intercom_probe_tx_),
-                     static_cast<unsigned long>(intercom_probe_sent_),
-                     static_cast<unsigned>(APP_INTERCOM_IMAGE_PROBE),
-                     static_cast<unsigned long>(intercom_probe_deadline_stops_),
-                     static_cast<unsigned long>(intercom_missed_slots_),
-                     static_cast<unsigned long>(intercom_img_frames_tx_));
+        if ((intercom_probe_tx_ % 250U) == 0U) {
+            log_intercom_image_stats(false);
         }
     }
     schedule_rx();
@@ -1413,7 +1433,8 @@ void RadioPing::send_intercom_probe_burst(uint16_t count)
 
 void RadioPing::prepare_intercom_image()
 {
-    // Stage 3: hold ONE fixed representative frame in PSRAM and cycle it forever.
+    // Stage 3 fallback: build ONE fixed representative frame in PSRAM and send
+    // each fragment once.
     // The user chose a synthetic in-RAM frame (no camera) so this measures the
     // pure RF frame-rate ceiling over the live TDD without touching the audio
     // path or the camera/LCD. Swap this fill for a real captured JPEG later.
@@ -1425,8 +1446,8 @@ void RadioPing::prepare_intercom_image()
     }
 #if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
     // Stage 4 real slow-refresh: do NOT allocate a synthetic frame. The capture-feed
-    // task publishes real JPEGs and the burst adopts the first one at a frame
-    // boundary (bumping intercom_img_session_). Until then total_frags_ stays 0 and
+    // task publishes real JPEGs and the burst adopts one whenever no frame is active
+    // (bumping intercom_img_session_). Until then total_frags_ stays 0 and
     // the burst sends nothing, so voice is untouched while the first frame encodes.
     // Drop any frame left over from a previous call.
     if (intercom_img_buf_) {
@@ -1485,8 +1506,8 @@ void RadioPing::prepare_intercom_image()
 
 void RadioPing::intercom_image_publish(uint8_t *jpeg, size_t jpeg_len)
 {
-    // core1 capture-feed task -> pending slot. Newest frame wins: if a prior frame
-    // is still pending (radio task has not reached a boundary yet), drop the old one
+    // CPU0 capture-feed task -> pending slot. Newest frame wins: if a prior frame
+    // is still pending (radio task is finishing the active frame), drop the old one
     // so we never queue stale frames. Ownership of the accepted blob moves to the
     // radio task (adopted in send_intercom_image_burst); ownership of a dropped blob
     // returns to us to free here.
@@ -1510,15 +1531,13 @@ void RadioPing::intercom_image_publish(uint8_t *jpeg, size_t jpeg_len)
 void RadioPing::send_intercom_image_burst(uint16_t count)
 {
     // Same slot-tail discipline as send_intercom_probe_burst (deadline, AEC-yield,
-    // one fragment at a time) but the payload is a real ImageData fragment built
-    // from the fixed frame, and the cursor rolls across slots + wraps at
-    // end-of-frame so successive slots continue the frame instead of restarting.
+    // one fragment at a time) but the payload is a real ImageData fragment. The
+    // cursor rolls across slots until every fragment has been attempted exactly
+    // once; the frame is then released instead of wrapping for blind redundancy.
 #if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
-    // Adopt a newly captured frame ONLY at a frame boundary (cursor == 0) so the
-    // gateway never sees a frame spliced from two sessions. On adopt, the active
-    // buffer becomes the freshest published JPEG and the per-frame image session id
-    // is bumped so the gateway resets reassembly and displays the new frame once.
-    if (intercom_img_cursor_ == 0) {
+    // Adopt the freshest pending JPEG only when no frame is active. A partial frame
+    // is always finished before replacement, so sessions can never be spliced.
+    if (intercom_img_buf_ == nullptr) {
         uint8_t *fresh = nullptr;
         size_t   fresh_len = 0;
         taskENTER_CRITICAL(&intercom_img_lock_);
@@ -1528,15 +1547,13 @@ void RadioPing::send_intercom_image_burst(uint16_t count)
         intercom_img_pending_len_ = 0;
         taskEXIT_CRITICAL(&intercom_img_lock_);
         if (fresh) {
-            if (intercom_img_buf_) {
-                heap_caps_free(intercom_img_buf_);
-            }
             intercom_img_buf_ = fresh;
             intercom_img_len_ = fresh_len;
             intercom_img_total_frags_ = static_cast<uint16_t>(
                 (fresh_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) /
                 APP_IMAGE_FRAGMENT_DATA_SIZE);
             intercom_img_session_++;  // new frame boundary marker for the gateway
+            intercom_img_frames_adopted_++;
         }
     }
 #endif
@@ -1590,13 +1607,23 @@ void RadioPing::send_intercom_image_burst(uint16_t count)
         (void)lr20xx_radio_fifo_write_tx(ctx, pkt, APP_FLRC_BURST_PAYLOAD_LEN);
         (void)ral_set_tx(&radio_.ral);
         smtc_modem_hal_unprotect_api_call();
-        (void)wait_for_tx_done(50);
+        intercom_img_frag_tx_attempts_++;
+        if (wait_for_tx_done(50)) {
+            intercom_img_frag_tx_done_++;
+        } else {
+            intercom_img_frag_tx_timeouts_++;
+        }
         sent++;
 
         intercom_img_cursor_++;
         if (intercom_img_cursor_ >= intercom_img_total_frags_) {
             intercom_img_cursor_ = 0;
             intercom_img_frames_tx_++;
+            heap_caps_free(intercom_img_buf_);
+            intercom_img_buf_ = nullptr;
+            intercom_img_len_ = 0;
+            intercom_img_total_frags_ = 0;
+            break;
         }
     }
 
@@ -3055,85 +3082,200 @@ void RadioPing::handle_image_start(uint16_t len)
     }
 }
 
+void RadioPing::finalize_intercom_image_rx_session()
+{
+    if (!is_gateway_ || !intercom_img_rx_active_) return;
+    if (!intercom_img_current_complete_) {
+        const uint16_t received = image_xfer_.rx_active()
+                                      ? image_xfer_.rx_received_count()
+                                      : 0U;
+        const uint16_t total = intercom_img_total_frags_;
+        intercom_img_sessions_incomplete_++;
+        if (received < total) {
+            intercom_img_missing_unique_ += static_cast<uint32_t>(total - received);
+        }
+    }
+}
+
+void RadioPing::log_intercom_image_stats(bool final)
+{
+    if (!intercom_active_ && !final) return;
+    if (!is_gateway_) {
+        ESP_LOGI(TAG,
+                 "[IMG TX] final=%u call=%u frame_session=%u adopted=%lu "
+                 "sent_once=%lu frag_try=%lu tx_done=%lu tx_timeout=%lu "
+                 "deadline_stop=%lu missed_slots=%lu",
+                 final ? 1U : 0U, intercom_session_, intercom_img_session_,
+                 static_cast<unsigned long>(intercom_img_frames_adopted_),
+                 static_cast<unsigned long>(intercom_img_frames_tx_),
+                 static_cast<unsigned long>(intercom_img_frag_tx_attempts_),
+                 static_cast<unsigned long>(intercom_img_frag_tx_done_),
+                 static_cast<unsigned long>(intercom_img_frag_tx_timeouts_),
+                 static_cast<unsigned long>(intercom_probe_deadline_stops_),
+                 static_cast<unsigned long>(intercom_missed_slots_));
+        return;
+    }
+
+    uint16_t partial_received = 0;
+    uint16_t partial_total = 0;
+    if (intercom_img_rx_active_ && !intercom_img_current_complete_) {
+        partial_total = intercom_img_total_frags_;
+        if (image_xfer_.rx_active()) {
+            partial_received = image_xfer_.rx_received_count();
+        }
+    }
+    const uint32_t settled = intercom_img_frames_rx_ +
+                             intercom_img_sessions_incomplete_ +
+                             intercom_img_sessions_unseen_;
+    const uint32_t frame_ok_x10 = settled > 0
+        ? (intercom_img_frames_rx_ * 1000U) / settled
+        : 0U;
+    const uint32_t frag_total_est = intercom_img_frags_rx_ +
+                                    intercom_img_frag_seq_lost_;
+    const uint32_t frag_loss_x10 = frag_total_est > 0
+        ? (intercom_img_frag_seq_lost_ * 1000U) / frag_total_est
+        : 0U;
+    const uint32_t elapsed_ms = smtc_modem_hal_get_time_in_ms() -
+                                intercom_img_rate_ms_;
+    const uint32_t fps_x10 = elapsed_ms > 0
+        ? (intercom_img_frames_rx_ * 10000U) / elapsed_ms
+        : 0U;
+
+    ESP_LOGI(TAG,
+             "[IMG RX] final=%u call=%u current=%u seen=%lu unseen=%lu complete=%lu "
+             "incomplete=%lu partial=%u/%u frame_ok=%lu.%01lu%% fps=%lu.%01lu | "
+             "frag_valid=%lu unique=%lu dup=%lu seq_lost_min=%lu "
+             "loss_min=%lu.%01lu%% missing_unique=%lu crc=%lu malformed=%lu "
+             "alloc_fail=%lu reasm_fail=%lu",
+             final ? 1U : 0U, intercom_session_, intercom_img_rx_session_,
+             static_cast<unsigned long>(intercom_img_sessions_seen_),
+             static_cast<unsigned long>(intercom_img_sessions_unseen_),
+             static_cast<unsigned long>(intercom_img_frames_rx_),
+             static_cast<unsigned long>(intercom_img_sessions_incomplete_),
+             static_cast<unsigned>(partial_received),
+             static_cast<unsigned>(partial_total),
+             static_cast<unsigned long>(frame_ok_x10 / 10U),
+             static_cast<unsigned long>(frame_ok_x10 % 10U),
+             static_cast<unsigned long>(fps_x10 / 10U),
+             static_cast<unsigned long>(fps_x10 % 10U),
+             static_cast<unsigned long>(intercom_img_frags_rx_),
+             static_cast<unsigned long>(intercom_img_frags_unique_),
+             static_cast<unsigned long>(intercom_img_frags_duplicate_),
+             static_cast<unsigned long>(intercom_img_frag_seq_lost_),
+             static_cast<unsigned long>(frag_loss_x10 / 10U),
+             static_cast<unsigned long>(frag_loss_x10 % 10U),
+             static_cast<unsigned long>(intercom_img_missing_unique_),
+             static_cast<unsigned long>(intercom_img_crc_errors_),
+             static_cast<unsigned long>(intercom_img_malformed_),
+             static_cast<unsigned long>(intercom_img_alloc_failures_),
+             static_cast<unsigned long>(intercom_img_reassemble_failures_));
+}
+
 void RadioPing::handle_intercom_image_data(uint16_t len)
 {
-    // Gateway, during a live call: ImageData piggybacked on the node uplink. No
-    // ImageCmd/ImageStart handshake ran (it would ACK + schedule_rx and desync
-    // the 20ms TDD), so self-open reassembly from the packet's own session+total
-    // and just COUNT complete frames — no decode, no LCD (user's Stage-3 choice).
-    uint16_t session_id = get_u16_le(&rx_buf_[6]);
-    uint16_t frag_index = get_u16_le(&rx_buf_[8]);
-    uint16_t total_frags = get_u16_le(&rx_buf_[10]);
-    uint16_t frag_len = get_u16_le(&rx_buf_[12]);
+    const uint16_t session_id = get_u16_le(&rx_buf_[6]);
+    const uint16_t frag_index = get_u16_le(&rx_buf_[8]);
+    const uint16_t total_frags = get_u16_le(&rx_buf_[10]);
+    const uint16_t frag_len = get_u16_le(&rx_buf_[12]);
 
     if (total_frags == 0 || frag_index >= total_frags ||
         frag_len > APP_IMAGE_FRAGMENT_DATA_SIZE ||
         len < static_cast<uint16_t>(kHeaderSize + frag_len + 2)) {
+        intercom_img_malformed_++;
         return;
     }
-    uint16_t rx_crc = get_u16_le(&rx_buf_[kHeaderSize + frag_len]);
-    uint16_t calc_crc = crc16_ccitt(&rx_buf_[4], kHeaderSize - 4 + frag_len);
+    const uint16_t rx_crc = get_u16_le(&rx_buf_[kHeaderSize + frag_len]);
+    const uint16_t calc_crc = crc16_ccitt(&rx_buf_[4], kHeaderSize - 4 + frag_len);
     if (rx_crc != calc_crc) {
+        intercom_img_crc_errors_++;
         return;
     }
 
-    if (!image_xfer_.rx_active() || image_xfer_.rx_session_id() != session_id ||
-        image_xfer_.rx_total_count() != total_frags) {
-        image_xfer_.rx_begin(session_id, total_frags);
+    const bool new_session = !intercom_img_rx_active_ ||
+                             intercom_img_rx_session_ != session_id ||
+                             intercom_img_total_frags_ != total_frags;
+    if (new_session) {
+        if (intercom_img_rx_active_) {
+            const uint16_t session_gap = static_cast<uint16_t>(
+                session_id - intercom_img_rx_session_);
+            if (session_gap > 1U && session_gap < 0x8000U) {
+                intercom_img_sessions_unseen_ +=
+                    static_cast<uint32_t>(session_gap - 1U);
+            }
+            if (intercom_img_have_expected_frag_ && intercom_img_total_frags_ > 0) {
+                intercom_img_frag_seq_lost_ +=
+                    static_cast<uint32_t>((intercom_img_total_frags_ -
+                                           intercom_img_expected_frag_) %
+                                          intercom_img_total_frags_);
+            }
+            finalize_intercom_image_rx_session();
+        } else if (session_id > 1U) {
+            // Image sessions start at 1 for every call. A first observed value
+            // above 1 means one or more whole JPEGs were lost before any fragment.
+            intercom_img_sessions_unseen_ += static_cast<uint32_t>(session_id - 1U);
+        }
+        intercom_img_frag_seq_lost_ += frag_index;
+        intercom_img_sessions_seen_++;
+        intercom_img_rx_session_ = session_id;
         intercom_img_total_frags_ = total_frags;
-        intercom_img_rate_ms_ = smtc_modem_hal_get_time_in_ms();
+        intercom_img_rx_active_ = true;
+        intercom_img_current_complete_ = false;
+        intercom_img_rx_frame_start_ms_ = smtc_modem_hal_get_time_in_ms();
+        image_xfer_.rx_begin(session_id, total_frags);
+    } else if (intercom_img_have_expected_frag_) {
+        intercom_img_frag_seq_lost_ += static_cast<uint32_t>(
+            (frag_index + total_frags - intercom_img_expected_frag_) % total_frags);
     }
-
-    bool complete = image_xfer_.rx_fragment(session_id, frag_index, total_frags,
-                                            &rx_buf_[kHeaderSize], frag_len);
+    intercom_img_expected_frag_ = static_cast<uint16_t>((frag_index + 1U) % total_frags);
+    intercom_img_have_expected_frag_ = true;
     intercom_img_frags_rx_++;
 
-    if (complete) {
-#if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
-        // Real slow-refresh: a NEW image session means a new captured frame. Push it
-        // to decode+display exactly once; cyclic duplicates of the SAME session (the
-        // blind-redundancy resend passes) re-report complete but must not re-push.
-        bool is_new_frame =
-            !intercom_img_shown_valid_ || intercom_img_shown_session_ != session_id;
-        if (is_new_frame) {
-            intercom_img_shown_session_ = session_id;
-            intercom_img_shown_valid_ = true;
-            intercom_img_frames_rx_++;
-            if (intercom_img_frame_cb_) {
-                uint8_t *jpeg = nullptr;
-                size_t jpeg_len = 0;
-                if (image_xfer_.rx_reassemble(&jpeg, &jpeg_len) == ESP_OK && jpeg) {
-                    // Callback owns the copy; rx buffers stay intact so later
-                    // duplicate fragments of this session dedup cleanly.
-                    intercom_img_frame_cb_(jpeg, jpeg_len, session_id,
-                                           intercom_img_frame_cb_ctx_);
-                }
-            }
-        }
-        // Do NOT rx_restart here: the next NEW session's first fragment triggers
-        // rx_begin (session-change check above), which frees and re-allocs cleanly.
-#else
-        intercom_img_frames_rx_++;
-        image_xfer_.rx_restart();  // count the next pass without heap thrash
-#endif
-        // Frame-rate log common to both modes. In real mode frames_rx counts DISTINCT
-        // frames (one per new session); in synthetic mode it counts resend passes.
-        uint32_t now = smtc_modem_hal_get_time_in_ms();
-        uint32_t dt = now - intercom_img_rate_ms_;
-        if (dt >= 2000U) {
-            uint32_t fps_x10 = (intercom_img_frames_rx_ * 10000U) / dt;
-            ESP_LOGI(TAG, "intercom image RX: frames=%lu frags=%lu %lu.%01lu fps "
-                          "(%u frags/frame)",
-                     static_cast<unsigned long>(intercom_img_frames_rx_),
-                     static_cast<unsigned long>(intercom_img_frags_rx_),
-                     static_cast<unsigned long>(fps_x10 / 10U),
-                     static_cast<unsigned long>(fps_x10 % 10U),
-                     static_cast<unsigned>(total_frags));
-            intercom_img_frames_rx_ = 0;
-            intercom_img_frags_rx_ = 0;
-            intercom_img_rate_ms_ = now;
+    if (!image_xfer_.rx_active()) {
+        image_xfer_.rx_begin(session_id, total_frags);
+        if (!image_xfer_.rx_active()) {
+            intercom_img_alloc_failures_++;
+            return;
         }
     }
+
+    const uint16_t before = image_xfer_.rx_received_count();
+    const bool complete = image_xfer_.rx_fragment(
+        session_id, frag_index, total_frags, &rx_buf_[kHeaderSize], frag_len);
+    const uint16_t after = image_xfer_.rx_received_count();
+    if (after > before) {
+        intercom_img_frags_unique_++;
+    } else {
+        intercom_img_frags_duplicate_++;
+    }
+
+    if (!complete) return;
+
+#if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
+    if (intercom_img_current_complete_) return;
+    intercom_img_current_complete_ = true;
+    intercom_img_shown_session_ = session_id;
+    intercom_img_shown_valid_ = true;
+    intercom_img_frames_rx_++;
+    if (intercom_img_frame_cb_) {
+        uint8_t *jpeg = nullptr;
+        size_t jpeg_len = 0;
+        const uint32_t reassemble_start_ms = smtc_modem_hal_get_time_in_ms();
+        if (image_xfer_.rx_reassemble(&jpeg, &jpeg_len) == ESP_OK && jpeg) {
+            const uint32_t reassemble_ms = smtc_modem_hal_get_time_in_ms() -
+                                           reassemble_start_ms;
+            const uint32_t transfer_ms = reassemble_start_ms -
+                                          intercom_img_rx_frame_start_ms_;
+            intercom_img_frame_cb_(jpeg, jpeg_len, session_id, total_frags,
+                                    transfer_ms, reassemble_ms,
+                                    intercom_img_frame_cb_ctx_);
+        } else {
+            intercom_img_reassemble_failures_++;
+        }
+    }
+#else
+    intercom_img_frames_rx_++;
+    image_xfer_.rx_restart();
+#endif
 }
 
 void RadioPing::handle_image_data(uint16_t len)

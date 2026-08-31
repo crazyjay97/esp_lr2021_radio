@@ -168,10 +168,15 @@
  * reassembly, decodes and displays it on the existing image page. The cyclic-resend
  * (blind redundancy) engine is unchanged, so a JPEG frame survives air loss without
  * retransmission. No suspend of audio; capture runs below voice_tx/voice_play.
- * Refresh is intentionally slow (~1-2 fps) — correctness before speed. Set to 0 to
- * fall back to the fixed synthetic frame sized by APP_INTERCOM_IMAGE_FRAME_BYTES.
- * When > 0 this supersedes APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS (keep that at 0). */
-#define APP_INTERCOM_IMAGE_REAL_CAPTURE_MS   700U
+ * Refresh rate: this is the delay ADDED AFTER each capture+encode (~185ms), so the
+ * frame period = capture+encode + this value (700ms measured ~885ms period ~1fps).
+ * Reduced 700->200 => period ~385ms ~2.6fps. Tuning path if voice stays clean
+ * (voice_rx/masters diff 1, missed=0, aec_max not spiking): 100 => ~3.5fps,
+ * 50 => ~4.3fps, 0 => ~5fps (ceiling, bound by encode). Keep some delay as AEC
+ * breathing room. Set to 0-as-value falls back to the synthetic frame path — do
+ * NOT use 0 here for max fps; use a small positive value like 20. When > 0 this
+ * supersedes APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS (keep that at 0). */
+#define APP_INTERCOM_IMAGE_REAL_CAPTURE_MS   50U
 /* Keep the end-to-end acoustic loop below unity when two units are nearby.
  * Playback attenuation is applied before both the AEC reference and I2S.
  * Digital loop gain = INPUT_GAIN * PLAYBACK_PERCENT/100. At 1 * 0.50 = 0.50
@@ -375,7 +380,11 @@
 
 /* ----- Image transfer over FLRC ------------------------------------------ */
 
-#define APP_IMAGE_JPEG_QUALITY          30
+/* JPEG quality 1-100. Lower = faster encode + smaller frames (less air time,
+ * less fragments per frame) but coarser. 30 is medium-low; 20 is aggressive
+ * (~33% faster encode, acceptable for surveillance); 15 is floor. Tune if fps
+ * bottlenecked by encode (current ~120ms @ quality 30). */
+#define APP_IMAGE_JPEG_QUALITY          25
 #define APP_IMAGE_FRAGMENT_DATA_SIZE    (APP_FLRC_MAX_PAYLOAD_BYTES - 16U)
 #define APP_IMAGE_TX_INTER_PACKET_US    0U
 #define APP_IMAGE_RX_TIMEOUT_MS         3000U

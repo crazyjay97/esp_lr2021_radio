@@ -78,9 +78,11 @@ public:
     void intercom_image_publish(uint8_t *jpeg, size_t jpeg_len);
     // Gateway-side API: callback invoked once per NEW image frame with a reassembled
     // JPEG copy the callback takes ownership of (must free it). Registered by app_main
-    // to hand the frame to the decode+display queue. Not called for cyclic duplicates.
+    // to hand the frame to the decode+display queue. Called once per image session.
     using IntercomImageFrameCb = void (*)(uint8_t *jpeg, size_t len,
-                                          uint16_t session, void *ctx);
+                                          uint16_t session, uint16_t fragments,
+                                          uint32_t transfer_ms,
+                                          uint32_t reassemble_ms, void *ctx);
     void set_intercom_image_frame_cb(IntercomImageFrameCb cb, void *ctx) {
         intercom_img_frame_cb_ = cb;
         intercom_img_frame_cb_ctx_ = ctx;
@@ -162,6 +164,8 @@ private:
     void prepare_intercom_image();
     void send_intercom_image_burst(uint16_t count);
     void handle_intercom_image_data(uint16_t len);
+    void finalize_intercom_image_rx_session();
+    void log_intercom_image_stats(bool final);
     bool leave_rx_for_tx();
     void handle_rx_packet();
     void dispatch_rx_packet(uint16_t len, int16_t rssi);
@@ -332,10 +336,29 @@ private:
     size_t   intercom_img_len_ = 0;         // node: frame byte length
     uint16_t intercom_img_total_frags_ = 0; // node+gw: fragments per frame
     uint16_t intercom_img_cursor_ = 0;      // node: next fragment index to send
-    uint32_t intercom_img_frames_tx_ = 0;   // node: whole-frame wraps completed
+    uint32_t intercom_img_frames_tx_ = 0;   // node: frames whose fragments were sent once
     uint32_t intercom_img_frames_rx_ = 0;   // gw: complete frames reassembled
     uint32_t intercom_img_frags_rx_ = 0;    // gw: valid fragments accepted
     uint32_t intercom_img_rate_ms_ = 0;     // gw: window origin for frames/s log
+    uint32_t intercom_img_frames_adopted_ = 0;
+    uint32_t intercom_img_frag_tx_attempts_ = 0;
+    uint32_t intercom_img_frag_tx_done_ = 0;
+    uint32_t intercom_img_frag_tx_timeouts_ = 0;
+    uint32_t intercom_img_sessions_seen_ = 0;
+    uint32_t intercom_img_sessions_unseen_ = 0;
+    uint32_t intercom_img_sessions_incomplete_ = 0;
+    uint32_t intercom_img_missing_unique_ = 0;
+    uint32_t intercom_img_frags_unique_ = 0;
+    uint32_t intercom_img_frags_duplicate_ = 0;
+    uint32_t intercom_img_frag_seq_lost_ = 0;
+    uint32_t intercom_img_crc_errors_ = 0;
+    uint32_t intercom_img_malformed_ = 0;
+    uint32_t intercom_img_alloc_failures_ = 0;
+    uint32_t intercom_img_reassemble_failures_ = 0;
+    uint32_t intercom_img_rx_frame_start_ms_ = 0;
+    uint16_t intercom_img_expected_frag_ = 0;
+    bool     intercom_img_have_expected_frag_ = false;
+    bool     intercom_img_current_complete_ = false;
     // Stage-4 real-JPEG slow refresh. A per-FRAME image session id (distinct from
     // the voice intercom_session_ so voice matching is untouched); the node bumps it
     // each time it adopts a fresh captured frame, and the gateway uses a change in it
