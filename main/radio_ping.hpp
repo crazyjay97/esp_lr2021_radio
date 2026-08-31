@@ -72,6 +72,20 @@ public:
     bool set_intercom(bool enable);
     bool intercom_active() const { return intercom_active_ && intercom_start_confirmed_; }
 
+    // Stage-4: node-side API — capture-feed task publishes a freshly encoded JPEG.
+    // Takes ownership of `jpeg` (heap_caps blob) into the pending slot; the radio
+    // task adopts it at the next frame boundary. Thread-safe.
+    void intercom_image_publish(uint8_t *jpeg, size_t jpeg_len);
+    // Gateway-side API: callback invoked once per NEW image frame with a reassembled
+    // JPEG copy the callback takes ownership of (must free it). Registered by app_main
+    // to hand the frame to the decode+display queue. Not called for cyclic duplicates.
+    using IntercomImageFrameCb = void (*)(uint8_t *jpeg, size_t len,
+                                          uint16_t session, void *ctx);
+    void set_intercom_image_frame_cb(IntercomImageFrameCb cb, void *ctx) {
+        intercom_img_frame_cb_ = cb;
+        intercom_img_frame_cb_ctx_ = ctx;
+    }
+
     ImageTransfer &image_xfer() { return image_xfer_; }
     uint32_t last_transfer_ms() const { return image_rx_transfer_ms_; }
     bool image_tx_busy() const { return image_tx_active_; }
@@ -322,6 +336,23 @@ private:
     uint32_t intercom_img_frames_rx_ = 0;   // gw: complete frames reassembled
     uint32_t intercom_img_frags_rx_ = 0;    // gw: valid fragments accepted
     uint32_t intercom_img_rate_ms_ = 0;     // gw: window origin for frames/s log
+    // Stage-4 real-JPEG slow refresh. A per-FRAME image session id (distinct from
+    // the voice intercom_session_ so voice matching is untouched); the node bumps it
+    // each time it adopts a fresh captured frame, and the gateway uses a change in it
+    // to detect a frame boundary (reset reassembly, then decode+display once).
+    uint16_t intercom_img_session_ = 0;     // node: current frame's session id
+    uint16_t intercom_img_rx_session_ = 0;  // gw: session currently being reassembled
+    bool     intercom_img_rx_active_ = false; // gw: reassembly open for a session
+    uint16_t intercom_img_shown_session_ = 0; // gw: last session already pushed to UI
+    bool     intercom_img_shown_valid_ = false;
+    // Node cross-core handoff: the capture-feed task (core1) publishes the newest
+    // encoded JPEG here under intercom_img_lock_; the radio task (core0) adopts it at
+    // a frame boundary. Ownership of the blob transfers to the radio task on adopt.
+    uint8_t *intercom_img_pending_ = nullptr;
+    size_t   intercom_img_pending_len_ = 0;
+    portMUX_TYPE intercom_img_lock_ = portMUX_INITIALIZER_UNLOCKED;
+    IntercomImageFrameCb intercom_img_frame_cb_ = nullptr;
+    void    *intercom_img_frame_cb_ctx_ = nullptr;
     uint32_t intercom_mic_frames_ = 0;
     uint32_t intercom_play_frames_ = 0;
     uint64_t intercom_aec_us_total_ = 0;

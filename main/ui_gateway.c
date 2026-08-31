@@ -1514,7 +1514,10 @@ static void image_present_timer_cb(lv_timer_t *t)
                       : 0;
     s_has_image = true;
 
-    if (!s_stream_mode) return;
+    /* Present when a normal image stream is running OR a live intercom call is
+     * active. In-call frames (Stage-4) reuse this same present path so a live
+     * photo shows up on the image page, covering the intercom status page. */
+    if (!s_stream_mode && !s_intercom_active) return;
 
     bool page_changed = false;
     if (s_page != UI_PAGE_IMAGE || !s_img_canvas) {

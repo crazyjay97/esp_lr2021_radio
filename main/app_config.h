@@ -159,7 +159,19 @@
  * frames) for audio disruption. This is the gate before feeding real JPEG into
  * the slot-tail burst; set to 0 to disable. The synthetic-frame burst keeps
  * running alongside so the radio load stays realistic during the probe. */
-#define APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS  1000U
+#define APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS  0U
+/* Stage 4 (real JPEG slow-refresh, functionality-first): when > 0 the node, during
+ * a live call, captures + software-encodes a REAL JPEG every N ms and publishes it
+ * to the radio's pending-image slot (double buffer + atomic swap). The radio task
+ * adopts a newly published frame ONLY at a burst frame boundary (cursor wrap), then
+ * bumps a per-frame image session id so the gateway detects the new frame, resets
+ * reassembly, decodes and displays it on the existing image page. The cyclic-resend
+ * (blind redundancy) engine is unchanged, so a JPEG frame survives air loss without
+ * retransmission. No suspend of audio; capture runs below voice_tx/voice_play.
+ * Refresh is intentionally slow (~1-2 fps) — correctness before speed. Set to 0 to
+ * fall back to the fixed synthetic frame sized by APP_INTERCOM_IMAGE_FRAME_BYTES.
+ * When > 0 this supersedes APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS (keep that at 0). */
+#define APP_INTERCOM_IMAGE_REAL_CAPTURE_MS   700U
 /* Keep the end-to-end acoustic loop below unity when two units are nearby.
  * Playback attenuation is applied before both the AEC reference and I2S.
  * Digital loop gain = INPUT_GAIN * PLAYBACK_PERCENT/100. At 1 * 0.50 = 0.50

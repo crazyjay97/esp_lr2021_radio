@@ -329,6 +329,10 @@ void RadioPing::start_intercom_local(uint16_t session)
     intercom_img_frames_rx_ = 0;
     intercom_img_frags_rx_ = 0;
     intercom_img_rate_ms_ = smtc_modem_hal_get_time_in_ms();
+    // Gateway per-frame display de-dup state: clear it so the first frame of THIS
+    // call is always pushed even if a prior call ended on the same session id.
+    intercom_img_shown_valid_ = false;
+    intercom_img_shown_session_ = 0;
     rx_crc_errors_ = 0;
     rx_hdr_errors_ = 0;
     rx_unknown_packets_ = 0;
@@ -1288,8 +1292,13 @@ bool RadioPing::send_intercom_slot(uint8_t flags)
     // ring capture before real image data is wired in. GW-only receives+drops.
     if (ok && intercom_active_ && !is_gateway_ && (flags & kVoiceFlagNodeReply) &&
         (flags & kVoiceFlagStopAck) == 0 && APP_INTERCOM_IMAGE_PROBE > 0) {
-        // Stage 3: real JPEG fragments if a frame is loaded, else Stage-1 dummy.
-        if (APP_INTERCOM_IMAGE_ENABLE && intercom_img_total_frags_ > 0) {
+        // Stage 3/4: enter the image path when a frame is already loaded OR a
+        // freshly captured one is waiting in the pending slot. The pending frame
+        // is adopted inside send_intercom_image_burst at the next frame boundary
+        // (cursor==0), which flips total_frags_ positive — checking only
+        // total_frags_ here would deadlock (never adopt the first frame).
+        if (APP_INTERCOM_IMAGE_ENABLE &&
+            (intercom_img_total_frags_ > 0 || intercom_img_pending_ != nullptr)) {
             send_intercom_image_burst(APP_INTERCOM_IMAGE_PROBE);
         } else {
             send_intercom_probe_burst(APP_INTERCOM_IMAGE_PROBE);
@@ -1410,9 +1419,34 @@ void RadioPing::prepare_intercom_image()
     // path or the camera/LCD. Swap this fill for a real captured JPEG later.
     intercom_img_cursor_ = 0;
     intercom_img_frames_tx_ = 0;
+    intercom_img_session_ = 0;
     if (APP_INTERCOM_IMAGE_ENABLE == 0) {
         return;
     }
+#if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
+    // Stage 4 real slow-refresh: do NOT allocate a synthetic frame. The capture-feed
+    // task publishes real JPEGs and the burst adopts the first one at a frame
+    // boundary (bumping intercom_img_session_). Until then total_frags_ stays 0 and
+    // the burst sends nothing, so voice is untouched while the first frame encodes.
+    // Drop any frame left over from a previous call.
+    if (intercom_img_buf_) {
+        heap_caps_free(intercom_img_buf_);
+        intercom_img_buf_ = nullptr;
+    }
+    uint8_t *stale = nullptr;
+    taskENTER_CRITICAL(&intercom_img_lock_);
+    stale = intercom_img_pending_;
+    intercom_img_pending_ = nullptr;
+    intercom_img_pending_len_ = 0;
+    taskEXIT_CRITICAL(&intercom_img_lock_);
+    if (stale) {
+        heap_caps_free(stale);
+    }
+    intercom_img_len_ = 0;
+    intercom_img_total_frags_ = 0;
+    ESP_LOGI(TAG, "intercom image: real slow-refresh, awaiting first captured frame");
+    return;
+#else
     const size_t want = APP_INTERCOM_IMAGE_FRAME_BYTES;
     if (!intercom_img_buf_ || intercom_img_len_ != want) {
         if (intercom_img_buf_) {
@@ -1446,6 +1480,31 @@ void RadioPing::prepare_intercom_image()
              static_cast<unsigned>(intercom_img_len_),
              static_cast<unsigned>(intercom_img_total_frags_),
              static_cast<unsigned>(APP_INTERCOM_IMAGE_PROBE));
+#endif  // APP_INTERCOM_IMAGE_REAL_CAPTURE_MS
+}
+
+void RadioPing::intercom_image_publish(uint8_t *jpeg, size_t jpeg_len)
+{
+    // core1 capture-feed task -> pending slot. Newest frame wins: if a prior frame
+    // is still pending (radio task has not reached a boundary yet), drop the old one
+    // so we never queue stale frames. Ownership of the accepted blob moves to the
+    // radio task (adopted in send_intercom_image_burst); ownership of a dropped blob
+    // returns to us to free here.
+    if (!jpeg || jpeg_len == 0) {
+        if (jpeg) {
+            heap_caps_free(jpeg);
+        }
+        return;
+    }
+    uint8_t *old = nullptr;
+    taskENTER_CRITICAL(&intercom_img_lock_);
+    old = intercom_img_pending_;
+    intercom_img_pending_ = jpeg;
+    intercom_img_pending_len_ = jpeg_len;
+    taskEXIT_CRITICAL(&intercom_img_lock_);
+    if (old) {
+        heap_caps_free(old);
+    }
 }
 
 void RadioPing::send_intercom_image_burst(uint16_t count)
@@ -1454,6 +1513,33 @@ void RadioPing::send_intercom_image_burst(uint16_t count)
     // one fragment at a time) but the payload is a real ImageData fragment built
     // from the fixed frame, and the cursor rolls across slots + wraps at
     // end-of-frame so successive slots continue the frame instead of restarting.
+#if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
+    // Adopt a newly captured frame ONLY at a frame boundary (cursor == 0) so the
+    // gateway never sees a frame spliced from two sessions. On adopt, the active
+    // buffer becomes the freshest published JPEG and the per-frame image session id
+    // is bumped so the gateway resets reassembly and displays the new frame once.
+    if (intercom_img_cursor_ == 0) {
+        uint8_t *fresh = nullptr;
+        size_t   fresh_len = 0;
+        taskENTER_CRITICAL(&intercom_img_lock_);
+        fresh = intercom_img_pending_;
+        fresh_len = intercom_img_pending_len_;
+        intercom_img_pending_ = nullptr;
+        intercom_img_pending_len_ = 0;
+        taskEXIT_CRITICAL(&intercom_img_lock_);
+        if (fresh) {
+            if (intercom_img_buf_) {
+                heap_caps_free(intercom_img_buf_);
+            }
+            intercom_img_buf_ = fresh;
+            intercom_img_len_ = fresh_len;
+            intercom_img_total_frags_ = static_cast<uint16_t>(
+                (fresh_len + APP_IMAGE_FRAGMENT_DATA_SIZE - 1) /
+                APP_IMAGE_FRAGMENT_DATA_SIZE);
+            intercom_img_session_++;  // new frame boundary marker for the gateway
+        }
+    }
+#endif
     if (count == 0 || !intercom_img_buf_ || intercom_img_total_frags_ == 0) {
         return;
     }
@@ -1483,7 +1569,9 @@ void RadioPing::send_intercom_image_burst(uint16_t count)
     ImageTxRequest req;
     req.jpeg = intercom_img_buf_;
     req.jpeg_len = intercom_img_len_;
-    req.session_id = intercom_session_;
+    // Per-FRAME image session id (not the voice session): the gateway keys frame
+    // boundaries off this. In synthetic mode it stays 0 -> gateway shows one frame.
+    req.session_id = intercom_img_session_;
 
     uint8_t *pkt = tx_buf_;
     uint16_t sent = 0;
@@ -3001,8 +3089,35 @@ void RadioPing::handle_intercom_image_data(uint16_t len)
     intercom_img_frags_rx_++;
 
     if (complete) {
+#if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
+        // Real slow-refresh: a NEW image session means a new captured frame. Push it
+        // to decode+display exactly once; cyclic duplicates of the SAME session (the
+        // blind-redundancy resend passes) re-report complete but must not re-push.
+        bool is_new_frame =
+            !intercom_img_shown_valid_ || intercom_img_shown_session_ != session_id;
+        if (is_new_frame) {
+            intercom_img_shown_session_ = session_id;
+            intercom_img_shown_valid_ = true;
+            intercom_img_frames_rx_++;
+            if (intercom_img_frame_cb_) {
+                uint8_t *jpeg = nullptr;
+                size_t jpeg_len = 0;
+                if (image_xfer_.rx_reassemble(&jpeg, &jpeg_len) == ESP_OK && jpeg) {
+                    // Callback owns the copy; rx buffers stay intact so later
+                    // duplicate fragments of this session dedup cleanly.
+                    intercom_img_frame_cb_(jpeg, jpeg_len, session_id,
+                                           intercom_img_frame_cb_ctx_);
+                }
+            }
+        }
+        // Do NOT rx_restart here: the next NEW session's first fragment triggers
+        // rx_begin (session-change check above), which frees and re-allocs cleanly.
+#else
         intercom_img_frames_rx_++;
         image_xfer_.rx_restart();  // count the next pass without heap thrash
+#endif
+        // Frame-rate log common to both modes. In real mode frames_rx counts DISTINCT
+        // frames (one per new session); in synthetic mode it counts resend passes.
         uint32_t now = smtc_modem_hal_get_time_in_ms();
         uint32_t dt = now - intercom_img_rate_ms_;
         if (dt >= 2000U) {

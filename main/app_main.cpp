@@ -93,6 +93,7 @@ struct GatewayImageFrame {
     uint32_t queued_ms = 0;
     uint16_t session_id = 0;
     uint16_t fragments = 0;
+    bool from_intercom = false;  // Stage-4: in-call frame, bypass stream-active gate
 };
 
 QueueHandle_t g_gateway_image_queue = nullptr;
@@ -659,6 +660,58 @@ static void intercom_capture_probe_task(void *arg)
 }
 #endif
 
+#if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
+// Stage-4 real JPEG slow-refresh (node only). Every APP_INTERCOM_IMAGE_REAL_CAPTURE_MS
+// during a live call, capture + software-encode ONE real JPEG (no audio suspend) and
+// publish it to the radio's pending-image slot. The radio task adopts it at the next
+// burst frame boundary and cycles its fragments through the slot tail (blind
+// redundancy, no retransmission). Runs at the preemptible image priority so AEC/Opus
+// always win. Replaces the discard-only probe when real capture is enabled.
+static void intercom_capture_feed_task(void *arg)
+{
+    (void)arg;
+    uint32_t attempts = 0;
+    uint32_t fails = 0;
+    for (;;) {
+        if (!g_radio.intercom_active()) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+        bool expected_idle = false;
+        if (!g_capture_busy.compare_exchange_strong(expected_idle, true,
+                                                    std::memory_order_acq_rel)) {
+            vTaskDelay(pdMS_TO_TICKS(APP_INTERCOM_IMAGE_REAL_CAPTURE_MS));
+            continue;
+        }
+
+        const uint32_t t0 = static_cast<uint32_t>(esp_log_timestamp());
+        size_t jpeg_len = 0;
+        uint8_t *jpeg = prepare_jpeg_blob(&jpeg_len);  // capture + encode, no suspend
+        const uint32_t dt = static_cast<uint32_t>(esp_log_timestamp()) - t0;
+        g_capture_busy.store(false, std::memory_order_release);
+        attempts++;
+
+        if (jpeg && jpeg_len > 0) {
+            // Ownership transfers to the radio (freed on adopt or replace).
+            g_radio.intercom_image_publish(jpeg, jpeg_len);
+        } else {
+            if (jpeg) heap_caps_free(jpeg);
+            fails++;
+        }
+
+        ESP_LOGI(TAG,
+                 "[IMG FEED] capture+encode=%lums jpeg=%u bytes ok=%d "
+                 "attempts=%lu fails=%lu",
+                 static_cast<unsigned long>(dt),
+                 static_cast<unsigned>(jpeg_len), (jpeg && jpeg_len > 0) ? 1 : 0,
+                 static_cast<unsigned long>(attempts),
+                 static_cast<unsigned long>(fails));
+
+        vTaskDelay(pdMS_TO_TICKS(APP_INTERCOM_IMAGE_REAL_CAPTURE_MS));
+    }
+}
+#endif
+
 void image_capture_task(void *arg)
 {
     auto *ctx = static_cast<ImageCaptureCtx *>(arg);
@@ -968,8 +1021,12 @@ void gateway_image_task(void *arg)
             continue;
         }
 
-        if (g_app_mode != AppMode::radio || !ui_gw_stream_active() ||
-            g_radio.intercom_active()) {
+        // Stage-4: in-call frames (from_intercom) bypass the stream-active and
+        // intercom-active gates so a live-call photo displays on the image page;
+        // normal (non-call) transfers keep the original stricter gate.
+        if (g_app_mode != AppMode::radio ||
+            (!frame.from_intercom &&
+             (!ui_gw_stream_active() || g_radio.intercom_active()))) {
             gateway_image_frame_free(&frame);
             continue;
         }
@@ -1006,7 +1063,8 @@ void gateway_image_task(void *arg)
                     io.outbuf = rgb565;
                     jerr = jpeg_dec_process(decoder, &io);
                     decode_ms = static_cast<uint32_t>(esp_log_timestamp()) - task_start_ms;
-                    if (jerr == JPEG_ERR_OK && ui_gw_stream_active()) {
+                    if (jerr == JPEG_ERR_OK &&
+                        (frame.from_intercom || ui_gw_stream_active())) {
                         const uint32_t compose_start_ms =
                             static_cast<uint32_t>(esp_log_timestamp());
                         ui_gw_rx_complete(reinterpret_cast<const uint16_t *>(rgb565),
@@ -1107,6 +1165,33 @@ void on_image_rx_complete(ImageTransfer *xfer)
         gateway_image_frame_free(&frame);
     }
 }
+
+#if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
+// Stage-4 gateway sink: RadioPing calls this once per NEW in-call image frame with a
+// reassembled JPEG copy it hands ownership of. Wrap it as a from_intercom frame and
+// push to the same decode+display pipeline (image page). The queue push frees it on
+// success; we free it here on any early-out so the copy never leaks.
+void on_intercom_image_frame(uint8_t *jpeg, size_t len, uint16_t session, void *ctx)
+{
+    (void)ctx;
+    if (!jpeg || len == 0) {
+        if (jpeg) heap_caps_free(jpeg);
+        return;
+    }
+    GatewayImageFrame frame = {};
+    frame.jpeg = jpeg;
+    frame.jpeg_len = len;
+    frame.session_id = session;
+    frame.from_intercom = true;
+    frame.transfer_ms = 0;      // no per-frame transfer timing on the piggyback path
+    frame.reassemble_ms = 0;
+    frame.queued_ms = static_cast<uint32_t>(esp_log_timestamp());
+    if (!gateway_image_queue_push(frame)) {
+        ESP_LOGW(TAG, "intercom image queue unavailable: drop session=%u", session);
+        gateway_image_frame_free(&frame);
+    }
+}
+#endif
 
 void camera_capture_task(void *arg)
 {
@@ -1535,6 +1620,11 @@ extern "C" void app_main(void)
             g_radio.set_config_received_cb(on_config_received);
             g_radio.set_low_power_standby_cb(on_low_power_standby);
             g_radio.set_intercom_state_cb(on_intercom_state);
+#if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
+            // Gateway: route in-call reassembled JPEG frames to decode+display.
+            // Harmless on the node (it never fires this callback).
+            g_radio.set_intercom_image_frame_cb(on_intercom_image_frame, nullptr);
+#endif
         }
         if (g_app_mode == AppMode::radio && radio_ok) {
 #if APP_RADIO_TASKS_ENABLE
@@ -1579,6 +1669,16 @@ extern "C" void app_main(void)
                                         APP_IMAGE_TASK_PRIORITY, nullptr,
                                         APP_IMAGE_TASK_CORE) != pdPASS) {
                 ESP_LOGW(TAG, "intercom capture probe task create failed");
+            }
+#endif
+#if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
+            // Stage-4 real JPEG slow-refresh: capture+encode during a live call and
+            // publish to the radio's pending slot. Priority below voice so AEC wins.
+            if (xTaskCreatePinnedToCore(intercom_capture_feed_task, "img_feed",
+                                        APP_IMAGE_TASK_STACK_BYTES, nullptr,
+                                        APP_IMAGE_TASK_PRIORITY, nullptr,
+                                        APP_IMAGE_TASK_CORE) != pdPASS) {
+                ESP_LOGW(TAG, "intercom capture feed task create failed");
             }
 #endif
 
