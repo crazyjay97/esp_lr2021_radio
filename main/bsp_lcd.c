@@ -10,6 +10,7 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/spi_master.h"
+#include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_commands.h"
@@ -30,6 +31,10 @@ static const char *TAG = "bsp_lcd";
 
 /* LR2021 uses SPI2 inside the module; keep the external LCD on SPI3. */
 #define BSP_LCD_SPI_HOST SPI3_HOST
+#define LCD_DMA_CACHE_ALIGNMENT 64U
+#define LCD_PIXEL_DUTY_CYCLE_POS APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS
+#define LCD_PSRAM_STAGE_BUFFER_COUNT 2U
+#define LCD_PSRAM_STAGE_BYTES 1024U
 
 static esp_lcd_panel_io_handle_t s_lcd_io;
 static spi_device_handle_t s_lcd_pixel_spi;
@@ -63,7 +68,11 @@ static bool s_video_path_logged;
 static bool s_split_draw_logged;
 static size_t s_lcd_pixel_max_transfer_bytes;
 static size_t s_lcd_pixel_inflight;
+static uint32_t s_lcd_pixel_dma_error_count;
 static spi_transaction_t s_lcd_pixel_transactions[APP_LCD_SPI_QUEUE_DEPTH];
+static DMA_ATTR uint8_t
+    s_lcd_psram_stage[LCD_PSRAM_STAGE_BUFFER_COUNT][LCD_PSRAM_STAGE_BYTES]
+        __attribute__((aligned(LCD_DMA_CACHE_ALIGNMENT)));
 static lv_obj_t *s_camera_status_label;
 static lv_obj_t *s_camera_canvas;
 static lv_color_t *s_camera_canvas_buf;
@@ -97,6 +106,19 @@ static uint32_t lcd_spi_actual_clock_hz(uint32_t requested_hz,
         APB_CLK_FREQ, requested_hz, duty_cycle_pos);
 #pragma GCC diagnostic pop
     return actual_hz > 0 ? (uint32_t)actual_hz : 0U;
+}
+
+static void *lcd_alloc_internal_dma(size_t bytes)
+{
+    return heap_caps_aligned_alloc(
+        LCD_DMA_CACHE_ALIGNMENT, bytes,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+}
+
+static bool lcd_pixel_needs_staging(const void *color)
+{
+    return esp_ptr_external_ram(color) || !esp_ptr_dma_capable(color) ||
+           (((uintptr_t)color & (LCD_DMA_CACHE_ALIGNMENT - 1U)) != 0U);
 }
 
 static int lcd_gpio_drive_capability(gpio_num_t gpio)
@@ -256,17 +278,126 @@ static void lvgl_tick_cb(void *arg)
     lv_tick_inc(APP_LCD_LVGL_TICK_MS);
 }
 
+static esp_err_t lcd_pixel_take_completed(spi_transaction_t **completed_out,
+                                          TickType_t wait_ticks)
+{
+    spi_transaction_t *completed = NULL;
+    esp_err_t ret = spi_device_get_trans_result(
+        s_lcd_pixel_spi, &completed, wait_ticks);
+
+    /* ESP-IDF returns the completed descriptor together with
+     * ESP_ERR_INVALID_STATE when PSRAM DMA reports RX/TX data loss. The
+     * descriptor has already left the return queue in that case, so its
+     * inflight slot must still be retired before the error is propagated. */
+    if (completed != NULL && s_lcd_pixel_inflight > 0) {
+        s_lcd_pixel_inflight--;
+    }
+
+    if (ret != ESP_OK) {
+        const uint32_t flags = completed ? completed->flags : 0U;
+        const uint32_t error_count = ++s_lcd_pixel_dma_error_count;
+        ESP_LOGE(TAG,
+                 "[LCD-SPI] completion error count=%lu err=%s "
+                 "flags=0x%08lx tx_underflow=%d rx_overflow=%d "
+                 "remaining=%u",
+                 (unsigned long)error_count, esp_err_to_name(ret),
+                 (unsigned long)flags,
+                 (flags & SPI_TRANS_DMA_TX_FAIL) ? 1 : 0,
+                 (flags & SPI_TRANS_DMA_RX_FAIL) ? 1 : 0,
+                 (unsigned)s_lcd_pixel_inflight);
+    }
+
+    if (completed_out) {
+        *completed_out = completed;
+    }
+    return ret;
+}
+
 static esp_err_t lcd_pixel_recycle_completed(void)
 {
+    esp_err_t first_err = ESP_OK;
     while (s_lcd_pixel_inflight > 0) {
         spi_transaction_t *completed = NULL;
-        esp_err_t ret = spi_device_get_trans_result(
-            s_lcd_pixel_spi, &completed, portMAX_DELAY);
+        esp_err_t ret = lcd_pixel_take_completed(
+            &completed, pdMS_TO_TICKS(1000));
+        if (ret != ESP_OK && first_err == ESP_OK) {
+            first_err = ret;
+        }
+
+        /* A timeout or API failure without a returned descriptor means there
+         * is nothing safe to retire in this pass. */
+        if (completed == NULL) {
+            break;
+        }
+    }
+    return first_err;
+}
+
+static esp_err_t lcd_pixel_queue_staged(const uint8_t *color,
+                                        size_t color_size)
+{
+    size_t next_offset = 0;
+
+    for (size_t slot = 0;
+         slot < LCD_PSRAM_STAGE_BUFFER_COUNT && next_offset < color_size;
+         ++slot) {
+        const size_t chunk_size =
+            color_size - next_offset > LCD_PSRAM_STAGE_BYTES
+                ? LCD_PSRAM_STAGE_BYTES
+                : color_size - next_offset;
+        memcpy(s_lcd_psram_stage[slot], color + next_offset, chunk_size);
+
+        spi_transaction_t *trans = &s_lcd_pixel_transactions[slot];
+        memset(trans, 0, sizeof(*trans));
+        trans->length = chunk_size * 8U;
+        trans->tx_buffer = s_lcd_psram_stage[slot];
+        next_offset += chunk_size;
+        trans->user = next_offset == color_size ? (void *)1 : NULL;
+
+        esp_err_t ret = spi_device_queue_trans(
+            s_lcd_pixel_spi, trans, portMAX_DELAY);
         if (ret != ESP_OK) {
             return ret;
         }
-        s_lcd_pixel_inflight--;
+        s_lcd_pixel_inflight++;
     }
+
+    while (next_offset < color_size) {
+        spi_transaction_t *completed = NULL;
+        esp_err_t ret = lcd_pixel_take_completed(&completed, portMAX_DELAY);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        size_t slot = LCD_PSRAM_STAGE_BUFFER_COUNT;
+        for (size_t i = 0; i < LCD_PSRAM_STAGE_BUFFER_COUNT; ++i) {
+            if (completed == &s_lcd_pixel_transactions[i]) {
+                slot = i;
+                break;
+            }
+        }
+        ESP_RETURN_ON_FALSE(slot < LCD_PSRAM_STAGE_BUFFER_COUNT,
+                            ESP_ERR_INVALID_STATE, TAG,
+                            "unexpected staged pixel descriptor");
+        const size_t chunk_size =
+            color_size - next_offset > LCD_PSRAM_STAGE_BYTES
+                ? LCD_PSRAM_STAGE_BYTES
+                : color_size - next_offset;
+        memcpy(s_lcd_psram_stage[slot], color + next_offset, chunk_size);
+
+        memset(completed, 0, sizeof(*completed));
+        completed->length = chunk_size * 8U;
+        completed->tx_buffer = s_lcd_psram_stage[slot];
+        next_offset += chunk_size;
+        completed->user = next_offset == color_size ? (void *)1 : NULL;
+
+        ret = spi_device_queue_trans(
+            s_lcd_pixel_spi, completed, portMAX_DELAY);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        s_lcd_pixel_inflight++;
+    }
+
     return ESP_OK;
 }
 
@@ -278,10 +409,14 @@ static esp_err_t lcd_pixel_tx_color(const void *color, size_t color_size)
                         ESP_ERR_INVALID_STATE, TAG,
                         "pixel max transfer size unavailable");
 
-    const size_t chunk_count =
-        (color_size + s_lcd_pixel_max_transfer_bytes - 1U) /
-        s_lcd_pixel_max_transfer_bytes;
-    ESP_RETURN_ON_FALSE(chunk_count <= APP_LCD_SPI_QUEUE_DEPTH,
+    const bool staged_source = lcd_pixel_needs_staging(color);
+    const size_t chunk_count = staged_source
+                                   ? 0U
+                                   : (color_size +
+                                      s_lcd_pixel_max_transfer_bytes - 1U) /
+                                         s_lcd_pixel_max_transfer_bytes;
+    ESP_RETURN_ON_FALSE(staged_source ||
+                            chunk_count <= APP_LCD_SPI_QUEUE_DEPTH,
                         ESP_ERR_INVALID_SIZE, TAG,
                         "pixel transfer needs %u chunks, queue depth is %u",
                         (unsigned)chunk_count,
@@ -296,27 +431,31 @@ static esp_err_t lcd_pixel_tx_color(const void *color, size_t color_size)
         gpio_ll_set_level(&GPIO, BSP_LCD_SPI_DC_GPIO, 1);
         gpio_ll_output_enable(&GPIO, BSP_LCD_SPI_DC_GPIO);
 
-        const uint8_t *chunk = color;
-        size_t remaining = color_size;
-        for (size_t i = 0; i < chunk_count; ++i) {
-            const size_t chunk_size =
-                remaining > s_lcd_pixel_max_transfer_bytes
-                    ? s_lcd_pixel_max_transfer_bytes
-                    : remaining;
-            spi_transaction_t *trans = &s_lcd_pixel_transactions[i];
-            memset(trans, 0, sizeof(*trans));
-            trans->length = chunk_size * 8U;
-            trans->tx_buffer = chunk;
-            trans->user = (i + 1U == chunk_count) ? (void *)1 : NULL;
+        if (staged_source) {
+            ret = lcd_pixel_queue_staged(color, color_size);
+        } else {
+            const uint8_t *chunk = color;
+            size_t remaining = color_size;
+            for (size_t i = 0; i < chunk_count; ++i) {
+                const size_t chunk_size =
+                    remaining > s_lcd_pixel_max_transfer_bytes
+                        ? s_lcd_pixel_max_transfer_bytes
+                        : remaining;
+                spi_transaction_t *trans = &s_lcd_pixel_transactions[i];
+                memset(trans, 0, sizeof(*trans));
+                trans->length = chunk_size * 8U;
+                trans->tx_buffer = chunk;
+                trans->user = (i + 1U == chunk_count) ? (void *)1 : NULL;
 
-            ret = spi_device_queue_trans(
-                s_lcd_pixel_spi, trans, portMAX_DELAY);
-            if (ret != ESP_OK) {
-                break;
+                ret = spi_device_queue_trans(
+                    s_lcd_pixel_spi, trans, portMAX_DELAY);
+                if (ret != ESP_OK) {
+                    break;
+                }
+                s_lcd_pixel_inflight++;
+                chunk += chunk_size;
+                remaining -= chunk_size;
             }
-            s_lcd_pixel_inflight++;
-            chunk += chunk_size;
-            remaining -= chunk_size;
         }
     }
 
@@ -387,7 +526,7 @@ static esp_err_t lcd_draw_rgb565_bitmap(uint32_t x0, uint32_t y0,
                  (unsigned long)(x1 - x0), (unsigned long)(y1 - y0),
                  (unsigned)color_bytes, (unsigned)APP_LCD_SPI_CMD_PCLK_HZ,
                  (unsigned)APP_LCD_SPI_PCLK_HZ,
-                 (unsigned)APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS);
+                 (unsigned)LCD_PIXEL_DUTY_CYCLE_POS);
         s_split_draw_logged = true;
     }
 
@@ -904,7 +1043,7 @@ esp_err_t bsp_lcd_init(void)
 
     const spi_device_interface_config_t pixel_dev_cfg = {
         .mode = 0,
-        .duty_cycle_pos = APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS,
+        .duty_cycle_pos = LCD_PIXEL_DUTY_CYCLE_POS,
         .clock_speed_hz = APP_LCD_SPI_PCLK_HZ,
         .spics_io_num = -1,
         .flags = SPI_DEVICE_HALFDUPLEX,
@@ -955,8 +1094,8 @@ esp_err_t bsp_lcd_init(void)
              (unsigned)APP_LCD_SPI_PCLK_HZ,
              (unsigned)lcd_spi_actual_clock_hz(
                  APP_LCD_SPI_PCLK_HZ,
-                 APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS),
-             (unsigned)APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS,
+                 LCD_PIXEL_DUTY_CYCLE_POS),
+             (unsigned)LCD_PIXEL_DUTY_CYCLE_POS,
              (unsigned)APB_CLK_FREQ,
              (unsigned)APP_LCD_SPI_QUEUE_DEPTH,
              (unsigned)max_transfer_bytes, (unsigned)full_frame_bytes,
@@ -967,8 +1106,14 @@ esp_err_t bsp_lcd_init(void)
              "CS=GPIO%d manual hold until pixel ISR",
              (unsigned)APP_LCD_SPI_CMD_PCLK_HZ,
              (unsigned)APP_LCD_SPI_PCLK_HZ,
-             (unsigned)APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS,
+             (unsigned)LCD_PIXEL_DUTY_CYCLE_POS,
              BSP_LCD_SPI_CS_GPIO);
+    ESP_LOGI(TAG,
+             "[LCD-SPI] PSRAM TX staging: buffers=%u bytes_each=%u "
+             "alignment=%u internal_dma=1",
+             (unsigned)LCD_PSRAM_STAGE_BUFFER_COUNT,
+             (unsigned)LCD_PSRAM_STAGE_BYTES,
+             (unsigned)LCD_DMA_CACHE_ALIGNMENT);
     ESP_LOGI(TAG,
              "[LCD-SPI] drive_cap SCLK=%d MOSI=%d CS=%d DC=%d "
              "(0=weakest,3=strongest,-1=read_failed)",
@@ -1104,11 +1249,16 @@ esp_err_t bsp_lcd_show_test_pattern(void)
 
     const size_t rows = APP_LCD_TEST_PATTERN_ROWS;
     const size_t pixels = APP_LCD_H_RES * rows;
-    uint16_t *line = heap_caps_malloc(pixels * sizeof(uint16_t),
-                                      MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    uint16_t *line = lcd_alloc_internal_dma(pixels * sizeof(uint16_t));
     if (!line) {
         return ESP_ERR_NO_MEM;
     }
+    ESP_LOGI(TAG,
+             "[LCD-DIAG] pattern buffer addr=%p bytes=%u aligned64=%d "
+             "internal_dma=%d",
+             (void *)line, (unsigned)(pixels * sizeof(uint16_t)),
+             (((uintptr_t)line & (LCD_DMA_CACHE_ALIGNMENT - 1U)) == 0U) ? 1 : 0,
+             esp_ptr_dma_capable(line) ? 1 : 0);
 
     static const uint16_t colors[] = {
         0xf800, 0x07e0, 0x001f, 0xffe0, 0x07ff, 0xf81f, 0xffff, 0x0000,
@@ -1164,16 +1314,13 @@ esp_err_t bsp_lcd_start_lvgl_demo(void)
     lv_init();
 
     const size_t pixels = APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS;
-    lv_color_t *buf1 = heap_caps_malloc(pixels * sizeof(lv_color_t),
-                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    lv_color_t *buf2 = heap_caps_malloc(pixels * sizeof(lv_color_t),
-                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    lv_color_t *buf1 = lcd_alloc_internal_dma(pixels * sizeof(lv_color_t));
+    lv_color_t *buf2 = lcd_alloc_internal_dma(pixels * sizeof(lv_color_t));
     if (!buf1 || !buf2) {
         heap_caps_free(buf1);
         heap_caps_free(buf2);
         return ESP_ERR_NO_MEM;
     }
-
     static lv_disp_draw_buf_t draw_buf;
     lv_disp_draw_buf_init(&draw_buf, buf1, buf2, pixels);
 
@@ -1251,10 +1398,8 @@ esp_err_t bsp_lcd_start_camera_ui(bsp_lcd_capture_cb_t cb, void *user)
     lv_init();
 
     const size_t pixels = APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS;
-    lv_color_t *buf1 = heap_caps_malloc(pixels * sizeof(lv_color_t),
-                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    lv_color_t *buf2 = heap_caps_malloc(pixels * sizeof(lv_color_t),
-                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    lv_color_t *buf1 = lcd_alloc_internal_dma(pixels * sizeof(lv_color_t));
+    lv_color_t *buf2 = lcd_alloc_internal_dma(pixels * sizeof(lv_color_t));
     if (!buf1 || !buf2) {
         heap_caps_free(buf1);
         heap_caps_free(buf2);
@@ -1339,15 +1484,21 @@ esp_err_t bsp_lcd_start_gateway_ui(void)
     lv_init();
 
     const size_t pixels = APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS;
-    lv_color_t *buf1 = heap_caps_malloc(pixels * sizeof(lv_color_t),
-                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    lv_color_t *buf2 = heap_caps_malloc(pixels * sizeof(lv_color_t),
-                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    lv_color_t *buf1 = lcd_alloc_internal_dma(pixels * sizeof(lv_color_t));
+    lv_color_t *buf2 = lcd_alloc_internal_dma(pixels * sizeof(lv_color_t));
     if (!buf1 || !buf2) {
         heap_caps_free(buf1);
         heap_caps_free(buf2);
         return ESP_ERR_NO_MEM;
     }
+
+    ESP_LOGI(TAG,
+             "[LCD-SPI] gateway LVGL DMA buffers bytes_each=%u "
+             "buf1=%p aligned64=%d buf2=%p aligned64=%d",
+             (unsigned)(pixels * sizeof(lv_color_t)), (void *)buf1,
+             (((uintptr_t)buf1 & (LCD_DMA_CACHE_ALIGNMENT - 1U)) == 0U) ? 1 : 0,
+             (void *)buf2,
+             (((uintptr_t)buf2 & (LCD_DMA_CACHE_ALIGNMENT - 1U)) == 0U) ? 1 : 0);
 
     static lv_disp_draw_buf_t draw_buf_gw;
     lv_disp_draw_buf_init(&draw_buf_gw, buf1, buf2, pixels);
@@ -1416,23 +1567,22 @@ esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
     ESP_RETURN_ON_FALSE(width == APP_LCD_H_RES && height == APP_LCD_V_RES,
                         ESP_ERR_INVALID_ARG, TAG, "invalid video frame size");
 
-    const bool dma_capable = esp_ptr_external_ram(rgb565)
-                                 ? esp_ptr_dma_ext_capable(rgb565)
-                                 : esp_ptr_dma_capable(rgb565);
-    ESP_RETURN_ON_FALSE(dma_capable, ESP_ERR_INVALID_ARG, TAG,
-                        "video frame is not DMA capable");
     if (!s_video_path_logged) {
         const bool external = esp_ptr_external_ram(rgb565);
+        const bool staged = lcd_pixel_needs_staging(rgb565);
         const size_t frame_bytes = width * height * sizeof(uint16_t);
-        const size_t chunk_bytes =
-            APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS * sizeof(uint16_t);
+        const size_t chunk_bytes = staged
+                                       ? LCD_PSRAM_STAGE_BYTES
+                                       : APP_LCD_H_RES *
+                                             APP_LCD_LVGL_BUFFER_ROWS *
+                                             sizeof(uint16_t);
         const size_t chunks =
             (frame_bytes + chunk_bytes - 1U) / chunk_bytes;
         ESP_LOGI(TAG,
                  "[LCD-SPI] video_buffer=%s dma=%s addr=%p aligned64=%d "
                  "bytes=%u chunk_bytes=%u chunks=%u",
                  external ? "PSRAM" : "internal",
-                 external ? "PSRAM-direct" : "internal-direct",
+                 staged ? "internal-stage" : "internal-direct",
                  (const void *)rgb565,
                  (((uintptr_t)rgb565 & 63U) == 0U) ? 1 : 0,
                  (unsigned)frame_bytes, (unsigned)chunk_bytes,
@@ -1529,6 +1679,18 @@ esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
                  (unsigned long)pending_on_timeout,
                  (unsigned long)mismatch_on_timeout, recovered ? 1 : 0);
         return ESP_ERR_TIMEOUT;
+    }
+
+    /* The ISR callback reports that the last queued chunk completed, but the
+     * per-transaction result queue is authoritative for PSRAM DMA underflow.
+     * Drain this frame now so a failed chunk is reported to the UI immediately
+     * and cannot poison the next frame's inflight accounting. */
+    esp_err_t transfer_err = lcd_pixel_recycle_completed();
+    if (transfer_err != ESP_OK) {
+        ESP_LOGE(TAG, "[LCD-TRANSITION] video DMA failed seq=%lu: %s",
+                 (unsigned long)frame_sequence,
+                 esp_err_to_name(transfer_err));
+        return transfer_err;
     }
 
     const int64_t resume_us = esp_timer_get_time();

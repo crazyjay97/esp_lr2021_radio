@@ -146,21 +146,33 @@ esp_err_t __wrap_spi_device_polling_transmit(spi_device_handle_t handle,
         return ESP_ERR_NO_MEM;
     }
 
-    spi_transaction_t dma_trans = *trans_desc;
+    /* Preserve the original descriptor for pre/post callbacks that may use
+     * extended fields (e.g., ESP-LCD's lcd_spi_trans_descriptor_t). Only swap
+     * buffer pointers temporarily while holding the mutex. */
+    void *orig_tx_buffer = trans_desc->tx_buffer;
+    void *orig_rx_buffer = trans_desc->rx_buffer;
+    uint32_t orig_flags = trans_desc->flags;
+
     if (has_tx) {
         memcpy(s_polling_dma_tx, trans_desc->tx_buffer, tx_bytes);
-        dma_trans.tx_buffer = s_polling_dma_tx;
+        trans_desc->tx_buffer = s_polling_dma_tx;
     }
     if (has_rx) {
-        dma_trans.rx_buffer = s_polling_dma_rx;
+        trans_desc->rx_buffer = s_polling_dma_rx;
     }
-    dma_trans.flags &= ~SPI_TRANS_DMA_USE_PSRAM;
+    trans_desc->flags &= ~SPI_TRANS_DMA_USE_PSRAM;
 
     const esp_err_t err =
-        __real_spi_device_polling_transmit(handle, &dma_trans);
-    if (err == ESP_OK && has_rx) {
-        memcpy(trans_desc->rx_buffer, s_polling_dma_rx, rx_bytes);
+        __real_spi_device_polling_transmit(handle, trans_desc);
+
+    /* Restore original pointers regardless of success/failure before releasing
+     * the mutex. Copy RX data only if the transfer succeeded. */
+    if (err == ESP_OK && has_rx && orig_rx_buffer) {
+        memcpy(orig_rx_buffer, s_polling_dma_rx, rx_bytes);
     }
+    trans_desc->tx_buffer = orig_tx_buffer;
+    trans_desc->rx_buffer = orig_rx_buffer;
+    trans_desc->flags = orig_flags;
 
     xSemaphoreGive(mutex);
     return err;

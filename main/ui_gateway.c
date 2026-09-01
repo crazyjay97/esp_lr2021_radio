@@ -1497,10 +1497,6 @@ static void image_present_timer_cb(lv_timer_t *t)
         pending = s_img_canvas_pending_buf;
         s_img_canvas_pending_buf = NULL;
         meta = s_img_pending_meta;
-
-        lv_color_t *old_front = s_img_canvas_buf;
-        s_img_canvas_buf = pending;
-        release_image_canvas_buffer(old_front);
     }
     portEXIT_CRITICAL(&s_img_canvas_mux);
 
@@ -1517,7 +1513,19 @@ static void image_present_timer_cb(lv_timer_t *t)
     /* Present when a normal image stream is running OR a live intercom call is
      * active. In-call frames (Stage-4) reuse this same present path so a live
      * photo shows up on the image page, covering the intercom status page. */
-    if (!s_stream_mode && !s_intercom_active) return;
+    if (!s_stream_mode && !s_intercom_active) {
+        portENTER_CRITICAL(&s_img_canvas_mux);
+        lv_color_t *old_front = s_img_canvas_buf;
+        s_img_canvas_buf = pending;
+        release_image_canvas_buffer(old_front);
+        portEXIT_CRITICAL(&s_img_canvas_mux);
+        if (s_img_canvas) {
+            lv_canvas_set_buffer(s_img_canvas, s_img_canvas_buf, IMG_W, IMG_H,
+                                 LV_IMG_CF_TRUE_COLOR);
+            lv_obj_invalidate(s_img_canvas);
+        }
+        return;
+    }
 
     bool page_changed = false;
     if (s_page != UI_PAGE_IMAGE || !s_img_canvas) {
@@ -1534,14 +1542,22 @@ static void image_present_timer_cb(lv_timer_t *t)
     }
 
     esp_err_t err = bsp_lcd_present_video_frame(
-        (const uint16_t *)s_img_canvas_buf, IMG_W, IMG_H);
+        (const uint16_t *)pending, IMG_W, IMG_H);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "direct video present failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "direct video present failed, keeping last good frame: %s",
+                 esp_err_to_name(err));
+        portENTER_CRITICAL(&s_img_canvas_mux);
+        release_image_canvas_buffer(pending);
+        portEXIT_CRITICAL(&s_img_canvas_mux);
+    } else {
+        portENTER_CRITICAL(&s_img_canvas_mux);
+        lv_color_t *old_front = s_img_canvas_buf;
+        s_img_canvas_buf = pending;
+        release_image_canvas_buffer(old_front);
+        portEXIT_CRITICAL(&s_img_canvas_mux);
         if (s_img_canvas) {
             lv_canvas_set_buffer(s_img_canvas, s_img_canvas_buf, IMG_W, IMG_H,
                                  LV_IMG_CF_TRUE_COLOR);
-            lv_obj_clear_flag(s_img_canvas, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_invalidate(s_img_canvas);
         }
     }
     s_stream_first_shown = true;
