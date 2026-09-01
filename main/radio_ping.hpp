@@ -323,6 +323,12 @@ private:
     uint32_t intercom_probe_rx_ = 0;
     uint32_t intercom_probe_sent_ = 0;
     uint32_t intercom_probe_deadline_stops_ = 0;
+    // Real-JPEG slot-tail timing proof. The target is the next master arrival;
+    // min_slack is sampled after schedule_rx() has synchronously re-armed RX.
+    int64_t intercom_img_rearm_target_us_ = 0;
+    int32_t intercom_img_rearm_min_slack_us_ = 0;
+    bool intercom_img_rearm_slack_valid_ = false;
+    uint32_t intercom_img_rearm_late_ = 0;
     // Stage-3 diagnostic (gateway side): classify why appended image/probe
     // fragments go missing after the node voice reply. Sampled on the 20ms
     // master heartbeat so the numbers surface even when every probe is lost.

@@ -58,6 +58,12 @@ constexpr uint8_t kVoiceFlagStopAck = 0x10;
 constexpr uint8_t kVoiceFlagMask = kVoiceFlagMaster | kVoiceFlagNodeReply |
     kVoiceFlagStart | kVoiceFlagStop | kVoiceFlagStopAck;
 
+// A 510-byte FLRC fragment needs about 1.7 ms on air at 2.6 Mbps, plus the
+// FIFO write, radio command, IRQ handling and task wake-up. Do not start a new
+// fragment unless this complete worst-case budget remains before the existing
+// slot-tail deadline.
+constexpr int64_t kIntercomImageFragmentStartBudgetUs = 3000;
+
 // Continuous-stream fast path. The gateway places the next session in bytes
 // 12..13 of the previous frame's final empty-missing ACK. The node holds that
 // session until the old capture task has released its busy state.
@@ -321,6 +327,10 @@ void RadioPing::start_intercom_local(uint16_t session)
     intercom_probe_rx_ = 0;
     intercom_probe_sent_ = 0;
     intercom_probe_deadline_stops_ = 0;
+    intercom_img_rearm_target_us_ = 0;
+    intercom_img_rearm_min_slack_us_ = 0;
+    intercom_img_rearm_slack_valid_ = false;
+    intercom_img_rearm_late_ = 0;
     intercom_masters_tx_ = 0;
     intercom_voice_rx_ = 0;
     intercom_rearm_after_rx_ = 0;
@@ -1293,6 +1303,7 @@ void RadioPing::service_intercom()
 
 bool RadioPing::send_intercom_slot(uint8_t flags)
 {
+    intercom_img_rearm_target_us_ = 0;
     if (!leave_rx_for_tx()) {
         intercom_missed_slots_++;
         return false;
@@ -1333,6 +1344,23 @@ bool RadioPing::send_intercom_slot(uint8_t flags)
         }
     }
     schedule_rx();
+    if (intercom_img_rearm_target_us_ != 0) {
+        if (mode_ == Mode::rx_pending) {
+            const int32_t slack_us = static_cast<int32_t>(
+                intercom_img_rearm_target_us_ - esp_timer_get_time());
+            if (!intercom_img_rearm_slack_valid_ ||
+                slack_us < intercom_img_rearm_min_slack_us_) {
+                intercom_img_rearm_min_slack_us_ = slack_us;
+                intercom_img_rearm_slack_valid_ = true;
+            }
+            if (slack_us <= 0) {
+                intercom_img_rearm_late_++;
+            }
+        } else {
+            intercom_img_rearm_late_++;
+        }
+        intercom_img_rearm_target_us_ = 0;
+    }
     if (((intercom_tx_slots_ + intercom_missed_slots_) % 100U) == 1U) {
         // drops = tx_queue frames discarded before air (enqueue_voice_frame is
         // silent on drop). If drops tracks rx_lost, the loss is node-side queue
@@ -1525,10 +1553,11 @@ void RadioPing::intercom_image_publish(uint8_t *jpeg, size_t jpeg_len)
 
 void RadioPing::send_intercom_image_burst(uint16_t count)
 {
-    // Same slot-tail discipline as send_intercom_probe_burst (deadline, AEC-yield,
-    // one fragment at a time) but the payload is a real ImageData fragment. The
-    // cursor rolls across slots until every fragment has been attempted exactly
-    // once; the frame is then released instead of wrapping for blind redundancy.
+    // Real ImageData uses a predictive slot-tail deadline and one fragment at a
+    // time. The radio task keeps its normal priority; wait_for_tx_done still
+    // blocks during airtime, so lower-priority CPU0 work can run without delaying
+    // the TX_DONE wake-up or the following RX re-arm. The cursor rolls across
+    // slots until every fragment has been attempted exactly once.
 #if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
     // Adopt the freshest pending JPEG only when no frame is active. A partial frame
     // is always finished before replacement, so sessions can never be spliced.
@@ -1562,9 +1591,11 @@ void RadioPing::send_intercom_image_burst(uint16_t count)
         static_cast<int64_t>(APP_INTERCOM_SLOT_PERIOD_MS) * 1000LL;
     const int64_t deadline_us =
         next_master_us - static_cast<int64_t>(APP_INTERCOM_IMAGE_BURST_GUARD_US);
+    intercom_img_rearm_target_us_ = next_master_us;
 
-    const UBaseType_t saved_prio = uxTaskPriorityGet(nullptr);
-    vTaskPrioritySet(nullptr, APP_INTERCOM_IMAGE_BURST_PRIORITY);
+    // voice_tx/AEC is pinned to CPU1 now. Keep the CPU0 radio task at its normal
+    // priority for the whole burst so CPU0 voice_play cannot delay TX_DONE
+    // handling, cleanup or the RX re-arm before the next master slot.
 
     tx_done_waiter_ = xTaskGetCurrentTaskHandle();
     xTaskNotifyStateClear(nullptr);
@@ -1588,7 +1619,8 @@ void RadioPing::send_intercom_image_burst(uint16_t count)
     uint8_t *pkt = tx_buf_;
     uint16_t sent = 0;
     for (uint16_t i = 0; i < count; i++) {
-        if (esp_timer_get_time() >= deadline_us) {
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us + kIntercomImageFragmentStartBudgetUs >= deadline_us) {
             intercom_probe_deadline_stops_++;
             break;
         }
@@ -1628,8 +1660,6 @@ void RadioPing::send_intercom_image_burst(uint16_t count)
     smtc_modem_hal_unprotect_api_call();
     mode_ = Mode::idle;
     tx_done_waiter_ = nullptr;
-
-    vTaskPrioritySet(nullptr, saved_prio);
 
     intercom_probe_tx_++;       // reuse: bursts issued (denominator for logs)
     intercom_probe_sent_ += sent; // reuse: real fragments actually put on air
@@ -3099,7 +3129,8 @@ void RadioPing::log_intercom_image_stats(bool final)
         ESP_LOGI(TAG,
                  "[IMG TX] final=%u call=%u frame_session=%u adopted=%lu "
                  "sent_once=%lu frag_try=%lu tx_done=%lu tx_timeout=%lu "
-                 "deadline_stop=%lu missed_slots=%lu",
+                 "deadline_stop=%lu rx_rearm_min=%ldus rx_rearm_late=%lu "
+                 "missed_slots=%lu",
                  final ? 1U : 0U, intercom_session_, intercom_img_session_,
                  static_cast<unsigned long>(intercom_img_frames_adopted_),
                  static_cast<unsigned long>(intercom_img_frames_tx_),
@@ -3107,6 +3138,10 @@ void RadioPing::log_intercom_image_stats(bool final)
                  static_cast<unsigned long>(intercom_img_frag_tx_done_),
                  static_cast<unsigned long>(intercom_img_frag_tx_timeouts_),
                  static_cast<unsigned long>(intercom_probe_deadline_stops_),
+                 static_cast<long>(intercom_img_rearm_slack_valid_
+                                       ? intercom_img_rearm_min_slack_us_
+                                       : 0),
+                 static_cast<unsigned long>(intercom_img_rearm_late_),
                  static_cast<unsigned long>(intercom_missed_slots_));
         return;
     }
