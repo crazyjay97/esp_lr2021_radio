@@ -117,8 +117,12 @@ static void *lcd_alloc_internal_dma(size_t bytes)
 
 static bool lcd_pixel_needs_staging(const void *color)
 {
-    return esp_ptr_external_ram(color) || !esp_ptr_dma_capable(color) ||
-           (((uintptr_t)color & (LCD_DMA_CACHE_ALIGNMENT - 1U)) != 0U);
+    const bool aligned =
+        ((uintptr_t)color & (LCD_DMA_CACHE_ALIGNMENT - 1U)) == 0U;
+    if (esp_ptr_external_ram(color)) {
+        return !esp_ptr_dma_ext_capable(color) || !aligned;
+    }
+    return !esp_ptr_dma_capable(color) || !aligned;
 }
 
 static int lcd_gpio_drive_capability(gpio_num_t gpio)
@@ -1109,7 +1113,7 @@ esp_err_t bsp_lcd_init(void)
              (unsigned)LCD_PIXEL_DUTY_CYCLE_POS,
              BSP_LCD_SPI_CS_GPIO);
     ESP_LOGI(TAG,
-             "[LCD-SPI] PSRAM TX staging: buffers=%u bytes_each=%u "
+             "[LCD-SPI] fallback TX staging: buffers=%u bytes_each=%u "
              "alignment=%u internal_dma=1",
              (unsigned)LCD_PSRAM_STAGE_BUFFER_COUNT,
              (unsigned)LCD_PSRAM_STAGE_BYTES,
@@ -1582,7 +1586,8 @@ esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
                  "[LCD-SPI] video_buffer=%s dma=%s addr=%p aligned64=%d "
                  "bytes=%u chunk_bytes=%u chunks=%u",
                  external ? "PSRAM" : "internal",
-                 staged ? "internal-stage" : "internal-direct",
+                 staged ? "internal-stage"
+                        : (external ? "PSRAM-direct" : "internal-direct"),
                  (const void *)rgb565,
                  (((uintptr_t)rgb565 & 63U) == 0U) ? 1 : 0,
                  (unsigned)frame_bytes, (unsigned)chunk_bytes,

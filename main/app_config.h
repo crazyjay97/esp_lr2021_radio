@@ -176,7 +176,7 @@
  * breathing room. Set to 0-as-value falls back to the synthetic frame path — do
  * NOT use 0 here for max fps; use a small positive value like 20. When > 0 this
  * supersedes APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS (keep that at 0). */
-#define APP_INTERCOM_IMAGE_REAL_CAPTURE_MS   100U
+#define APP_INTERCOM_IMAGE_REAL_CAPTURE_MS   200U
 /* Keep the end-to-end acoustic loop below unity when two units are nearby.
  * Playback attenuation is applied before both the AEC reference and I2S.
  * Digital loop gain = INPUT_GAIN * PLAYBACK_PERCENT/100. At 1 * 0.50 = 0.50
