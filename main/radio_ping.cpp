@@ -16,6 +16,7 @@
 
 #include "app_config.h"
 #include "bsp.h"
+#include "spi_psram_dma_wrap.h"
 
 #include "lr20xx_radio_lora.h"
 #include "lr20xx_radio_common.h"
@@ -50,6 +51,8 @@ constexpr uint8_t kPacketTypeVbat = 12;
  * fragments. The gateway counts and drops these. */
 constexpr uint8_t kPacketTypeIntercomProbe = 13;
 constexpr uint16_t kHeaderSize = 14;
+constexpr size_t kRxStreamCapacity = 2048;
+constexpr size_t kRxPacketMalformed = static_cast<size_t>(-1);
 constexpr uint8_t kVoiceFlagMaster = 0x01;
 constexpr uint8_t kVoiceFlagNodeReply = 0x02;
 constexpr uint8_t kVoiceFlagStart = 0x04;
@@ -135,6 +138,62 @@ uint32_t get_u32_le(const uint8_t *p)
            (static_cast<uint32_t>(p[3]) << 24);
 }
 
+size_t rx_packet_size_from_header(const uint8_t *data, size_t available)
+{
+    if (available < kHeaderSize) {
+        return 0;
+    }
+
+    switch (data[4]) {
+    case kPacketTypeVoice: {
+        const uint8_t frame_count = data[12];
+        if (frame_count > APP_FLRC_OPUS_FRAMES_PER_PACKET) {
+            return kRxPacketMalformed;
+        }
+        size_t offset = kHeaderSize;
+        for (uint8_t i = 0; i < frame_count; ++i) {
+            if (offset >= available) {
+                return 0;
+            }
+            const uint8_t opus_len = data[offset++];
+            if (opus_len == 0 || opus_len > APP_OPUS_MAX_PACKET_BYTES ||
+                offset + opus_len > APP_FLRC_VOICE_MAX_PAYLOAD_BYTES) {
+                return kRxPacketMalformed;
+            }
+            if (offset + opus_len > available) {
+                return 0;
+            }
+            offset += opus_len;
+        }
+        return offset;
+    }
+    case kPacketTypeImageData:
+    case kPacketTypeIntercomProbe:
+        // Both paths are padded to one fixed physical FLRC payload.
+        return APP_FLRC_BURST_PAYLOAD_LEN;
+    case kPacketTypeImageNack: {
+        const uint16_t missing_count = get_u16_le(&data[8]);
+        if (missing_count > APP_IMAGE_NACK_MAX_INDICES) {
+            return kRxPacketMalformed;
+        }
+        return kHeaderSize + static_cast<size_t>(missing_count) * 2U;
+    }
+    case kPacketTypeImageStart:
+    case kPacketTypeVbat:
+        return kHeaderSize + 6U;
+    case kPacketTypePing:
+    case kPacketTypeImageCmd:
+    case kPacketTypeImageDone:
+    case kPacketTypeImageEOT:
+    case kPacketTypeConfig:
+    case kPacketTypeConfigAck:
+    case kPacketTypeImageCmdAck:
+        return kHeaderSize;
+    default:
+        return kRxPacketMalformed;
+    }
+}
+
 TickType_t ms_to_ticks_min_1(uint32_t ms)
 {
     TickType_t ticks = pdMS_TO_TICKS(ms);
@@ -169,6 +228,25 @@ uint32_t crc32_ieee(const uint8_t *data, size_t len)
 
 RadioPing *RadioPing::instance_ = nullptr;
 
+esp_err_t RadioPing::init_rx_stream()
+{
+    if (rx_stream_buf_ != nullptr) {
+        rx_stream_size_ = 0;
+        return ESP_OK;
+    }
+    rx_stream_buf_ = static_cast<uint8_t *>(
+        heap_caps_malloc(kRxStreamCapacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (rx_stream_buf_ == nullptr) {
+        ESP_LOGE(TAG, "RX stream PSRAM alloc failed: %u bytes",
+                 static_cast<unsigned>(kRxStreamCapacity));
+        return ESP_ERR_NO_MEM;
+    }
+    rx_stream_size_ = 0;
+    ESP_LOGI(TAG, "RX stream buffer: %u bytes in PSRAM",
+             static_cast<unsigned>(kRxStreamCapacity));
+    return ESP_OK;
+}
+
 esp_err_t RadioPing::init()
 {
     instance_ = this;
@@ -194,6 +272,10 @@ esp_err_t RadioPing::init()
         ESP_LOGE(TAG, "image tx queue alloc failed");
         return ESP_ERR_NO_MEM;
     }
+    err = init_rx_stream();
+    if (err != ESP_OK) {
+        return err;
+    }
 
 #if !APP_RADIO_HW_INIT_ENABLE
     ESP_LOGW(TAG, "LR2021 hardware init disabled for camera isolation");
@@ -203,6 +285,11 @@ esp_err_t RadioPing::init()
     smtc_modem_hal_protect_api_call();
     ral_status_t status = ral_reset(&radio_.ral);
     if (status == RAL_STATUS_OK) status = ral_init(&radio_.ral);
+    if (status == RAL_STATUS_OK &&
+        app_spi_polling_dma_prepare(static_cast<spi_host_device_t>(
+            CONFIG_LR2021_RADIO_SPI_ID)) != ESP_OK) {
+        status = RAL_STATUS_ERROR;
+    }
     if (status == RAL_STATUS_OK) {
         status = ral_set_rx_tx_fallback_mode(&radio_.ral, RAL_FALLBACK_STDBY_XOSC);
     }
@@ -250,6 +337,10 @@ esp_err_t RadioPing::init_gateway()
         ESP_LOGE(TAG, "tx queue alloc failed");
         return ESP_ERR_NO_MEM;
     }
+    err = init_rx_stream();
+    if (err != ESP_OK) {
+        return err;
+    }
 
 #if !APP_RADIO_HW_INIT_ENABLE
     ESP_LOGW(TAG, "LR2021 hardware init disabled");
@@ -259,6 +350,11 @@ esp_err_t RadioPing::init_gateway()
     smtc_modem_hal_protect_api_call();
     ral_status_t status = ral_reset(&radio_.ral);
     if (status == RAL_STATUS_OK) status = ral_init(&radio_.ral);
+    if (status == RAL_STATUS_OK &&
+        app_spi_polling_dma_prepare(static_cast<spi_host_device_t>(
+            CONFIG_LR2021_RADIO_SPI_ID)) != ESP_OK) {
+        status = RAL_STATUS_ERROR;
+    }
     if (status == RAL_STATUS_OK) {
         status = ral_set_rx_tx_fallback_mode(&radio_.ral, RAL_FALLBACK_STDBY_XOSC);
     }
@@ -614,6 +710,7 @@ void RadioPing::suspend()
     tx_burst_active_ = false;
     tx_flush_pending_ = false;
     irq_pending_ = false;
+    rx_stream_size_ = 0;
 
     if (tx_queue_ != nullptr) {
         xQueueReset(tx_queue_);
@@ -642,6 +739,7 @@ void RadioPing::resume()
     smtc_modem_hal_unprotect_api_call();
 
     mode_ = Mode::idle;
+    rx_stream_size_ = 0;
     suspended_ = false;
     ESP_LOGI(TAG, "radio resumed");
 }
@@ -1118,6 +1216,10 @@ void RadioPing::schedule_rx()
 {
     if (mode_ != Mode::idle) return;
 
+    // set_rx starts a new hardware receive epoch. Any trailing software bytes
+    // belonged to the FIFO epoch that standby/timeout just ended.
+    rx_stream_size_ = 0;
+
     // The gateway is RX-only and must listen with NO gaps: a node's
     // self-initiated (PIR) image push arrives unannounced, and the 100ms
     // timeout+re-arm cycle leaves a set_standby/set_rx blind spot the push can
@@ -1204,6 +1306,7 @@ bool RadioPing::leave_rx_for_tx()
     smtc_modem_hal_unprotect_api_call();
     irq_pending_ = false;
     cad_pending_ms_ = 0;
+    rx_stream_size_ = 0;
     mode_ = Mode::idle;
     return status == RAL_STATUS_OK;
 }
@@ -1812,46 +1915,127 @@ void RadioPing::capture_voice_packet()
 
 void RadioPing::handle_rx_packet()
 {
-    // Drain the RX FIFO fully on each RX_DONE. This is essential for the FLRC
-    // burst image stream: at 2.6 Mbps a 511B fragment lands every ~2ms, faster
-    // than the poll loop can service one interrupt, so multiple fragments pile
-    // up in the 1024B RX FIFO before we get here. irq_pending_ is a bool, so N
-    // back-to-back RX_DONEs collapse into a single poll_once pass; reading by
-    // FIFO level until it drains keeps the read pointer aligned on boundaries.
-    for (int drained = 0; ; drained++) {
-        uint16_t level = 0;
+    if (rx_stream_buf_ == nullptr) {
+        ESP_LOGE(TAG, "RX stream buffer unavailable");
+        return;
+    }
+
+    // RX FIFO level is a byte count, not a packet length. Back-to-back RX_DONE
+    // events may collapse into one task wake-up, leaving several complete
+    // packets plus part of the next packet in the 1024-byte FIFO. Preserve that
+    // byte stream in PSRAM and restore boundaries from the application header.
+    uint16_t level = 0;
+    smtc_modem_hal_protect_api_call();
+    ral_status_t status = static_cast<ral_status_t>(
+        lr20xx_radio_fifo_get_rx_level(radio_.ral.context, &level));
+    smtc_modem_hal_unprotect_api_call();
+    if (status != RAL_STATUS_OK) {
+        ESP_LOGW(TAG, "RX FIFO level failed: %d", status);
+        return;
+    }
+    if (level == 0) {
+        return;
+    }
+
+    process_rx_stream(rx_stream_rssi_);
+    if (static_cast<size_t>(level) > kRxStreamCapacity - rx_stream_size_) {
+        ESP_LOGW(TAG, "RX stream overflow reset: buffered=%u fifo=%u",
+                 static_cast<unsigned>(rx_stream_size_), level);
+        rx_stream_size_ = 0;
+    }
+    if (static_cast<size_t>(level) > kRxStreamCapacity) {
+        ESP_LOGE(TAG, "RX FIFO level exceeds stream capacity: %u", level);
+        return;
+    }
+
+    uint16_t remaining = level;
+    while (remaining > 0) {
+        const uint16_t take = remaining > APP_FLRC_MAX_PAYLOAD_BYTES
+                                  ? APP_FLRC_MAX_PAYLOAD_BYTES : remaining;
         smtc_modem_hal_protect_api_call();
-        ral_status_t level_status = static_cast<ral_status_t>(
-            lr20xx_radio_fifo_get_rx_level(radio_.ral.context, &level));
+        status = static_cast<ral_status_t>(lr20xx_radio_fifo_read_rx(
+            radio_.ral.context, rx_stream_buf_ + rx_stream_size_, take));
         smtc_modem_hal_unprotect_api_call();
-
-        if (level_status != RAL_STATUS_OK || level == 0) {
-            break;
-        }
-        // Later iterations with a sub-fragment level mean the next fragment is
-        // still arriving. The first iteration may legitimately read a short
-        // control packet (or the remaining bytes reported by the FIFO).
-        if (drained > 0 && level < APP_FLRC_MAX_PAYLOAD_BYTES) {
-            break;
-        }
-        uint16_t take = (level >= APP_FLRC_MAX_PAYLOAD_BYTES)
-                            ? APP_FLRC_MAX_PAYLOAD_BYTES : level;
-        ral_flrc_rx_pkt_status_t pkt_status = {};
-
-        smtc_modem_hal_protect_api_call();
-        ral_status_t status = static_cast<ral_status_t>(
-            lr20xx_radio_fifo_read_rx(radio_.ral.context, rx_buf_, take));
-        if (status == RAL_STATUS_OK) {
-            status = ral_get_flrc_rx_pkt_status(&radio_.ral, &pkt_status);
-        }
-        smtc_modem_hal_unprotect_api_call();
-
         if (status != RAL_STATUS_OK) {
-            ESP_LOGW(TAG, "RX read failed: %d", status);
+            ESP_LOGW(TAG, "RX FIFO read failed: %d requested=%u", status, take);
             break;
         }
+        rx_stream_size_ += take;
+        remaining = static_cast<uint16_t>(remaining - take);
+    }
 
-        dispatch_rx_packet(take, pkt_status.rssi_sync_in_dbm);
+    ral_flrc_rx_pkt_status_t pkt_status = {};
+    smtc_modem_hal_protect_api_call();
+    const ral_status_t pkt_status_result =
+        ral_get_flrc_rx_pkt_status(&radio_.ral, &pkt_status);
+    smtc_modem_hal_unprotect_api_call();
+    if (pkt_status_result == RAL_STATUS_OK) {
+        rx_stream_rssi_ = pkt_status.rssi_sync_in_dbm;
+    } else {
+        ESP_LOGW(TAG, "RX packet status failed: %d", pkt_status_result);
+    }
+
+    process_rx_stream(rx_stream_rssi_);
+}
+
+void RadioPing::process_rx_stream(int16_t rssi)
+{
+    while (rx_stream_size_ > 0) {
+        if (rx_stream_size_ < sizeof(kMagic)) {
+            return;
+        }
+
+        if (std::memcmp(rx_stream_buf_, kMagic, sizeof(kMagic)) != 0) {
+            size_t next_magic = 1;
+            while (next_magic + sizeof(kMagic) <= rx_stream_size_ &&
+                   std::memcmp(rx_stream_buf_ + next_magic, kMagic,
+                               sizeof(kMagic)) != 0) {
+                ++next_magic;
+            }
+            if (next_magic + sizeof(kMagic) > rx_stream_size_) {
+                const size_t keep = rx_stream_size_ < sizeof(kMagic) - 1U
+                                        ? rx_stream_size_ : sizeof(kMagic) - 1U;
+                std::memmove(rx_stream_buf_,
+                             rx_stream_buf_ + rx_stream_size_ - keep, keep);
+                rx_stream_size_ = keep;
+            } else {
+                std::memmove(rx_stream_buf_, rx_stream_buf_ + next_magic,
+                             rx_stream_size_ - next_magic);
+                rx_stream_size_ -= next_magic;
+            }
+            rx_unknown_packets_++;
+            if ((rx_unknown_packets_ % 50U) == 1U) {
+                ESP_LOGW(TAG, "RX stream resync count=%lu buffered=%u",
+                         static_cast<unsigned long>(rx_unknown_packets_),
+                         static_cast<unsigned>(rx_stream_size_));
+            }
+            continue;
+        }
+
+        const size_t packet_size =
+            rx_packet_size_from_header(rx_stream_buf_, rx_stream_size_);
+        if (packet_size == 0) {
+            return;
+        }
+        if (packet_size == kRxPacketMalformed ||
+            packet_size > sizeof(rx_buf_)) {
+            // Drop one byte, then let the magic search above find the next
+            // valid packet boundary. This also recovers from a corrupt header.
+            std::memmove(rx_stream_buf_, rx_stream_buf_ + 1,
+                         rx_stream_size_ - 1U);
+            rx_stream_size_--;
+            rx_unknown_packets_++;
+            continue;
+        }
+        if (rx_stream_size_ < packet_size) {
+            return;
+        }
+
+        std::memcpy(rx_buf_, rx_stream_buf_, packet_size);
+        std::memmove(rx_stream_buf_, rx_stream_buf_ + packet_size,
+                     rx_stream_size_ - packet_size);
+        rx_stream_size_ -= packet_size;
+        dispatch_rx_packet(static_cast<uint16_t>(packet_size), rssi);
     }
 }
 

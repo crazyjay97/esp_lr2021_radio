@@ -4,21 +4,27 @@
 
 #include "driver/spi_master.h"
 #include "esp_attr.h"
+#include "esp_log.h"
 #include "esp_memory_utils.h"
+#include "esp_private/spi_common_internal.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "sdkconfig.h"
 
+#include "spi_psram_dma_wrap.h"
+
 #define SPI_POLLING_DMA_BUFFER_BYTES 1024U
-#define SPI_POLLING_DMA_ALIGNMENT    CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE
+#define SPI_POLLING_DMA_BUFFER_ALIGNMENT CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE
+
+static const char *TAG = "spi_dma_wrap";
 
 /* LR20xx polling transactions originate from stack VLAs. Once ESP-SR AFE is
  * resident, allocating two temporary internal DMA buffers for every large
  * packet can fail. Reserve one aligned pair at link time and serialize users. */
 static DMA_ATTR uint8_t s_polling_dma_tx[SPI_POLLING_DMA_BUFFER_BYTES]
-    __attribute__((aligned(SPI_POLLING_DMA_ALIGNMENT)));
+    __attribute__((aligned(SPI_POLLING_DMA_BUFFER_ALIGNMENT)));
 static DMA_ATTR uint8_t s_polling_dma_rx[SPI_POLLING_DMA_BUFFER_BYTES]
-    __attribute__((aligned(SPI_POLLING_DMA_ALIGNMENT)));
+    __attribute__((aligned(SPI_POLLING_DMA_BUFFER_ALIGNMENT)));
 static StaticSemaphore_t s_polling_dma_mutex_storage;
 static SemaphoreHandle_t s_polling_dma_mutex;
 static portMUX_TYPE s_polling_dma_init_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -34,6 +40,56 @@ static SemaphoreHandle_t polling_dma_mutex(void)
         portEXIT_CRITICAL(&s_polling_dma_init_lock);
     }
     return s_polling_dma_mutex;
+}
+
+esp_err_t app_spi_polling_dma_prepare(spi_host_device_t host_id)
+{
+#if SOC_GDMA_SUPPORTED
+    /* IDF enables a 32-byte AHB data burst for both SPI GDMA directions. On
+     * ESP32-S3 the RX burst makes every RX byte count require 4-byte alignment.
+     * Disable data burst only on this host's RX channel, then refresh the
+     * alignment cached by spi_master. TX burst remains enabled. */
+    const spi_dma_ctx_t *const_ctx = spi_bus_get_dma_ctx(host_id);
+    if (const_ctx == NULL || const_ctx->rx_dma_chan == NULL) {
+        ESP_LOGE(TAG, "SPI%d RX DMA context unavailable", (int)host_id + 1);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    gdma_transfer_config_t transfer_cfg = {
+        .max_data_burst_size = 0,
+        .access_ext_mem = true,
+    };
+    esp_err_t err = gdma_config_transfer(const_ctx->rx_dma_chan, &transfer_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SPI%d disable RX data burst failed: %s",
+                 (int)host_id + 1, esp_err_to_name(err));
+        return err;
+    }
+
+    size_t int_alignment = 0;
+    size_t ext_alignment = 0;
+    err = gdma_get_alignment_constraints(const_ctx->rx_dma_chan,
+                                         &int_alignment, &ext_alignment);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SPI%d read RX alignment failed: %s",
+                 (int)host_id + 1, esp_err_to_name(err));
+        return err;
+    }
+
+    /* spi_bus_get_dma_ctx() intentionally exposes a const diagnostic view, but
+     * spi_master stores the channel's alignment in this same private context.
+     * Keep this IDF-private compatibility adjustment isolated in one helper. */
+    spi_dma_ctx_t *ctx = (spi_dma_ctx_t *)const_ctx;
+    ctx->dma_align_rx_int = int_alignment;
+    ctx->dma_align_rx_ext = ext_alignment;
+    ESP_LOGI(TAG, "SPI%d RX data burst off, align internal=%u external=%u",
+             (int)host_id + 1, (unsigned)int_alignment,
+             (unsigned)ext_alignment);
+    return ESP_OK;
+#else
+    (void)host_id;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
 }
 
 esp_err_t __real_spi_device_queue_trans(spi_device_handle_t handle,
@@ -80,9 +136,7 @@ esp_err_t __wrap_spi_device_polling_transmit(spi_device_handle_t handle,
     const bool can_use_reserved_dma =
         (has_tx || has_rx) &&
         tx_bytes <= SPI_POLLING_DMA_BUFFER_BYTES &&
-        rx_bytes <= SPI_POLLING_DMA_BUFFER_BYTES &&
-        (!has_tx || (tx_bytes % SPI_POLLING_DMA_ALIGNMENT) == 0U) &&
-        (!has_rx || (rx_bytes % SPI_POLLING_DMA_ALIGNMENT) == 0U);
+        rx_bytes <= SPI_POLLING_DMA_BUFFER_BYTES;
     if (!can_use_reserved_dma) {
         return __real_spi_device_polling_transmit(handle, trans_desc);
     }

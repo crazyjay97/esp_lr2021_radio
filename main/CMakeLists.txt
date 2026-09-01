@@ -28,6 +28,7 @@ idf_component_register(SRCS
                            esp_driver_ledc
                            esp_driver_spi
                            esp_driver_uart
+                           esp_hw_support
                            esp_lcd
                            esp_timer
                            esp_adc

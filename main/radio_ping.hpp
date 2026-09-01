@@ -166,8 +166,10 @@ private:
     void handle_intercom_image_data(uint16_t len);
     void finalize_intercom_image_rx_session();
     void log_intercom_image_stats(bool final);
+    esp_err_t init_rx_stream();
     bool leave_rx_for_tx();
     void handle_rx_packet();
+    void process_rx_stream(int16_t rssi);
     void dispatch_rx_packet(uint16_t len, int16_t rssi);
     bool queue_voice_packet(uint16_t len, int16_t rssi);
     void log_rx(uint16_t seq, uint16_t len, int16_t rssi);
@@ -284,6 +286,9 @@ private:
 
     uint8_t tx_buf_[APP_FLRC_MAX_PAYLOAD_BYTES] = {};
     uint8_t rx_buf_[APP_FLRC_MAX_PAYLOAD_BYTES] = {};
+    uint8_t *rx_stream_buf_ = nullptr;
+    size_t rx_stream_size_ = 0;
+    int16_t rx_stream_rssi_ = 0;
     int16_t tx_pcm_[APP_AUDIO_FRAME_SAMPLES] = {};
     int16_t rx_pcm_[APP_AUDIO_FRAME_SAMPLES] = {};
 

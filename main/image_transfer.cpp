@@ -246,25 +246,14 @@ void ImageTransfer::rx_begin(uint16_t session_id, uint16_t total_fragments)
     rx_reset();
 
     size_t buf_size = static_cast<size_t>(total_fragments) * APP_IMAGE_FRAGMENT_DATA_SIZE;
-    bool using_psram = false;
     rx_buf_ = static_cast<uint8_t *>(
-        heap_caps_calloc(1, buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        heap_caps_calloc(1, buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     rx_frag_lens_ = static_cast<uint16_t *>(
-        heap_caps_calloc(total_fragments, sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        heap_caps_calloc(total_fragments, sizeof(uint16_t),
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     rx_received_map_ = static_cast<bool *>(
-        heap_caps_calloc(total_fragments, sizeof(bool), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-
-    if (!rx_buf_ || !rx_frag_lens_ || !rx_received_map_) {
-        rx_reset();
-        ESP_LOGW(TAG, "rx_begin internal SRAM alloc failed, falling back to PSRAM");
-        using_psram = true;
-        rx_buf_ = static_cast<uint8_t *>(
-            heap_caps_calloc(1, buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        rx_frag_lens_ = static_cast<uint16_t *>(
-            heap_caps_calloc(total_fragments, sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        rx_received_map_ = static_cast<bool *>(
-            heap_caps_calloc(total_fragments, sizeof(bool), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    }
+        heap_caps_calloc(total_fragments, sizeof(bool),
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
     if (!rx_buf_ || !rx_frag_lens_ || !rx_received_map_) {
         ESP_LOGE(TAG, "rx_begin alloc failed for %u fragments", total_fragments);
@@ -277,9 +266,8 @@ void ImageTransfer::rx_begin(uint16_t session_id, uint16_t total_fragments)
     rx_received_ = 0;
     rx_jpeg_size_ = 0;
 
-    ESP_LOGD(TAG, "rx_begin: session=%u total=%u bytes=%u caps=%s",
-             session_id, total_fragments, static_cast<unsigned>(buf_size),
-             using_psram ? "psram" : "internal");
+    ESP_LOGD(TAG, "rx_begin: session=%u total=%u bytes=%u caps=psram",
+             session_id, total_fragments, static_cast<unsigned>(buf_size));
 }
 
 bool ImageTransfer::rx_fragment(uint16_t session_id, uint16_t frag_index,
