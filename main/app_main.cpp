@@ -106,7 +106,8 @@ TaskHandle_t g_gateway_image_task_handle = nullptr;
 // its slot-tail burst while moving the load away from the saturated CPU1.
 constexpr UBaseType_t kIntercomImageTaskPriority = 1;
 constexpr BaseType_t kIntercomImageTaskCore = 0;
-constexpr uint32_t kIntercomImageFramePeriodMs = 100U;
+constexpr uint32_t kIntercomImageFramePeriodMs =
+    APP_INTERCOM_IMAGE_REAL_CAPTURE_MS;
 
 #if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
 constexpr uint32_t kCpuStatsPeriodMs = 5000U;
@@ -783,8 +784,8 @@ static void intercom_capture_probe_task(void *arg)
 #endif
 
 #if APP_INTERCOM_IMAGE_REAL_CAPTURE_MS > 0
-// Stage-4 real JPEG fixed-rate feed (node only). At a fixed 100 ms period during a
-// live call, capture + software-encode ONE real JPEG (no audio suspend) and
+// Stage-4 real JPEG fixed-rate feed (node only). At the configured fixed period
+// during a live call, capture + software-encode ONE real JPEG (no audio suspend) and
 // publish it to the radio's pending-image slot. The radio task sends every fragment
 // once through the slot tail, then releases that JPEG. It runs on CPU0 below both
 // normal radio work and the temporary slot-tail burst priority, so neither radio nor

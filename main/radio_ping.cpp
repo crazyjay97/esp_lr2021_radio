@@ -1316,25 +1316,20 @@ bool RadioPing::send_intercom_slot(uint8_t flags)
                      static_cast<unsigned long>(intercom_missed_slots_));
         }
     }
-    // Stage-1 fusion timing probe: the node appends N dummy padded packets in
-    // the SAME uplink window as its voice reply (image is one-way node->GW, same
-    // direction). This measures whether the append starves voice slots / shallow-
-    // ring capture before real image data is wired in. GW-only receives+drops.
+    // In-call image fusion: the node may append real JPEG fragments in the same
+    // uplink window as its voice reply. Empty image slots stay empty so the radio
+    // can return to RX immediately.
     if (ok && intercom_active_ && !is_gateway_ && (flags & kVoiceFlagNodeReply) &&
         (flags & kVoiceFlagStopAck) == 0 && APP_INTERCOM_IMAGE_PROBE > 0) {
-        // Stage 3/4: enter the image path when a frame is already loaded OR a
-        // freshly captured one is waiting in the pending slot. The pending frame
-        // is adopted inside send_intercom_image_burst when no frame is active,
-        // which flips total_frags_ positive — checking only
-        // total_frags_ here would deadlock (never adopt the first frame).
+        // Stage 3/4: send only real image data. When no JPEG is ready, return to
+        // RX without filling the slot tail with the old diagnostic dummy probe.
+        // A pending frame is adopted inside send_intercom_image_burst.
         if (APP_INTERCOM_IMAGE_ENABLE &&
             (intercom_img_total_frags_ > 0 || intercom_img_pending_ != nullptr)) {
             send_intercom_image_burst(APP_INTERCOM_IMAGE_PROBE);
-        } else {
-            send_intercom_probe_burst(APP_INTERCOM_IMAGE_PROBE);
-        }
-        if ((intercom_probe_tx_ % 250U) == 0U) {
-            log_intercom_image_stats(false);
+            if ((intercom_probe_tx_ % 250U) == 0U) {
+                log_intercom_image_stats(false);
+            }
         }
     }
     schedule_rx();

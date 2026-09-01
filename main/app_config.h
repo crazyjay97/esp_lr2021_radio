@@ -65,7 +65,7 @@
 /* ----- FLRC radio link ------------------------------------------------------- */
 
 /* Center frequency. Confirm the exact channel is legal for the deployment area. */
-#define APP_FLRC_FREQUENCY_HZ           915120000UL
+#define APP_FLRC_FREQUENCY_HZ           923120000UL
 
 /* LR2021 FLRC high-rate mode requested for this project.
  * Informational only: the upgraded driver selects rate and bandwidth together
@@ -176,7 +176,7 @@
  * breathing room. Set to 0-as-value falls back to the synthetic frame path — do
  * NOT use 0 here for max fps; use a small positive value like 20. When > 0 this
  * supersedes APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS (keep that at 0). */
-#define APP_INTERCOM_IMAGE_REAL_CAPTURE_MS   50U
+#define APP_INTERCOM_IMAGE_REAL_CAPTURE_MS   140U
 /* Keep the end-to-end acoustic loop below unity when two units are nearby.
  * Playback attenuation is applied before both the AEC reference and I2S.
  * Digital loop gain = INPUT_GAIN * PLAYBACK_PERCENT/100. At 1 * 0.50 = 0.50
@@ -189,14 +189,11 @@
 #define APP_INTERCOM_AEC_ENABLE         1
 
 /* Official ESP-SR direct full-duplex AEC. The runtime chunk size is bridged
- * to the project's 10 ms audio frames without an AFE worker task.
- * Filter length 2 (was 4): the linear filter's per-frame MAC cost scales with
- * this, so halving it is the single biggest core1 CPU saving before the image
- * path lands. Trade-off: shorter echo-tail coverage (~64 ms vs ~128 ms). The
- * small doorbell enclosure has a short tail so 2 should hold; if call onset
- * howls or steady-state echo returns, raise back to 3-4 (and/or bump
- * APP_AFE_AEC_NLP_LEVEL_STEADY to 1). */
-#define APP_AFE_AEC_FILTER_LENGTH       2U
+ * to the project's 10 ms audio frames without an AFE worker task. Espressif
+ * recommends filter length 4 on ESP32-S3; local tests with shorter filters did
+ * not cancel the echo reliably. Keep 4 as the validated baseline. The runtime
+ * chunk size is not a documented conversion from filter length to milliseconds. */
+#define APP_AFE_AEC_FILTER_LENGTH       4U
 
 /* AEC NLP (non-linear residual-echo suppressor) aggressiveness:
  *   0 = AEC_NLP_LEVEL_NORMAL, 1 = AGGR (ESP-SR default), 2 = VERYAGGR.
@@ -287,30 +284,25 @@
 #define APP_TX_DROP_LOG_EVERY_N         25U
 
 /* Opus decode plus I2S write run here so radio RX can re-arm quickly. */
-#define APP_VOICE_PLAY_TASK_PRIORITY    5
+#define APP_VOICE_PLAY_TASK_PRIORITY    3
 /* Was 32768; cut to 16KB to reclaim internal SRAM under 32KB I-cache. See
  * APP_RADIO_TASK_STACK_BYTES note. STACK-probe logs verify real usage. */
 #define APP_VOICE_PLAY_TASK_STACK_BYTES 16384U
 
-/* Run Opus decode/playback away from direct radio control. */
-#define APP_VOICE_PLAY_TASK_CORE        1
+/* Let CPU0 radio priority preempt Opus decode/playback when TDD work arrives. */
+#define APP_VOICE_PLAY_TASK_CORE        0
 
-/* AEC now runs on CPU1 (see APP_VOICE_TX_TASK_CORE), so it no longer contends
- * with the CPU0 radio TDD. On CPU1 it must sit ABOVE the JPEG encoder
- * (img_cap, APP_IMAGE_TASK_PRIORITY=3) so a 10 ms AEC frame preempts the
- * ~90 ms elastic JPEG encode instead of being starved by it; it stays below
- * voice_play(5) so speaker output/RX re-arm keep priority. */
+/* AEC runs on CPU1 so it cannot delay CPU0 radio TDD work. Playback and the
+ * low-priority image feed run on CPU0; CPU1 is reserved mainly for AEC and
+ * Opus encoding. */
 #define APP_VOICE_TX_TASK_PRIORITY      4
 /* Was 32768; cut to 16KB to reclaim internal SRAM under 32KB I-cache. See
  * APP_RADIO_TASK_STACK_BYTES note. STACK-probe logs verify real usage. */
 #define APP_VOICE_TX_TASK_STACK_BYTES   16384U
 
-/* Move capture/AEC/Opus off CPU0 onto CPU1. On CPU0 the radio TDD (20 ms hard
- * deadline) and a 16 ms worst-case AEC frame were two hard-real-time jobs
- * fighting one core: raising radio starves AEC (howling), raising AEC blocks
- * radio RX re-arm across the master (deaf, superframe stretches to ~35 ms).
- * Splitting them turns that into "hard AEC vs elastic JPEG" on CPU1, which is
- * a tunable trade-off (drop JPEG frames, never voice). */
+/* Keep AEC and direct RAL radio control on separate cores: a long AEC frame
+ * must not delay radio RX re-arm, and radio IRQ handling must not starve AEC.
+ * Playback shares CPU0 at lower priority so the radio can always preempt it. */
 #define APP_VOICE_TX_TASK_CORE          1
 
 /* ----- Audio DSP (noise suppression / voice enhancement) -------------------- */
