@@ -802,16 +802,6 @@ esp_err_t CameraUartStreamer::capture_frame(uint8_t **out_data,
                               out_pixelformat, false);
 }
 
-void CameraUartStreamer::arm_jpeg_snapshot()
-{
-    if (!dvp_ready_) {
-        return;
-    }
-    // One-shot. configure_snapshot_request() only arms when nothing is already
-    // ready or mid-DMA, so re-arming can never discard a frame in flight.
-    configure_snapshot_request(false);
-}
-
 esp_err_t CameraUartStreamer::capture_jpeg_input(uint8_t **out_data,
                                                  size_t *out_len,
                                                  uint32_t *out_width,
@@ -850,18 +840,17 @@ esp_err_t CameraUartStreamer::capture_frame_impl(uint8_t **out_data,
     // The semaphore is only a wake hint. Slot state is authoritative because
     // two snapshot completions may coalesce into one binary semaphore token.
     xQueueReset(capture_sem_);
-    // Never leave continuous prefetch latched on. With it latched, the ISR
-    // routed a frame into a snapshot slot at every DVP frame end, including
-    // throughout the downsample and JPEG encode. Because release_snapshot()
-    // runs before the encode, the slot freed there was always the last one
-    // refilled and therefore always the "newest" one take_ready_snapshot()
-    // picked next -- so the frame actually used was invariably the one DMA'd
-    // while the CPU was hammering PSRAM hardest, and the second slot was
-    // filled and discarded unread every cycle. Arming one-shot instead moves
-    // the kept frame into the idle tail of the feed period; see
-    // arm_jpeg_snapshot(). The DVP keeps running continuously either way,
-    // writing parking buffers when no snapshot is armed.
-    configure_snapshot_request(false);
+    // Keep continuous prefetch latched: the ISR routes every DVP frame end into
+    // a snapshot slot, so a completed frame is essentially always sitting ready
+    // and this function returns without waiting for a VSYNC. One-shot arming was
+    // tried instead, to keep the kept frame out of the encode's PSRAM window,
+    // but the corruption it was working around came from MSPI contention and is
+    // fixed at the source by APP_SP0A39_MCLK_HZ. What one-shot arming does cost
+    // is throughput: arming lands mid-frame, so the frame is discarded and the
+    // next one is awaited, averaging 1.5 sensor frame periods of dead time per
+    // capture on top of the downsample and encode. With the sensor at ~10 fps
+    // that alone caps the feed at 6-7 fps. Prefetching removes that wait.
+    configure_snapshot_request(true);
     if (!prefetched) {
         prefetched = take_ready_snapshot(&lease, xTaskGetTickCount());
     }

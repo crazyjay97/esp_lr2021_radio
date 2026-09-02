@@ -176,7 +176,7 @@
  * breathing room. Set to 0-as-value falls back to the synthetic frame path — do
  * NOT use 0 here for max fps; use a small positive value like 20. When > 0 this
  * supersedes APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS (keep that at 0). */
-#define APP_INTERCOM_IMAGE_REAL_CAPTURE_MS   200U
+#define APP_INTERCOM_IMAGE_REAL_CAPTURE_MS   100U
 /* Keep the end-to-end acoustic loop below unity when two units are nearby.
  * Playback attenuation is applied before both the AEC reference and I2S.
  * Digital loop gain = INPUT_GAIN * PLAYBACK_PERCENT/100. At 1 * 0.50 = 0.50
@@ -458,9 +458,28 @@
 
 #define APP_CAMERA_UART_BAUD            2000000
 
-/* SP0A39 DVP mode with 24 MHz input clock. */
+/* SP0A39 DVP mode. The DVP controller generates XCLK; PCLK follows it, so this
+ * value sets both the sensor frame rate and the rate the CAM FIFO must be
+ * drained at.
+ *
+ * The node shares one MSPI controller between octal PSRAM and the DIO flash,
+ * and the DVP never stops: at 20 MHz a 640x480 UYVY frame is 614400 bytes in
+ * 30.7 ms, i.e. a permanent 20 MB/s PSRAM write stream, of which only one frame
+ * per APP_INTERCOM_IMAGE_REAL_CAPTURE_MS is ever used. Any MSPI stall longer
+ * than the shallow CAM FIFO holds overruns it, and a lost byte shifts the UYVY
+ * phase for the rest of the frame (chroma collapses onto luma: green shadows,
+ * magenta highlights). Video alone survives that; adding the voice path does
+ * not, because the AEC works out of PSRAM ring buffers sample by sample and the
+ * Opus/AEC code misses the 32 KB instruction cache constantly - and every icache
+ * miss is a 32-byte DIO flash fetch that owns MSPI for ~1.6 us.
+ *
+ * 10 MHz halves the camera's own share of the bus and doubles the FIFO drain
+ * margin per byte, so the tolerable stall window doubles. The frame takes 61 ms
+ * instead of 31 ms, which is still far inside the 200 ms feed period, so the
+ * pipeline timing is unaffected. Raising this back to 20 MHz reintroduces the
+ * corruption whenever voice runs. */
 #define APP_CAMERA_COLOR_ENABLE         1
-#define APP_SP0A39_MCLK_HZ              20000000U
+#define APP_SP0A39_MCLK_HZ              10000000U
 #define APP_SP0A39_I2C_ADDR             0x21U
 
 /* LCD_CAM DVP input polarity. Toggle these when the sensor clocks/syncs are

@@ -749,11 +749,6 @@ static uint8_t *prepare_jpeg_blob(size_t *out_len)
         frame, len, width, height, pixfmt, &jpeg, &jpeg_len);
     const uint32_t encode_done_ms = static_cast<uint32_t>(esp_log_timestamp());
     heap_caps_free(frame);
-    // Heavy CPU work is done for this period. Route the next DVP frame into a
-    // snapshot slot now, so the frame this node will actually send is captured
-    // during the idle tail of the feed period instead of competing with the
-    // downsample and the JPEG encode for PSRAM/MSPI bandwidth.
-    g_camera_uart.arm_jpeg_snapshot();
     if (e != ESP_OK || !jpeg) {
         ESP_LOGW(TAG, "[PREFETCH] encode failed: capture=%lums encode=%lums error=%s",
                  static_cast<unsigned long>(capture_done_ms - prepare_start_ms),

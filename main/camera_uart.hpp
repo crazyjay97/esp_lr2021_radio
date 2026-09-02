@@ -17,11 +17,6 @@ public:
                             uint32_t *out_width,
                             uint32_t *out_height,
                             uint32_t *out_pixelformat);
-    // Route the next DVP frame into a snapshot slot. The DVP itself keeps
-    // running either way; this only selects which frame is kept. Call it once
-    // the CPU has finished the heavy downsample/encode work so the frame that
-    // will actually be used is captured while the PSRAM bus is quiet.
-    void arm_jpeg_snapshot();
     // Capture directly into the aligned pixel order required by the JPEG encoder.
     // Caller releases *out_data with heap_caps_free().
     esp_err_t capture_jpeg_input(uint8_t **out_data,
