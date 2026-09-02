@@ -1202,6 +1202,10 @@ static void create_qr_page(void)
 /* ─── Page switch ─── */
 static void show_page(ui_page_t page)
 {
+    /* Rebuilding the body means LVGL has to reach the panel again. This is the
+     * catch-all release point for video ownership; the direct present path
+     * re-takes it right before each frame. */
+    bsp_lcd_set_video_direct_owner(false);
     destroy_body_children();
     s_page = page;
 
@@ -1225,6 +1229,12 @@ static void stream_stop(void)
     s_stream_first_shown = false;
     if (was_streaming && s_rx_abort_cb) {
         s_rx_abort_cb();
+    }
+    /* The panel still holds the last video frame and the caller may not switch
+     * pages, so release ownership here and force one full LVGL redraw. */
+    bsp_lcd_set_video_direct_owner(false);
+    if (was_streaming && s_scr) {
+        lv_obj_invalidate(s_scr);
     }
 }
 
@@ -1357,6 +1367,14 @@ void ui_gw_set_intercom_active(bool active)
              active ? 1 : 0, s_intercom_on ? 1 : 0);
     if (s_page == UI_PAGE_INTERCOM) {
         show_page(UI_PAGE_INTERCOM);
+    } else if (!active) {
+        /* In-call frames are presented straight to the panel from any page.
+         * When the call ends without a page switch, hand the panel back to
+         * LVGL and repaint over the last video frame. */
+        bsp_lcd_set_video_direct_owner(false);
+        if (s_scr) {
+            lv_obj_invalidate(s_scr);
+        }
     }
 
     xSemaphoreGiveRecursive(s_lock);
@@ -1514,6 +1532,8 @@ static void image_present_timer_cb(lv_timer_t *t)
      * active. In-call frames (Stage-4) reuse this same present path so a live
      * photo shows up on the image page, covering the intercom status page. */
     if (!s_stream_mode && !s_intercom_active) {
+        /* Single shot into the LVGL canvas: LVGL owns the panel again. */
+        bsp_lcd_set_video_direct_owner(false);
         portENTER_CRITICAL(&s_img_canvas_mux);
         lv_color_t *old_front = s_img_canvas_buf;
         s_img_canvas_buf = pending;
@@ -1540,6 +1560,13 @@ static void image_present_timer_cb(lv_timer_t *t)
     if (page_changed) {
         lv_refr_now(NULL);
     }
+
+    /* From here the stream covers the whole panel every frame. Keep LVGL off
+     * the LCD until the stream ends, otherwise its full refreshes (also about
+     * 80 ms for 240x320) interleave with the video frames and the panel
+     * alternates between the UI and the picture. show_page() and the canvas
+     * path above hand ownership back. */
+    bsp_lcd_set_video_direct_owner(true);
 
     esp_err_t err = bsp_lcd_present_video_frame(
         (const uint16_t *)pending, IMG_W, IMG_H);

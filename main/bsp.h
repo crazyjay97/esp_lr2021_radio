@@ -53,6 +53,11 @@ SemaphoreHandle_t bsp_lcd_get_lvgl_lock(void);
 esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
                                       uint32_t width,
                                       uint32_t height);
+/* While a video stream owns the whole panel, LVGL redraws are dropped instead
+ * of being sent to the LCD. Every pixel LVGL could draw is overwritten by the
+ * next full-frame present anyway, so letting both write the panel only makes
+ * the two alternate on screen. */
+void bsp_lcd_set_video_direct_owner(bool owns_panel);
 esp_err_t bsp_lcd_set_camera_status(const char *text);
 esp_err_t bsp_lcd_clear_camera_photo(void);
 esp_err_t bsp_lcd_show_gray_photo(const uint8_t *gray,

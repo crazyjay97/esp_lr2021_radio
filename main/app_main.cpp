@@ -6,6 +6,7 @@
 #include "ui_gateway.h"
 #include "wifi_manager.h"
 
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
@@ -1186,7 +1187,17 @@ void gateway_image_task(void *arg)
             if (jerr == JPEG_ERR_OK && outbuf_len > 0) {
                 if (outbuf_len > rgb565_capacity) {
                     if (rgb565) jpeg_free_align(rgb565);
-                    rgb565 = static_cast<uint8_t *>(jpeg_calloc_align(outbuf_len, 16));
+                    /* esp_new_jpeg only asks for 16, but this buffer lives in
+                     * PSRAM next to allocations that other DMA engines write.
+                     * At 16 it shares its first and last cache line with those
+                     * neighbours; an M2C invalidate issued for a neighbour then
+                     * drops the whole line, including this buffer's edge bytes.
+                     * The tail is exactly what rotate_rgb565_to_canvas() maps
+                     * to the leftmost screen column. A 64-byte cache line makes
+                     * that overlap three times wider than the 32-byte one did,
+                     * so align to the cache line and own every line outright. */
+                    rgb565 = static_cast<uint8_t *>(jpeg_calloc_align(
+                        outbuf_len, CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE));
                     rgb565_capacity = rgb565 ? outbuf_len : 0;
                 }
                 if (rgb565) {

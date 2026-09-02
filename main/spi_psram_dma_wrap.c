@@ -16,6 +16,14 @@
 #define SPI_POLLING_DMA_BUFFER_BYTES 1024U
 #define SPI_POLLING_DMA_BUFFER_ALIGNMENT CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE
 
+/* Octal PSRAM device wrap boundary, not the data cache line. See the note in
+ * app_spi_tx_dma_prioritize_psram(). */
+#define SPI_TX_PSRAM_BURST_BYTES 32U
+/* Above the default 0 that gdma_channel_alloc() assigns to every channel, but
+ * one level below the maximum of 5 so audio DMA can still be raised over the
+ * display if it ever needs to. */
+#define SPI_TX_DMA_PRIORITY 4
+
 static const char *TAG = "spi_dma_wrap";
 
 /* LR20xx polling transactions originate from stack VLAs. Once ESP-SR AFE is
@@ -85,6 +93,65 @@ esp_err_t app_spi_polling_dma_prepare(spi_host_device_t host_id)
     ESP_LOGI(TAG, "SPI%d RX data burst off, align internal=%u external=%u",
              (int)host_id + 1, (unsigned)int_alignment,
              (unsigned)ext_alignment);
+    return ESP_OK;
+#else
+    (void)host_id;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+esp_err_t app_spi_tx_dma_prioritize_psram(spi_host_device_t host_id)
+{
+#if SOC_GDMA_SUPPORTED
+    /* A 64-byte data cache line makes every competing refill occupy MSPI twice
+     * as long as it did with 32-byte lines, so the pixel stream loses half of
+     * its arbitration share and the SPI TX FIFO runs dry mid-frame
+     * (SPI_TRANS_DMA_TX_FAIL, "DMA TX underflow detected").
+     *
+     * The fix is arbitration priority, NOT a wider burst. gdma_channel_alloc()
+     * resets every channel to priority 0 (esp_hw_support/dma/gdma.c), so the
+     * LCD stream competes on equal terms with Wi-Fi, I2S audio and the LR20xx
+     * SPI2 channel while it holds the bus for 76.8 ms per frame.
+     *
+     * Do NOT raise max_data_burst_size to the 64-byte cache line here, even
+     * though GDMA_LL_MAX_BURST_SIZE_PSRAM allows it. This board runs Octal
+     * PSRAM whose device-level wrap boundary is 32 bytes (startup prints
+     * "BurstLen: 32 Byte"), which is unrelated to the cache line. A 64-byte
+     * block that straddles that wrap boundary fetches misplaced data, and
+     * because the FIFO never starves it produces occasional colour blocks and
+     * tearing with no DMA error flag set at all. Keep the block size matched
+     * to the device, and win the bus with priority instead. */
+    const spi_dma_ctx_t *const_ctx = spi_bus_get_dma_ctx(host_id);
+    if (const_ctx == NULL || const_ctx->tx_dma_chan == NULL) {
+        ESP_LOGE(TAG, "SPI%d TX DMA context unavailable", (int)host_id + 1);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    gdma_transfer_config_t transfer_cfg = {
+        .max_data_burst_size = SPI_TX_PSRAM_BURST_BYTES,
+        .access_ext_mem = true,
+    };
+    esp_err_t err = gdma_config_transfer(const_ctx->tx_dma_chan, &transfer_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SPI%d set TX burst to %uB failed: %s",
+                 (int)host_id + 1, (unsigned)SPI_TX_PSRAM_BURST_BYTES,
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    err = gdma_set_priority(const_ctx->tx_dma_chan, SPI_TX_DMA_PRIORITY);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SPI%d set TX DMA priority failed: %s",
+                 (int)host_id + 1, esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG,
+             "SPI%d TX PSRAM burst=%uB priority=%d (cache line=%uB, device "
+             "burst governs)",
+             (int)host_id + 1, (unsigned)SPI_TX_PSRAM_BURST_BYTES,
+             SPI_TX_DMA_PRIORITY,
+             (unsigned)CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE);
     return ESP_OK;
 #else
     (void)host_id;

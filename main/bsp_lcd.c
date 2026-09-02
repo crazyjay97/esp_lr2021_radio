@@ -11,6 +11,7 @@
 #include "driver/i2c_master.h"
 #include "driver/spi_master.h"
 #include "esp_attr.h"
+#include "esp_cache.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_commands.h"
@@ -26,6 +27,7 @@
 #include "lvgl.h"
 
 #include "app_config.h"
+#include "spi_psram_dma_wrap.h"
 
 static const char *TAG = "bsp_lcd";
 
@@ -36,6 +38,42 @@ static const char *TAG = "bsp_lcd";
 #define LCD_PSRAM_STAGE_BUFFER_COUNT 2U
 #define LCD_PSRAM_STAGE_BYTES 1024U
 
+/* Diagnostic. Fingerprints the video frame twice per present: once as the CPU
+ * sees it (through the cache, right before submitting), and once straight from
+ * PSRAM after the transfer completes. It answers two questions at once:
+ *
+ *   before != after  ->  what GDMA read was NOT what the CPU wrote. Either the
+ *                        buffer was written during the transfer, or the C2M
+ *                        writeback never reached PSRAM.
+ *   before == after  ->  the buffer was stable and PSRAM held exactly the CPU's
+ *                        data for the whole transfer; anything left is
+ *                        downstream of memory (GDMA fetch or the panel).
+ *
+ * One sample per cache line, so no single bad line can hide. Costs about 5 ms
+ * per call; at the current 200 ms frame period that is free. Set to 0 once the
+ * question is settled. */
+/* Answered on 2026-09-02: 73 consecutive frames, zero mismatches. The canvas is
+ * stable for the whole transfer and PSRAM holds exactly what the CPU wrote, so
+ * everything up to and including memory is correct. Left in place, switched
+ * off, in case a later change needs to re-confirm that. */
+#define LCD_VIDEO_INTEGRITY_CHECK 0
+
+/* Controlled experiment, currently ON.
+ *
+ * The integrity check proved the frame is already correct in PSRAM, so the
+ * remaining corruption has to come from what happens after memory. This routes
+ * PSRAM frames through the internal SRAM staging path: the CPU copies each
+ * chunk into internal DMA RAM and GDMA never touches external memory at all.
+ *
+ *   corruption gone     -> it is the GDMA fetch from PSRAM
+ *   corruption survives -> it is downstream of the fetch (SPI or panel)
+ *
+ * Cost: 1 KB chunks push a frame from 77 ms to about 120 ms. The frame period
+ * is currently ~200 ms, so the frame rate does not change. The staging buffers
+ * are a 2 KB static array that is already linked in, so this does not take any
+ * runtime heap away from AEC (internal free drops to ~6 KB once AEC is up). */
+#define LCD_VIDEO_FORCE_PSRAM_STAGING 1
+
 static esp_lcd_panel_io_handle_t s_lcd_io;
 static spi_device_handle_t s_lcd_pixel_spi;
 static esp_lcd_panel_handle_t s_lcd_panel;
@@ -43,6 +81,7 @@ static bool s_lcd_bus_ready;
 static bool s_lcd_ready;
 static bool s_lvgl_started;
 static bool s_lcd_suspended;
+static volatile bool s_video_direct_owns_panel;
 static i2c_master_dev_handle_t s_touch;
 static uint8_t s_touch_addr;
 static lv_disp_drv_t *s_lvgl_disp_drv;
@@ -120,10 +159,39 @@ static bool lcd_pixel_needs_staging(const void *color)
     const bool aligned =
         ((uintptr_t)color & (LCD_DMA_CACHE_ALIGNMENT - 1U)) == 0U;
     if (esp_ptr_external_ram(color)) {
+        if (LCD_VIDEO_FORCE_PSRAM_STAGING) {
+            return true;
+        }
         return !esp_ptr_dma_ext_capable(color) || !aligned;
     }
     return !esp_ptr_dma_capable(color) || !aligned;
 }
+
+#if LCD_VIDEO_INTEGRITY_CHECK
+/* Split per SPI chunk so a mismatch points at a screen band: segment i covers
+ * canvas rows [i*40, (i+1)*40), which is exactly the i-th 19200-byte transfer.
+ * One sample per cache line, so no single bad line can hide. Reading every
+ * line also means the "after" pass refills the whole buffer from PSRAM once it
+ * has been invalidated. */
+#define LCD_INTEGRITY_SEGMENTS 8
+
+static void lcd_video_fingerprint(const uint16_t *pixels, size_t count,
+                                  uint32_t out[LCD_INTEGRITY_SEGMENTS])
+{
+    const size_t step = LCD_DMA_CACHE_ALIGNMENT / sizeof(uint16_t);
+    const size_t seg_pixels = count / LCD_INTEGRITY_SEGMENTS;
+
+    for (size_t seg = 0; seg < LCD_INTEGRITY_SEGMENTS; ++seg) {
+        const size_t begin = seg * seg_pixels;
+        const size_t end = begin + seg_pixels;
+        uint32_t hash = 2166136261u;
+        for (size_t i = begin; i < end; i += step) {
+            hash = (hash ^ pixels[i]) * 16777619u;
+        }
+        out[seg] = hash;
+    }
+}
+#endif
 
 static int lcd_gpio_drive_capability(gpio_num_t gpio)
 {
@@ -672,7 +740,12 @@ static esp_err_t lvgl_register_flush_ready_cb(lv_disp_drv_t *drv)
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
                           lv_color_t *color_map)
 {
-    if (s_lcd_suspended || !s_lcd_ready) {
+    /* A full-frame video present covers all 240x320 pixels and takes 76.8 ms.
+     * An LVGL full refresh costs about the same, so if both are allowed to
+     * reach the panel they alternate on screen and the picture visibly flips
+     * between the UI and the video every few frames. Drop LVGL output while
+     * the stream owns the panel; the caller redraws once it hands it back. */
+    if (s_lcd_suspended || !s_lcd_ready || s_video_direct_owns_panel) {
         lv_disp_flush_ready(drv);
         return;
     }
@@ -1011,6 +1084,17 @@ esp_err_t bsp_lcd_init(void)
         s_lcd_bus_ready = true;
         ESP_LOGI(TAG, "SPI3 bus initialized: SCLK=%d MOSI=%d",
                  BSP_LCD_SPI_SCLK_GPIO, BSP_LCD_SPI_MOSI_GPIO);
+
+        /* Video frames are read straight out of PSRAM by SPI3 TX GDMA. Give
+         * that channel arbitration priority, otherwise 64-byte cache refills
+         * from the other bus masters starve the pixel stream and it
+         * underflows mid-frame. */
+        esp_err_t dma_err =
+            app_spi_tx_dma_prioritize_psram(BSP_LCD_SPI_HOST);
+        if (dma_err != ESP_OK) {
+            ESP_LOGW(TAG, "SPI3 TX DMA stays at IDF defaults: %s",
+                     esp_err_to_name(dma_err));
+        }
     }
 
     gpio_config_t cs_cfg = {
@@ -1062,6 +1146,32 @@ esp_err_t bsp_lcd_init(void)
         spi_bus_get_max_transaction_len(
             BSP_LCD_SPI_HOST, &s_lcd_pixel_max_transfer_bytes),
         TAG, "pixel max transaction length");
+
+    /* spi_bus_get_max_transaction_len() does not report the size configured
+     * above. spicommon_dma_desc_alloc() rounds max_transfer_sz up to a whole
+     * number of DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED (4092) descriptors,
+     * so 19200 comes back as 5 * 4092 = 20460.
+     *
+     * A PSRAM frame is split on that value, and 20460 is not a multiple of the
+     * data cache line: every chunk after the first then starts 44 bytes into a
+     * cache line. With 32-byte lines the GDMA block was 32 bytes and the AHB
+     * GDMA v1 auto-alignment absorbed the smaller offset; at 64 bytes the block
+     * and the misalignment both grow and the chunk boundaries no longer land
+     * where the hardware realigns.
+     *
+     * Clamp back to the configured 19200 (exactly 40 lines, 64 * 300) and mask
+     * to the cache line so the split stays aligned for any cache
+     * configuration. The frame then divides evenly into 8 chunks. */
+    const size_t configured_transfer_bytes =
+        APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS * sizeof(uint16_t);
+    if (s_lcd_pixel_max_transfer_bytes > configured_transfer_bytes) {
+        s_lcd_pixel_max_transfer_bytes = configured_transfer_bytes;
+    }
+    s_lcd_pixel_max_transfer_bytes &=
+        ~(size_t)(LCD_DMA_CACHE_ALIGNMENT - 1U);
+    ESP_RETURN_ON_FALSE(s_lcd_pixel_max_transfer_bytes > 0,
+                        ESP_ERR_INVALID_SIZE, TAG,
+                        "pixel transfer size collapsed after alignment");
     s_lcd_pixel_inflight = 0;
 
     ESP_RETURN_ON_ERROR(
@@ -1081,8 +1191,7 @@ esp_err_t bsp_lcd_init(void)
                                   (gpio_drive_cap_t)APP_LCD_SPI_DC_DRIVE_CAP),
         TAG, "lcd dc drive capability");
 
-    const size_t max_transfer_bytes =
-        APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS * sizeof(uint16_t);
+    const size_t max_transfer_bytes = s_lcd_pixel_max_transfer_bytes;
     const size_t full_frame_bytes =
         APP_LCD_H_RES * APP_LCD_V_RES * sizeof(uint16_t);
     const size_t full_frame_chunks =
@@ -1562,6 +1671,11 @@ SemaphoreHandle_t bsp_lcd_get_lvgl_lock(void)
     return s_lvgl_lock;
 }
 
+void bsp_lcd_set_video_direct_owner(bool owns_panel)
+{
+    s_video_direct_owns_panel = owns_panel;
+}
+
 esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
                                       uint32_t width,
                                       uint32_t height)
@@ -1575,23 +1689,21 @@ esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
         const bool external = esp_ptr_external_ram(rgb565);
         const bool staged = lcd_pixel_needs_staging(rgb565);
         const size_t frame_bytes = width * height * sizeof(uint16_t);
-        const size_t chunk_bytes = staged
-                                       ? LCD_PSRAM_STAGE_BYTES
-                                       : APP_LCD_H_RES *
-                                             APP_LCD_LVGL_BUFFER_ROWS *
-                                             sizeof(uint16_t);
+        const size_t chunk_bytes = staged ? LCD_PSRAM_STAGE_BYTES
+                                          : s_lcd_pixel_max_transfer_bytes;
         const size_t chunks =
             (frame_bytes + chunk_bytes - 1U) / chunk_bytes;
         ESP_LOGI(TAG,
                  "[LCD-SPI] video_buffer=%s dma=%s addr=%p aligned64=%d "
-                 "bytes=%u chunk_bytes=%u chunks=%u",
+                 "bytes=%u chunk_bytes=%u chunks=%u chunk_aligned64=%d",
                  external ? "PSRAM" : "internal",
                  staged ? "internal-stage"
                         : (external ? "PSRAM-direct" : "internal-direct"),
                  (const void *)rgb565,
                  (((uintptr_t)rgb565 & 63U) == 0U) ? 1 : 0,
                  (unsigned)frame_bytes, (unsigned)chunk_bytes,
-                 (unsigned)chunks);
+                 (unsigned)chunks,
+                 ((chunk_bytes & (LCD_DMA_CACHE_ALIGNMENT - 1U)) == 0U) ? 1 : 0);
         s_video_path_logged = true;
     }
     if (!s_video_frame_done) {
@@ -1633,6 +1745,13 @@ esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
                  (unsigned long)pending_before_submit,
                  (unsigned long)mismatch_before_submit);
     }
+
+#if LCD_VIDEO_INTEGRITY_CHECK
+    /* CPU view, through the cache: exactly what rotate_rgb565_to_canvas wrote. */
+    const size_t integrity_pixels = (size_t)width * height;
+    uint32_t fingerprint_before[LCD_INTEGRITY_SEGMENTS];
+    lcd_video_fingerprint(rgb565, integrity_pixels, fingerprint_before);
+#endif
 
     const int64_t start_us = esp_timer_get_time();
     esp_err_t err = lcd_draw_rgb565_bitmap(
@@ -1698,6 +1817,49 @@ esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
         return transfer_err;
     }
 
+#if LCD_VIDEO_INTEGRITY_CHECK
+    /* Drop the cached copy so the second pass reads what actually sits in
+     * PSRAM, i.e. the bytes GDMA fetched. The buffer is clean at this point:
+     * spi_master ran a C2M writeback on every chunk when it was queued, so
+     * invalidating cannot lose CPU data. */
+    const size_t integrity_bytes = integrity_pixels * sizeof(uint16_t);
+    /* No UNALIGNED flag: M2C rejects it, and the canvas is already 64-byte
+     * aligned with a length that is a whole number of cache lines. */
+    esp_err_t inv_err = esp_cache_msync((void *)rgb565, integrity_bytes,
+                                        ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    if (inv_err != ESP_OK) {
+        ESP_LOGW(TAG, "[LCD-INTEGRITY] invalidate failed: %s",
+                 esp_err_to_name(inv_err));
+    } else {
+        uint32_t fingerprint_after[LCD_INTEGRITY_SEGMENTS];
+        lcd_video_fingerprint(rgb565, integrity_pixels, fingerprint_after);
+
+        uint32_t bad_mask = 0;
+        for (uint32_t seg = 0; seg < LCD_INTEGRITY_SEGMENTS; ++seg) {
+            if (fingerprint_after[seg] != fingerprint_before[seg]) {
+                bad_mask |= (1U << seg);
+            }
+        }
+        static uint32_t s_integrity_mismatch_count;
+        if (bad_mask != 0) {
+            const uint32_t first = (uint32_t)__builtin_ctz(bad_mask);
+            ESP_LOGE(TAG,
+                     "[LCD-INTEGRITY] PSRAM differs from CPU writes seq=%lu "
+                     "segments=0x%02lx first=%lu rows=%lu..%lu "
+                     "cpu=0x%08lx psram=0x%08lx mismatches=%lu addr=%p",
+                     (unsigned long)frame_sequence, (unsigned long)bad_mask,
+                     (unsigned long)first,
+                     (unsigned long)(first * (height / LCD_INTEGRITY_SEGMENTS)),
+                     (unsigned long)((first + 1U) *
+                                     (height / LCD_INTEGRITY_SEGMENTS) - 1U),
+                     (unsigned long)fingerprint_before[first],
+                     (unsigned long)fingerprint_after[first],
+                     (unsigned long)++s_integrity_mismatch_count,
+                     (const void *)rgb565);
+        }
+    }
+#endif
+
     const int64_t resume_us = esp_timer_get_time();
     int64_t isr_done_us;
     uint32_t done_sequence;
@@ -1723,12 +1885,14 @@ esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
     static int64_t last_resume_us;
     ESP_LOGI(TAG, "[LCD] direct seq=%lu submit=%lldus submit_to_isr=%lldus "
                   "physical=%lldus isr_to_resume=%lldus total=%lldus "
-                  "isr_period=%lldus resume_period=%lldus pixels=%lu",
+                  "isr_period=%lldus resume_period=%lldus pixels=%lu "
+                  "dma_err=%lu",
              (unsigned long)frame_sequence, submit_us, submit_to_isr_us,
              physical_us, isr_to_resume_us, total_us,
              last_isr_done_us > 0 ? isr_done_us - last_isr_done_us : 0,
              last_resume_us > 0 ? resume_us - last_resume_us : 0,
-             (unsigned long)(width * height));
+             (unsigned long)(width * height),
+             (unsigned long)s_lcd_pixel_dma_error_count);
     last_isr_done_us = isr_done_us;
     last_resume_us = resume_us;
     return ESP_OK;
