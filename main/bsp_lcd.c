@@ -58,21 +58,31 @@ static const char *TAG = "bsp_lcd";
  * off, in case a later change needs to re-confirm that. */
 #define LCD_VIDEO_INTEGRITY_CHECK 0
 
-/* Controlled experiment, currently ON.
+/* Controlled experiment, answered on 2026-09-02 and switched back off.
  *
  * The integrity check proved the frame is already correct in PSRAM, so the
- * remaining corruption has to come from what happens after memory. This routes
- * PSRAM frames through the internal SRAM staging path: the CPU copies each
- * chunk into internal DMA RAM and GDMA never touches external memory at all.
+ * remaining corruption had to come from what happens after memory. Forcing this
+ * on routed PSRAM frames through the internal SRAM staging path, so the CPU
+ * copied each chunk into internal DMA RAM and GDMA never touched external
+ * memory: corruption gone would mean the GDMA fetch from PSRAM, corruption
+ * surviving would mean downstream of the fetch.
  *
- *   corruption gone     -> it is the GDMA fetch from PSRAM
- *   corruption survives -> it is downstream of the fetch (SPI or panel)
+ * The corruption survived, so the GDMA fetch is exonerated. It was never on
+ * this side at all: the damage happened in the node's DVP capture, where a
+ * saturated MSPI (octal PSRAM sharing one controller with DIO flash, with the
+ * voice path's PSRAM ring buffers and instruction-cache misses on top) overran
+ * the shallow CAM FIFO and shifted the UYVY byte phase. Lowering
+ * APP_SP0A39_MCLK_HZ to 10 MHz fixed it at the source.
  *
- * Cost: 1 KB chunks push a frame from 77 ms to about 120 ms. The frame period
- * is currently ~200 ms, so the frame rate does not change. The staging buffers
- * are a 2 KB static array that is already linked in, so this does not take any
- * runtime heap away from AEC (internal free drops to ~6 KB once AEC is up). */
-#define LCD_VIDEO_FORCE_PSRAM_STAGING 1
+ * Staging is off because it is expensive here. It splits a 153600-byte frame
+ * into 150 chunks of 1 KB, and on a gateway whose cores run at ~90% those
+ * chunks get preempted repeatedly: measured submit was 110-125 ms for a
+ * transfer whose DMA is ~1 ms, holding the display to 7.9 fps while frames
+ * arrived intact at 9.7 fps. PSRAM-direct sends the frame in one transfer
+ * (~77 ms), which fits inside the ~103 ms arrival period. The original note
+ * here justified the cost with a ~200 ms frame period; that period is now
+ * 100 ms, so the justification no longer holds either. */
+#define LCD_VIDEO_FORCE_PSRAM_STAGING 0
 
 static esp_lcd_panel_io_handle_t s_lcd_io;
 static spi_device_handle_t s_lcd_pixel_spi;
