@@ -625,103 +625,6 @@ static void prefetch_discard()
     xSemaphoreGive(g_prefetch_mutex);
 }
 
-constexpr uint32_t kNodeJpegDumpFrameCount = 5U;
-constexpr size_t kNodeJpegDumpRawBytesPerLine = 96U;
-
-static uint32_t node_jpeg_dump_crc32(const uint8_t *data, size_t len)
-{
-    uint32_t crc = 0xFFFFFFFFU;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (int bit = 0; bit < 8; ++bit) {
-            crc = (crc & 1U) ? ((crc >> 1U) ^ 0xEDB88320U) : (crc >> 1U);
-        }
-    }
-    return ~crc;
-}
-
-static size_t node_jpeg_dump_base64(const uint8_t *src, size_t len,
-                                    char *dst, size_t dst_size)
-{
-    static constexpr char kBase64[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const size_t required = ((len + 2U) / 3U) * 4U;
-    if (!src || !dst || dst_size <= required) return 0;
-
-    size_t si = 0;
-    size_t di = 0;
-    while (si + 3U <= len) {
-        const uint32_t v = (static_cast<uint32_t>(src[si]) << 16U) |
-                           (static_cast<uint32_t>(src[si + 1U]) << 8U) |
-                           static_cast<uint32_t>(src[si + 2U]);
-        dst[di++] = kBase64[(v >> 18U) & 0x3FU];
-        dst[di++] = kBase64[(v >> 12U) & 0x3FU];
-        dst[di++] = kBase64[(v >> 6U) & 0x3FU];
-        dst[di++] = kBase64[v & 0x3FU];
-        si += 3U;
-    }
-    if (si < len) {
-        uint32_t v = static_cast<uint32_t>(src[si]) << 16U;
-        const bool have_second = (si + 1U < len);
-        if (have_second) v |= static_cast<uint32_t>(src[si + 1U]) << 8U;
-        dst[di++] = kBase64[(v >> 18U) & 0x3FU];
-        dst[di++] = kBase64[(v >> 12U) & 0x3FU];
-        dst[di++] = have_second ? kBase64[(v >> 6U) & 0x3FU] : '=';
-        dst[di++] = '=';
-    }
-    dst[di] = '\0';
-    return di;
-}
-
-static void dump_node_jpeg_before_radio(const uint8_t *jpeg, size_t jpeg_len)
-{
-    static uint32_t dumped_frames = 0;
-    if (!jpeg || jpeg_len == 0 || dumped_frames >= kNodeJpegDumpFrameCount) return;
-
-    const uint32_t frame = ++dumped_frames;
-    const uint32_t crc32 = node_jpeg_dump_crc32(jpeg, jpeg_len);
-    const size_t lines =
-        (jpeg_len + kNodeJpegDumpRawBytesPerLine - 1U) /
-        kNodeJpegDumpRawBytesPerLine;
-
-    ESP_LOGW(TAG,
-             "NODE_JPEG_DUMP_BEGIN frame=%lu/%lu len=%u crc32=0x%08lx "
-             "lines=%u source=before_radio",
-             static_cast<unsigned long>(frame),
-             static_cast<unsigned long>(kNodeJpegDumpFrameCount),
-             static_cast<unsigned>(jpeg_len),
-             static_cast<unsigned long>(crc32),
-             static_cast<unsigned>(lines));
-
-    char encoded[((kNodeJpegDumpRawBytesPerLine + 2U) / 3U) * 4U + 1U];
-    for (size_t line = 0, offset = 0; offset < jpeg_len; ++line) {
-        const size_t remaining = jpeg_len - offset;
-        const size_t chunk = remaining < kNodeJpegDumpRawBytesPerLine
-                                 ? remaining
-                                 : kNodeJpegDumpRawBytesPerLine;
-        const size_t encoded_len = node_jpeg_dump_base64(
-            jpeg + offset, chunk, encoded, sizeof(encoded));
-        if (encoded_len == 0) {
-            ESP_LOGE(TAG, "NODE_JPEG_DUMP_ABORT frame=%lu line=%u",
-                     static_cast<unsigned long>(frame),
-                     static_cast<unsigned>(line + 1U));
-            return;
-        }
-        ESP_LOGI(TAG, "NODE_JPEG_DUMP_B64 frame=%lu line=%u/%u:%s",
-                 static_cast<unsigned long>(frame),
-                 static_cast<unsigned>(line + 1U),
-                 static_cast<unsigned>(lines), encoded);
-        offset += chunk;
-    }
-
-    ESP_LOGW(TAG,
-             "NODE_JPEG_DUMP_END frame=%lu/%lu len=%u crc32=0x%08lx",
-             static_cast<unsigned long>(frame),
-             static_cast<unsigned long>(kNodeJpegDumpFrameCount),
-             static_cast<unsigned>(jpeg_len),
-             static_cast<unsigned long>(crc32));
-}
-
 // Capture one frame and JPEG-encode it into a freshly heap_caps-allocated blob.
 // Returns the blob (caller owns / frees) or nullptr on any failure. Assumes the
 // camera is powered and the LCD is already released (true inside the capture
@@ -756,7 +659,7 @@ static uint8_t *prepare_jpeg_blob(size_t *out_len)
                  esp_err_to_name(e));
         return nullptr;
     }
-    ESP_LOGI(TAG,
+    ESP_LOGD(TAG,
              "[PREFETCH] capture=%lums encode=%lums total=%lums raw=%u jpeg=%u",
              static_cast<unsigned long>(capture_done_ms - prepare_start_ms),
              static_cast<unsigned long>(encode_done_ms - capture_done_ms),
@@ -918,9 +821,6 @@ static void intercom_capture_feed_task(void *arg)
         attempts++;
 
         if (jpeg && jpeg_len > 0) {
-            // Dump the first five complete node JPEGs after encoding and before
-            // radio ownership/fragmentation, then stop this diagnostic forever.
-            dump_node_jpeg_before_radio(jpeg, jpeg_len);
             // Ownership transfers to the radio (freed on adopt or replace).
             g_radio.intercom_image_publish(jpeg, jpeg_len);
         } else {
@@ -928,7 +828,9 @@ static void intercom_capture_feed_task(void *arg)
             fails++;
         }
 
-        ESP_LOGI(TAG,
+        // Per-frame timing: verbose at the feed rate, so keep it at DEBUG and
+        // read the aggregate from the periodic [CPU] / [IMG RX] lines instead.
+        ESP_LOGD(TAG,
                  "[IMG FEED] capture+encode=%lums jpeg=%u bytes ok=%d "
                  "attempts=%lu fails=%lu",
                  static_cast<unsigned long>(dt),

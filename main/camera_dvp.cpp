@@ -936,7 +936,7 @@ esp_err_t CameraUartStreamer::capture_frame_impl(uint8_t **out_data,
             : kOutputPixelformat;
         const int64_t t_capture_done = esp_timer_get_time();
         if (jpeg_input) {
-            ESP_LOGI(TAG,
+            ESP_LOGD(TAG,
                      "[CAPTURE-JPEG] prefetched=%d slot=%d raw_age=%lums "
                      "prearm=%d setup=%lldus wait=%lldus alloc=%lldus "
                      "cache=%lldus fused=%lldus total=%lldus",
@@ -950,7 +950,7 @@ esp_err_t CameraUartStreamer::capture_frame_impl(uint8_t **out_data,
                      (long long)(t_downsample_done - t_downsample_start),
                      (long long)(t_capture_done - t_capture_start));
         } else {
-            ESP_LOGI(TAG,
+            ESP_LOGD(TAG,
                      "[CAPTURE] setup=%lldus wait=%lldus alloc=%lldus cache=%lldus "
                      "downsample=%lldus total=%lldus",
                      (long long)(t_wait_start - t_capture_start),

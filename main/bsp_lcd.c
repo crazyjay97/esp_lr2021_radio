@@ -1883,7 +1883,10 @@ esp_err_t bsp_lcd_present_video_frame(const uint16_t *rgb565,
     const int64_t total_us = resume_us - start_us;
     static int64_t last_isr_done_us;
     static int64_t last_resume_us;
-    ESP_LOGI(TAG, "[LCD] direct seq=%lu submit=%lldus submit_to_isr=%lldus "
+    /* One line per displayed frame. The direct-video path is settled, so keep
+     * the per-frame breakdown at DEBUG and read the display rate from the
+     * [FRAME] line instead. */
+    ESP_LOGD(TAG, "[LCD] direct seq=%lu submit=%lldus submit_to_isr=%lldus "
                   "physical=%lldus isr_to_resume=%lldus total=%lldus "
                   "isr_period=%lldus resume_period=%lldus pixels=%lu "
                   "dma_err=%lu",

@@ -223,7 +223,7 @@ esp_err_t ImageTransfer::encode_prepared_frame(const uint8_t *input, size_t inpu
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG,
+    ESP_LOGD(TAG,
              "[ENCODE-PREPARED] open=%lldus output_alloc=%lldus jpeg=%lldus "
              "cleanup=%lldus total=%lldus",
              (long long)(t_open_done - t_open_start),
