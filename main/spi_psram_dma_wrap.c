@@ -23,6 +23,18 @@
  * one level below the maximum of 5 so audio DMA can still be raised over the
  * display if it ever needs to. */
 #define SPI_TX_DMA_PRIORITY 4
+/* The camera runs continuously and writes full VGA frames into PSRAM. Its byte
+ * stream cannot be back-pressured: the sensor keeps clocking PCLK, so every
+ * arbitration loss that overruns the CAM FIFO is unrecoverable data loss, and a
+ * dropped byte shifts the UYVY phase for the rest of the frame. Every other
+ * GDMA client on this board is transactional and can wait, so the camera takes
+ * the maximum level. Priority 2 measurably reduced but did not remove the
+ * corruption; going straight to the hardware maximum removes arbitration as a
+ * variable instead of stepping through it. The LCD TX priority below is on the
+ * gateway, which has no camera, so the two never contend. The capture/prefetch
+ * pipeline is unchanged. 5 is the ESP32-S3 hardware maximum (levels [0,5]); it
+ * is spelled out here because the HAL constant lives in a private header. */
+#define DVP_RX_DMA_PRIORITY 5
 
 static const char *TAG = "spi_dma_wrap";
 
@@ -166,6 +178,9 @@ esp_err_t __real_spi_device_queue_trans(spi_device_handle_t handle,
 esp_err_t __real_spi_device_polling_transmit(spi_device_handle_t handle,
                                              spi_transaction_t *trans_desc);
 
+esp_err_t __real_gdma_connect(gdma_channel_handle_t dma_chan,
+                              gdma_trigger_t trig_periph);
+
 esp_err_t __wrap_spi_device_queue_trans(spi_device_handle_t handle,
                                         spi_transaction_t *trans_desc,
                                         TickType_t ticks_to_wait)
@@ -243,4 +258,26 @@ esp_err_t __wrap_spi_device_polling_transmit(spi_device_handle_t handle,
 
     xSemaphoreGive(mutex);
     return err;
+}
+
+esp_err_t __wrap_gdma_connect(gdma_channel_handle_t dma_chan,
+                              gdma_trigger_t trig_periph)
+{
+    esp_err_t err = __real_gdma_connect(dma_chan, trig_periph);
+    if (err != ESP_OK || trig_periph.periph != GDMA_TRIG_PERIPH_CAM) {
+        return err;
+    }
+
+    err = gdma_set_priority(dma_chan, DVP_RX_DMA_PRIORITY);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "DVP RX DMA priority setup failed: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG,
+             "DVP RX DMA priority=%d (cache line=%uB, capture pipeline unchanged)",
+             DVP_RX_DMA_PRIORITY,
+             (unsigned)CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE);
+    return ESP_OK;
 }

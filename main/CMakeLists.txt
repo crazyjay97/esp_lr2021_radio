@@ -49,3 +49,7 @@ target_link_libraries(${COMPONENT_LIB} INTERFACE
                       "-Wl,--wrap=spi_device_polling_transmit")
 target_link_libraries(${COMPONENT_LIB} INTERFACE
                       "-u __wrap_spi_device_polling_transmit")
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+                      "-Wl,--wrap=gdma_connect")
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+                      "-u __wrap_gdma_connect")
